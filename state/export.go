@@ -58,7 +58,7 @@ func (s *service) export(c *Context, in ExportRequest) (File, error) {
 	taken := map[string]map[string]bool{}
 	var names []string
 	for _, target := range targets {
-		g := s.byName[target.Group]
+		g := s.byName[target.Group].resolved()
 		if taken[g.name] == nil {
 			taken[g.name] = map[string]bool{}
 			keys[g.name] = map[string]string{}
@@ -125,8 +125,8 @@ func (s *service) line(c *Context, g group, row exported, keys map[string]map[st
 	for field, value := range row.data {
 		data[field] = value
 	}
-	for _, field := range g.fields.Sensitive {
-		delete(data, field)
+	for _, pointer := range g.secrets(row.data) {
+		data = strip(data, pointer)
 	}
 	refs := map[string]any{}
 	for field, target := range g.refs {

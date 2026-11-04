@@ -327,9 +327,10 @@ func TestStateSchemaDocument(t *testing.T) {
 	assert.Equal(t, []string{"location"}, room.DependsOn)
 	assert.Equal(t, map[string]string{"location_id": "location"}, room.Refs)
 	assert.Equal(t, []string{"kind"}, room.Filters)
-	assert.Equal(t, []string{"code"}, room.Fields.Sensitive)
-	assert.Equal(t, []string{"kind"}, room.Fields.Immutable)
-	assert.Equal(t, []string{"region"}, doc.Groups[0].Fields.ServerDefault)
+	assert.Equal(t, []string{"/code"}, room.Fields.Sensitive)
+	assert.Equal(t, []string{"/kind"}, room.Fields.Immutable)
+	assert.Equal(t, []string{"/region"}, doc.Groups[0].Fields.ServerDefault)
+	assert.Equal(t, map[string][]string{}, room.Fields.SensitiveBy)
 	assert.Contains(t, room.Schema["properties"], "code")
 
 	req := httptest.NewRequest(http.MethodGet, "/api/state", nil)
@@ -588,4 +589,117 @@ func TestStateCommand(t *testing.T) {
 		access[tool.Name] = tool.Annotations["readOnlyHint"]
 	}
 	assert.Equal(t, map[string]any{"state": true, "state_export": true, "state_import": false}, access)
+}
+
+type connectionBody struct {
+	Name   string         `json:"name"`
+	Type   string         `json:"type"`
+	Config map[string]any `json:"config,omitempty"`
+	Auth   map[string]any `json:"auth,omitempty"`
+}
+
+func connectionService(m *memory) *echo.Echo {
+	connection := memoryGroup[connectionBody](m, "connection")
+	connection.Schema = map[string]any{"type": "object", "properties": map[string]any{
+		"name": map[string]any{"type": "string"},
+		"type": map[string]any{"type": "string", "x-immutable": true},
+		"config": map[string]any{"type": "object", "properties": map[string]any{
+			"client_id":     map[string]any{"type": "string"},
+			"client_secret": map[string]any{"type": "string", "writeOnly": true},
+			"region":        map[string]any{"type": "string", "x-server-default": true},
+			"mode":          map[string]any{"type": "string", "x-immutable": true},
+		}},
+		"auth": map[string]any{
+			"type":          "object",
+			"discriminator": map[string]any{"propertyName": "kind"},
+			"oneOf": []any{
+				map[string]any{"properties": map[string]any{"kind": map[string]any{"type": "string"}, "token": map[string]any{"type": "string", "x-sensitive": true}}},
+				map[string]any{"properties": map[string]any{"kind": map[string]any{"type": "string"}, "user": map[string]any{"type": "string"}}},
+			},
+		},
+	}}
+	connection.Discriminator = "/type"
+	connection.Sensitive = func() map[string][]string {
+		return map[string][]string{"oauth": {"/config/refresh_token"}, "basic": {"/config/password", "/config/password"}}
+	}
+	e := echo.New()
+	state.Register(e.Group("/api"), state.Context{Service: "demo", Version: "v1.2.3", Keys: m}, connection)
+	return e
+}
+
+func connections() *memory {
+	m := newMemory("a")
+	m.add("connection", "conn-1", map[string]any{"name": "Calendar", "type": "oauth",
+		"config": map[string]any{"client_id": "public-id", "client_secret": "s3cret", "refresh_token": "r3fresh", "region": "eu", "mode": "push"},
+		"auth":   map[string]any{"kind": "token", "token": "t0ken"}})
+	m.add("connection", "conn-2", map[string]any{"name": "Printer", "type": "basic",
+		"config": map[string]any{"client_id": "printer", "password": "p4ss", "refresh_token": "listed", "region": "us", "mode": "pull"},
+		"auth":   map[string]any{"kind": "user", "user": "operator"}})
+	return m
+}
+
+func TestStateSensitiveByInTheSchema(t *testing.T) {
+	e := connectionService(newMemory("a"))
+	rec := call(e, http.MethodGet, "/api/state", "", "", nil)
+	assert.Equal(t, http.StatusOK, rec.Code)
+	assert.Contains(t, rec.Body.String(), `"sensitive_by": {`)
+	var wrapped struct {
+		Data state.Document `json:"data"`
+	}
+	assert.NoError(t, json.Unmarshal(rec.Body.Bytes(), &wrapped))
+	fields := wrapped.Data.Groups[0].Fields
+	assert.Equal(t, []string{"/auth/token", "/config/client_secret"}, fields.Sensitive, "nested properties and discriminated branches are walked")
+	assert.Equal(t, []string{"/config/mode", "/type"}, fields.Immutable)
+	assert.Equal(t, []string{"/config/region"}, fields.ServerDefault)
+	assert.Equal(t, "/type", fields.Discriminator)
+	assert.Equal(t, map[string][]string{"basic": {"/config/password"}, "oauth": {"/config/refresh_token"}}, fields.SensitiveBy)
+}
+
+func TestStateStripsNestedPointers(t *testing.T) {
+	e := connectionService(connections())
+	file := string(exportState(t, e, ``))
+	lines := strings.Split(strings.TrimSpace(file), "\n")
+	assert.Len(t, lines, 3)
+	assert.JSONEq(t, `{"group":"connection","key":"conn-1","data":{"name":"Calendar","type":"oauth","config":{"client_id":"public-id","region":"eu","mode":"push"},"auth":{"kind":"token"}}}`, lines[1], "exactly the flagged pointers go, the objects holding them stay")
+	assert.NotContains(t, file, "s3cret")
+	assert.NotContains(t, file, "t0ken")
+}
+
+func TestStateStripsByDiscriminator(t *testing.T) {
+	e := connectionService(connections())
+	file := string(exportState(t, e, ``))
+	lines := strings.Split(strings.TrimSpace(file), "\n")
+	assert.NotContains(t, lines[1], "r3fresh", "an oauth record loses its refresh token")
+	assert.JSONEq(t, `{"group":"connection","key":"conn-2","data":{"name":"Printer","type":"basic","config":{"client_id":"printer","refresh_token":"listed","region":"us","mode":"pull"},"auth":{"kind":"user","user":"operator"}}}`, lines[2], "a basic record loses its password and keeps what only oauth hides")
+	assert.NotContains(t, file, "p4ss")
+}
+
+func TestStateFieldFlagsByPointer(t *testing.T) {
+	source := connectionService(connections())
+	exported, err := state.Read(bytes.NewReader(exportState(t, source, ``)))
+	assert.NoError(t, err)
+	for i := range exported.Manifest.Groups {
+		exported.Manifest.Groups[i].Hash = ""
+	}
+	var unhashed bytes.Buffer
+	assert.NoError(t, exported.Write(&unhashed))
+
+	target := newMemory("b")
+	e := connectionService(target)
+	assert.Equal(t, map[string]int{state.OutcomeCreated: 2}, importState(t, e, "", unhashed.Bytes()).Counts)
+	assert.Equal(t, map[string]int{state.OutcomeUnchanged: 2}, importState(t, e, "", unhashed.Bytes()).Counts, "stripped secrets are not drift")
+
+	edited := strings.Replace(unhashed.String(), `"region":"eu",`, ``, 1)
+	edited = strings.Replace(edited, `"mode":"pull"`, `"mode":"push"`, 1)
+	out := importState(t, e, "", []byte(edited))
+	assert.Equal(t, state.OutcomeUnchanged, outcomes(out)["connection:conn-1"], "an omitted nested server default is not drift")
+	assert.Equal(t, state.OutcomeRefused, outcomes(out)["connection:conn-2"])
+	for _, result := range out.Results {
+		if result.Key == "conn-2" {
+			assert.Contains(t, result.Error, "connection.config.mode cannot change")
+		}
+	}
+
+	withSecret := strings.Replace(unhashed.String(), `"client_id":"public-id"`, `"client_id":"public-id","refresh_token":"new"`, 1)
+	assert.Equal(t, state.OutcomeUpdated, outcomes(importState(t, e, "", []byte(withSecret)))["connection:conn-1"], "a secret sent for the record's own type is always written")
 }
