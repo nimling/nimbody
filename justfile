@@ -2,8 +2,8 @@ install:
     go install github.com/nimling/sbump/cmd@latest
     mv "$(go env GOPATH)/bin/cmd" "$(go env GOPATH)/bin/sbump"
 
-deploy:
-    sbump patch --env APP_VERSION --push-version --auto --workflow
+deploy bump='patch':
+    sbump {{bump}} --env APP_VERSION --push-version --auto --workflow
 
 build:
     go build ./...

@@ -21,7 +21,7 @@ What `stream/`, `mcp/`, `cli/` and `state/` do: `.nimpress/packages.md`.
 5. `mcp/`: the stdio mcp server every cli serves through, `Server`, `Tool`, `Page`, `Command`, `Annotate`, `Argv`, `Exec`, `Frame`, the embedded `page.html` and `frame.html`; over streamable HTTP `Define`, `Route` and `Server.Mount`.
 6. `cli/`: the shared cli layer the `cli` skill in `~/.claude/skills/cli` describes: `Execute`, `Error`, `Print`, `FormatFor`, `FormatPlain`, `Colour`, `Style`, `Tools`, `Access`, `MCPCommand`, `AnnotationMCPPage`, `SkillCommand`, `SkillTreeCommand`, `PluginCommand`, `Settings`, `Flags`, `Load`, `Guard`, `ConfigCommand`, `Output`, `OperationCommand`, `Bridge`, `Relay`, `StateCommand`, `Send`.
 7. `shape/`: fields, sort, jq and templates over decoded json, shared by `cli.Output` and the remote mcp tools.
-8. `state/`: export and import of a service's data through `/state`, `Register`, `Group`, `Context`, `Resolver`, `Read` and `File`, the NDJSON state lines with manifest hashes, key mapping, dry run and sync.
+8. `state/`: export and import of a service's data through `/state`: `Register` with one `Group` per resource, `Context` with the host's access, transaction, `Resolver` and asset hooks, `Read` and `File` for the NDJSON lines with manifest hashes, key mapping, dry run, upsert, create, sync and delete with per record results, and the `state`, `state export` and `state import` commands every cli and its mcp server carry.
 
 ## Index
 
