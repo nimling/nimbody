@@ -94,6 +94,7 @@ func (s *service) importFile(c *Context, in ImportRequest, file File) (ImportRes
 		if len(lines) == 0 {
 			continue
 		}
+		g = g.resolved()
 		step := "import:" + g.name
 		c.Steps.Start(step, "import "+g.name, "")
 		current, err := s.current(r, g, lines)
@@ -342,11 +343,13 @@ func compare(g group, incoming, current Line) (bool, string) {
 	have := map[string]any{}
 	same := true
 	for field, value := range incoming.Data {
-		if contains(g.fields.Sensitive, field) {
-			same = false
-			continue
-		}
 		want[field] = value
+	}
+	for _, pointer := range g.secrets(incoming.Data) {
+		if _, sent := lookup(want, pointer); sent {
+			same = false
+			want = strip(want, pointer)
+		}
 	}
 	for field, value := range current.Data {
 		have[field] = value
@@ -357,15 +360,20 @@ func compare(g group, incoming, current Line) (bool, string) {
 	for field, value := range current.Refs {
 		have[field] = value
 	}
-	for _, field := range g.fields.ServerDefault {
-		if _, sent := want[field]; !sent {
-			delete(have, field)
+	for _, pointer := range g.fields.ServerDefault {
+		if _, sent := lookup(want, pointer); !sent {
+			have = strip(have, pointer)
 		}
 	}
 	immutable := ""
-	for _, field := range g.fields.Immutable {
-		if _, sent := want[field]; sent && !equal(want[field], have[field]) {
-			immutable = field
+	for _, pointer := range g.fields.Immutable {
+		wanted, sent := lookup(want, pointer)
+		if !sent {
+			continue
+		}
+		held, _ := lookup(have, pointer)
+		if !equal(wanted, held) {
+			immutable = dotted(pointer)
 			break
 		}
 	}

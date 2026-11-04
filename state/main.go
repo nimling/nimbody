@@ -7,7 +7,6 @@ import (
 	"errors"
 	"io"
 	"net/http"
-	"sort"
 	"strings"
 
 	"github.com/labstack/echo/v4"
@@ -16,7 +15,7 @@ import (
 	"github.com/nimling/nimbody/respond"
 )
 
-const FormatVersion = "1"
+const FormatVersion = "2"
 
 const MIMENDJSON = "application/x-ndjson"
 
@@ -78,15 +77,17 @@ type Blobs[T any] struct {
 }
 
 type Group[T any] struct {
-	Name      string
-	Schema    map[string]any
-	DependsOn []string
-	Refs      map[string]string
-	Filters   []string
-	Export    func(ctx *Context, query Query) ([]Record[T], error)
-	Import    func(ctx *Context, record Record[T]) (string, error)
-	Delete    func(ctx *Context, id string) error
-	Blobs     Blobs[T]
+	Name          string
+	Schema        map[string]any
+	DependsOn     []string
+	Refs          map[string]string
+	Filters       []string
+	Discriminator string
+	Sensitive     func() map[string][]string
+	Export        func(ctx *Context, query Query) ([]Record[T], error)
+	Import        func(ctx *Context, record Record[T]) (string, error)
+	Delete        func(ctx *Context, id string) error
+	Blobs         Blobs[T]
 }
 
 type Definition interface {
@@ -100,9 +101,11 @@ type Target struct {
 }
 
 type Fields struct {
-	Sensitive     []string `json:"sensitive"`
-	Immutable     []string `json:"immutable"`
-	ServerDefault []string `json:"server_default"`
+	Sensitive     []string            `json:"sensitive"`
+	Immutable     []string            `json:"immutable"`
+	ServerDefault []string            `json:"server_default"`
+	Discriminator string              `json:"discriminator,omitempty"`
+	SensitiveBy   map[string][]string `json:"sensitive_by"`
 }
 
 type GroupSchema struct {
@@ -171,6 +174,7 @@ type group struct {
 	refs      map[string]string
 	filters   []string
 	fields    Fields
+	sensitive func() map[string][]string
 	blobs     bool
 	export    func(ctx *Context, query Query) ([]exported, error)
 	write     func(ctx *Context, id, key string, data map[string]any) (string, func(ctx *Context, blob Blob) error, error)
@@ -178,6 +182,14 @@ type group struct {
 }
 
 func (g Group[T]) definition() group {
+	if g.Discriminator != "" {
+		if _, err := ParsePointer(g.Discriminator); err != nil {
+			panic("state: group " + g.Name + " names discriminator " + g.Discriminator + ", which is not a field pointer")
+		}
+	}
+	if g.Sensitive != nil && g.Discriminator == "" {
+		panic("state: group " + g.Name + " declares sensitive fields per type without a discriminator")
+	}
 	defined := group{
 		name:      g.Name,
 		schema:    g.Schema,
@@ -185,9 +197,11 @@ func (g Group[T]) definition() group {
 		refs:      g.Refs,
 		filters:   g.Filters,
 		fields:    fieldsOf(g.Schema),
+		sensitive: g.Sensitive,
 		blobs:     g.Blobs.Get != nil,
 		delete:    g.Delete,
 	}
+	defined.fields.Discriminator = g.Discriminator
 	put := func(record Record[T]) func(ctx *Context, blob Blob) error {
 		if g.Blobs.Put == nil {
 			return nil
@@ -251,24 +265,50 @@ func decode(value any) (map[string]any, error) {
 }
 
 func fieldsOf(schema map[string]any) Fields {
-	fields := Fields{Sensitive: []string{}, Immutable: []string{}, ServerDefault: []string{}}
-	properties, _ := schema["properties"].(map[string]any)
-	for name, raw := range properties {
+	flags := map[string]map[string]bool{FlagSensitive: {}, FlagImmutable: {}, FlagServerDefault: {}}
+	walkFields(schema, "", flags)
+	return Fields{
+		Sensitive:     sorted(flags[FlagSensitive]),
+		Immutable:     sorted(flags[FlagImmutable]),
+		ServerDefault: sorted(flags[FlagServerDefault]),
+		SensitiveBy:   map[string][]string{},
+	}
+}
+
+func walkFields(schema map[string]any, pointer string, flags map[string]map[string]bool) {
+	for name, raw := range GetProperties(schema) {
 		property, _ := raw.(map[string]any)
+		at := JoinPointer(pointer, name)
 		if property[FlagWriteOnly] == true || property[FlagSensitive] == true {
-			fields.Sensitive = append(fields.Sensitive, name)
+			flags[FlagSensitive][at] = true
 		}
 		if property[FlagImmutable] == true {
-			fields.Immutable = append(fields.Immutable, name)
+			flags[FlagImmutable][at] = true
 		}
 		if property[FlagServerDefault] == true {
-			fields.ServerDefault = append(fields.ServerDefault, name)
+			flags[FlagServerDefault][at] = true
+		}
+		walkFields(property, at, flags)
+	}
+}
+
+func (g group) resolved() group {
+	by := map[string][]string{}
+	if g.sensitive != nil {
+		for value, pointers := range g.sensitive() {
+			set := map[string]bool{}
+			for _, pointer := range pointers {
+				set[pointer] = true
+			}
+			by[value] = sorted(set)
 		}
 	}
-	sort.Strings(fields.Sensitive)
-	sort.Strings(fields.Immutable)
-	sort.Strings(fields.ServerDefault)
-	return fields
+	g.fields.SensitiveBy = by
+	return g
+}
+
+func (g group) secrets(data map[string]any) []string {
+	return append(append([]string{}, g.fields.Sensitive...), g.fields.SensitiveBy[discriminated(data, g.fields.Discriminator)]...)
 }
 
 type service struct {
@@ -366,7 +406,7 @@ func (s *service) context(ctx echo.Context) *Context {
 func (s *service) document() Document {
 	doc := Document{Format: FormatVersion, Service: s.host.Service, Version: s.host.Version, Groups: make([]GroupSchema, 0, len(s.groups))}
 	for _, g := range s.groups {
-		entry := GroupSchema{Name: g.name, Schema: g.schema, DependsOn: g.dependsOn, Refs: g.refs, Filters: g.filters, Fields: g.fields}
+		entry := GroupSchema{Name: g.name, Schema: g.schema, DependsOn: g.dependsOn, Refs: g.refs, Filters: g.filters, Fields: g.resolved().fields}
 		if entry.Schema == nil {
 			entry.Schema = map[string]any{}
 		}
