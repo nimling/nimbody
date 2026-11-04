@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+1. `state`: export and import of a service's data through `GET /state`, `POST /state/export` and `POST /state/import`: a schema document with field flags, NDJSON state lines with a manifest and a hash per group, export by filter and key, upsert, create and sync imports that map keys to ids and converge on a second run, deletes by key, dry runs, per record results over the step stream, and stored snapshots.
+2. `cli`: `StateCommand` adds `state`, `state export` and `state import` to a cli and its mcp tools.
+
 ## v1.0.0
 
 The first public release.
