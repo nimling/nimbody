@@ -278,7 +278,7 @@ func fieldsOf(schema map[string]any) Fields {
 func walkFields(schema map[string]any, pointer string, flags map[string]map[string]bool) {
 	for name, raw := range GetProperties(schema) {
 		property, _ := raw.(map[string]any)
-		at := pointer + "/" + escape(name)
+		at := JoinPointer(pointer, name)
 		if property[FlagWriteOnly] == true || property[FlagSensitive] == true {
 			flags[FlagSensitive][at] = true
 		}

@@ -21,8 +21,8 @@ func ParsePointer(pointer string) ([]string, error) {
 	return tokens, nil
 }
 
-func escape(token string) string {
-	return strings.ReplaceAll(strings.ReplaceAll(token, "~", "~0"), "/", "~1")
+func JoinPointer(pointer, token string) string {
+	return pointer + "/" + strings.ReplaceAll(strings.ReplaceAll(token, "~", "~0"), "/", "~1")
 }
 
 func GetProperties(schema map[string]any) map[string]any {
