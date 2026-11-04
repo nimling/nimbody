@@ -1,0 +1,219 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>__NAME__ __TITLE__</title>
+<style>
+:root {
+  --paper: #faf8f4;
+  --paper-2: #f3f0ea;
+  --paper-3: #ebe7e0;
+  --ink: #1d1a17;
+  --ink-2: rgb(29 26 23 / 0.72);
+  --ink-3: rgb(29 26 23 / 0.5);
+  --line: rgb(29 26 23 / 0.08);
+  --line-strong: rgb(29 26 23 / 0.16);
+  --accent: #5a57d6;
+  --accent-ink: #ffffff;
+  --accent-soft: rgb(90 87 214 / 0.12);
+  --signal: #d9803b;
+  --glass: rgb(250 248 244 / 0.78);
+  --frost-border: rgb(29 26 23 / 0.1);
+  --frost-highlight: rgb(255 255 255 / 0.6);
+  --error: #d14a33;
+  --warn: #c98a12;
+  --success: #378b4f;
+  --radius: 0.875rem;
+  color-scheme: light;
+}
+:root[data-theme="dark"] {
+  --paper: #211e1b;
+  --paper-2: #2a2623;
+  --paper-3: #342f2b;
+  --ink: #f4f1ec;
+  --ink-2: rgb(244 241 236 / 0.74);
+  --ink-3: rgb(244 241 236 / 0.52);
+  --line: rgb(244 241 236 / 0.08);
+  --line-strong: rgb(244 241 236 / 0.16);
+  --accent: #8d89f0;
+  --accent-ink: #15132e;
+  --accent-soft: rgb(141 137 240 / 0.16);
+  --signal: #e9a35f;
+  --glass: rgb(33 30 27 / 0.72);
+  --frost-border: rgb(244 241 236 / 0.1);
+  --frost-highlight: rgb(255 255 255 / 0.09);
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; background: transparent; }
+body {
+  font: 400 0.875rem/1.5 "Schibsted Grotesk", ui-sans-serif, system-ui, sans-serif;
+  color: var(--ink);
+  letter-spacing: -0.005em;
+  padding: 0.25rem;
+}
+.shell {
+  position: relative;
+  overflow: hidden;
+  border-radius: calc(var(--radius) * 1.25);
+  background: var(--glass);
+  -webkit-backdrop-filter: blur(22px) saturate(140%);
+  backdrop-filter: blur(22px) saturate(140%);
+  box-shadow: inset 0 0 0 1px var(--frost-border), inset 0 1px 0 var(--frost-highlight), 0 24px 60px -24px rgb(0 0 0 / 0.45);
+  display: grid;
+  gap: 0.75rem;
+  padding: 0.75rem;
+}
+header { display: flex; align-items: center; gap: 0.75rem; flex-wrap: wrap; }
+.brand { font-weight: 600; letter-spacing: -0.025em; font-size: 1.0625rem; }
+.brand small { color: var(--ink-3); font-weight: 400; font-size: 0.75rem; margin-inline-start: 0.375rem; }
+.name { color: var(--ink-2); overflow-wrap: anywhere; min-inline-size: 0; flex: 1; }
+button {
+  font: inherit;
+  font-size: 0.75rem;
+  color: var(--accent-ink);
+  background: var(--accent);
+  border: 0;
+  border-radius: 999px;
+  padding: 0.25rem 0.75rem;
+  cursor: pointer;
+}
+button[hidden] { display: none; }
+.frame {
+  inline-size: 100%;
+  aspect-ratio: 16 / 10;
+  border: 0;
+  border-radius: var(--radius);
+  background: var(--paper-2);
+  box-shadow: inset 0 0 0 1px var(--line);
+}
+.frame[hidden] { display: none; }
+.note { color: var(--ink-3); font-size: 0.8125rem; overflow-wrap: anywhere; }
+.note.error { color: var(--error); }
+</style>
+</head>
+<body>
+<div class="shell" id="shell">
+  <header>
+    <div class="brand">__NAME__<small>__VERSION__</small></div>
+    <div class="name" id="name"></div>
+    <button id="open" type="button" title="Open this in the browser" hidden>Open in browser</button>
+  </header>
+  <iframe class="frame" id="frame" title="__TITLE__" hidden></iframe>
+  <div class="note" id="note">Waiting for the result.</div>
+</div>
+<script>
+(() => {
+  const sign = "__SIGN__";
+  const $ = (id) => document.getElementById(id);
+  const state = { serverTools: false, link: "" };
+
+  let nextId = 1;
+  const pending = new Map();
+  const post = (message) => window.parent.postMessage(message, "*");
+  const send = (method, params) => new Promise((resolve, reject) => {
+    const id = nextId++;
+    pending.set(id, { resolve, reject });
+    post({ jsonrpc: "2.0", id, method, params });
+  });
+  const notify = (method, params) => post({ jsonrpc: "2.0", method, params });
+
+  const text = (result) => ((result && result.content) || []).find((c) => c.type === "text") || {};
+
+  function setNote(message, failed) {
+    $("note").textContent = message;
+    $("note").className = "note" + (failed ? " error" : "");
+    $("note").hidden = !message;
+  }
+
+  async function show(result) {
+    if (result.isError) {
+      setNote(text(result).text || "The call failed", true);
+      return;
+    }
+    let value;
+    try { value = JSON.parse(text(result).text); } catch (_) { value = null; }
+    if (!value || typeof value !== "object" || !value.frame) {
+      setNote("The result carries no frame address", true);
+      return;
+    }
+    $("name").textContent = value.name || "";
+    state.link = value.url || "";
+    $("open").hidden = !state.link;
+    let address = value.frame;
+    if (sign && state.serverTools) {
+      try {
+        const signed = await send("tools/call", { name: sign, arguments: { frame: value.frame } });
+        if (signed.isError) {
+          setNote(text(signed).text || "No address to frame", true);
+          return;
+        }
+        address = text(signed).text.trim();
+      } catch (err) {
+        setNote((err && err.message) || "No address to frame", true);
+        return;
+      }
+    }
+    if (!/^https?:\/\//.test(address)) {
+      setNote("The frame address is not http or https", true);
+      return;
+    }
+    $("frame").src = address;
+    $("frame").hidden = false;
+    setNote("", false);
+  }
+
+  window.addEventListener("message", (event) => {
+    if (event.source !== window.parent) return;
+    const m = event.data;
+    if (!m || m.jsonrpc !== "2.0") return;
+    if (m.id !== undefined && m.method === undefined) {
+      const p = pending.get(m.id);
+      if (!p) return;
+      pending.delete(m.id);
+      m.error ? p.reject(m.error) : p.resolve(m.result);
+      return;
+    }
+    switch (m.method) {
+      case "ui/notifications/tool-result":
+        show(m.params || {});
+        break;
+      case "ui/notifications/tool-cancelled":
+        setNote((m.params && m.params.reason) || "cancelled", true);
+        break;
+      case "ui/notifications/host-context-changed":
+        if (m.params && m.params.theme) document.documentElement.dataset.theme = m.params.theme;
+        break;
+      case "ui/resource-teardown":
+      case "ping":
+        if (m.id !== undefined) post({ jsonrpc: "2.0", id: m.id, result: {} });
+        break;
+    }
+  });
+
+  $("open").addEventListener("click", () => {
+    if (state.link) send("ui/open-link", { url: state.link }).catch(() => {});
+  });
+
+  async function start() {
+    try {
+      const init = await send("ui/initialize", { appInfo: { name: "__NAME__ __TITLE__", version: "__VERSION__" }, appCapabilities: {} });
+      const context = (init && init.hostContext) || {};
+      if (context.theme) document.documentElement.dataset.theme = context.theme;
+      state.serverTools = !!(init && init.hostCapabilities && init.hostCapabilities.serverTools);
+    } catch (_) {}
+    notify("ui/notifications/initialized");
+    if (!document.documentElement.dataset.theme && window.matchMedia("(prefers-color-scheme: dark)").matches) document.documentElement.dataset.theme = "dark";
+  }
+
+  new ResizeObserver(() => {
+    const r = $("shell").getBoundingClientRect();
+    notify("ui/notifications/size-changed", { width: Math.ceil(r.width), height: Math.ceil(r.height) + 8 });
+  }).observe($("shell"));
+
+  start();
+})();
+</script>
+</body>
+</html>
