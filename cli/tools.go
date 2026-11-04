@@ -29,6 +29,7 @@ const AccessNone = "none"
 var Tooling = map[string]bool{
 	"mcp": true, "plugin": true, "skill": true, "completion": true, "config": true,
 	"help": true, "version": true, "token": true, "login": true, "logout": true,
+	"terraform": true,
 }
 
 var readVerbs = map[string]bool{"get": true, "list": true, "status": true, "show": true, "read": true, "check": true, "stat": true}

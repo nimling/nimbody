@@ -102,9 +102,18 @@ func Report(out io.Writer, name string, err error) {
 	}
 }
 
+const EnvTerraform = "TF_PLUGIN_MAGIC_COOKIE"
+
+var Provider func() error
+
 func Execute(root *cobra.Command) int {
 	root.SilenceErrors = true
 	root.SilenceUsage = true
+	if Provider != nil && os.Getenv(EnvTerraform) != "" {
+		err := Provider()
+		Report(root.ErrOrStderr(), root.Name(), err)
+		return ExitCode(err)
+	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	err := root.ExecuteContext(ctx)
