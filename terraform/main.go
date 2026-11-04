@@ -11,12 +11,13 @@ import (
 	"github.com/hashicorp/terraform-plugin-go/tfprotov6"
 	"github.com/hashicorp/terraform-plugin-go/tfprotov6/tf6server"
 	"github.com/nimling/nimbody/cli"
+	"github.com/nimling/nimbody/terraform/registry"
 	"github.com/spf13/cobra"
 )
 
 const DefaultHost = "registry.terraform.io"
 
-const DefaultNamespace = "nimling"
+const DefaultNamespace = registry.Namespace
 
 type Provider struct {
 	Name       string
@@ -100,10 +101,7 @@ func (p Provider) Install(dir string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	file := "terraform-provider-" + p.Name + "_v" + version
-	if runtime.GOOS == "windows" {
-		file += ".exe"
-	}
+	file := registry.GetFiles(p.Name, version, runtime.GOOS, runtime.GOARCH).Executable
 	host, namespace, name := p.address()
 	path := filepath.Join(dir, host, namespace, name, version, runtime.GOOS+"_"+runtime.GOARCH, file)
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
@@ -138,5 +136,41 @@ func Command(p Provider) *cobra.Command {
 	}
 	install.Flags().StringVar(&dir, "dir", "", "the plugin directory or filesystem mirror to place the provider in, ~/.terraform.d/plugins by default")
 	root.AddCommand(install)
+
+	var out, modules string
+	pack := &cobra.Command{
+		Use:     "package <os>_<arch>=<binary>...",
+		Short:   "Write the release files of the " + p.Name + " provider: one zip per platform, their SHA256SUMS to sign, and a tar.gz per module",
+		Example: "  " + p.Name + " terraform package --dir dist --modules deploy/terraform linux_amd64=build/" + p.Name + "_linux_amd64 darwin_arm64=build/" + p.Name + "_darwin_arm64",
+		Args:    cobra.MinimumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			version, err := p.version()
+			if err != nil {
+				return err
+			}
+			release := registry.Package{Type: p.Name, Version: version, Modules: modules}
+			for _, arg := range args {
+				platform, path, ok := strings.Cut(arg, "=")
+				goos, goarch, split := strings.Cut(platform, "_")
+				if !ok || !split || goos == "" || goarch == "" || path == "" {
+					return cli.Rejected(arg+" is not <os>_<arch>=<binary>", "Name each build as linux_amd64=build/"+p.Name+"_linux_amd64.")
+				}
+				release.Binaries = append(release.Binaries, registry.Binary{OS: goos, Arch: goarch, Path: path})
+			}
+			written, err := registry.PutPackage(out, release)
+			if err != nil {
+				return err
+			}
+			for _, path := range written {
+				fmt.Fprintln(cmd.OutOrStdout(), path)
+			}
+			files := registry.GetFiles(p.Name, version, "", "")
+			fmt.Fprintf(cmd.ErrOrStderr(), "sign %s into %s with the org key\n", files.Sums, files.Signature)
+			return nil
+		},
+	}
+	pack.Flags().StringVar(&out, "dir", "dist", "the directory to write the release files to")
+	pack.Flags().StringVar(&modules, "modules", "", "the modules directory, deploy/terraform, holding <name>/<system>/ per module")
+	root.AddCommand(pack)
 	return root
 }
