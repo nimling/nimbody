@@ -12,15 +12,16 @@ The shared contract of a Go service and its cli. Every Go service imports its ht
 
 ## Packages
 
-What `stream/`, `mcp/` and `cli/` do: `.nimpress/packages.md`.
+What `stream/`, `mcp/`, `cli/` and `state/` do: `.nimpress/packages.md`.
 
 1. Root `main.go`: body binding and validation, `Bind`, `Validator`, `BodyValidator`, `Body`.
 2. `query/`: query parameter whitelisting and typed access, `ValidateQueryParams`, `QueryParams`, `ParseWith`, `GetTimeParam`.
 3. `respond/`: envelope, pagination and cursors, sort column allowlist, scope filtering, `RequestIDMiddleware`, `FriendlyJSONSerializer`, the step stream (`GetSteps`, `StepsFrom`, `Streaming`). What is frozen: `.claude/rules/envelope.md`; the contract: `.nimpress/envelope.md`.
 4. `stream/`: the client side of the step stream, `Read`, `Report`, `Line`, `Parse`, `Machine`, `EnvMCP`, and `GetLoginPage` with `LoginPage.Product` from the embedded `login.html`.
 5. `mcp/`: the stdio mcp server every cli serves through, `Server`, `Tool`, `Page`, `Command`, `Annotate`, `Argv`, `Exec`, `Frame`, the embedded `page.html` and `frame.html`; over streamable HTTP `Define`, `Route` and `Server.Mount`.
-6. `cli/`: the shared cli layer the `cli` skill in `~/.claude/skills/cli` describes: `Execute`, `Error`, `Print`, `FormatFor`, `FormatPlain`, `Colour`, `Style`, `Tools`, `Access`, `MCPCommand`, `AnnotationMCPPage`, `SkillCommand`, `SkillTreeCommand`, `PluginCommand`, `Settings`, `Flags`, `Load`, `Guard`, `ConfigCommand`, `Output`, `OperationCommand`, `Bridge`, `Relay`.
+6. `cli/`: the shared cli layer the `cli` skill in `~/.claude/skills/cli` describes: `Execute`, `Error`, `Print`, `FormatFor`, `FormatPlain`, `Colour`, `Style`, `Tools`, `Access`, `MCPCommand`, `AnnotationMCPPage`, `SkillCommand`, `SkillTreeCommand`, `PluginCommand`, `Settings`, `Flags`, `Load`, `Guard`, `ConfigCommand`, `Output`, `OperationCommand`, `Bridge`, `Relay`, `StateCommand`, `Send`.
 7. `shape/`: fields, sort, jq and templates over decoded json, shared by `cli.Output` and the remote mcp tools.
+8. `state/`: export and import of a service's data through `/state`, `Register`, `Group`, `Context`, `Resolver`, `Read` and `File`, the NDJSON state lines with manifest hashes, key mapping, dry run and sync.
 
 ## Index
 
