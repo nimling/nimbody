@@ -180,7 +180,7 @@ func containsString(list []string, value string) bool {
 	return false
 }
 
-func stateService(m *memory) (*echo.Echo, []mcp.Operation) {
+func stateService(m *memory, extra ...state.Definition) (*echo.Echo, []mcp.Operation) {
 	location := memoryGroup[locationBody](m, "location")
 	location.Schema = map[string]any{"type": "object", "properties": map[string]any{
 		"name":   map[string]any{"type": "string"},
@@ -258,7 +258,7 @@ func stateService(m *memory) (*echo.Echo, []mcp.Operation) {
 		},
 	}
 	e := echo.New()
-	operations := state.Register(e.Group("/api"), host, room, location)
+	operations := state.Register(e.Group("/api"), host, append([]state.Definition{room, location}, extra...)...)
 	return e, operations
 }
 
@@ -598,7 +598,7 @@ type connectionBody struct {
 	Auth   map[string]any `json:"auth,omitempty"`
 }
 
-func connectionService(m *memory) *echo.Echo {
+func connectionGroup(m *memory) state.Group[connectionBody] {
 	connection := memoryGroup[connectionBody](m, "connection")
 	connection.Schema = map[string]any{"type": "object", "properties": map[string]any{
 		"name": map[string]any{"type": "string"},
@@ -622,8 +622,12 @@ func connectionService(m *memory) *echo.Echo {
 	connection.Sensitive = func() map[string][]string {
 		return map[string][]string{"oauth": {"/config/refresh_token"}, "basic": {"/config/password", "/config/password"}}
 	}
+	return connection
+}
+
+func connectionService(m *memory) *echo.Echo {
 	e := echo.New()
-	state.Register(e.Group("/api"), state.Context{Service: "demo", Version: "v1.2.3", Keys: m}, connection)
+	state.Register(e.Group("/api"), state.Context{Service: "demo", Version: "v1.2.3", Keys: m}, connectionGroup(m))
 	return e
 }
 
