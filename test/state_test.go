@@ -556,7 +556,7 @@ func TestStateCommand(t *testing.T) {
 
 	out, _, err := run("state")
 	assert.NoError(t, err)
-	assert.Contains(t, out, `"format": "1"`)
+	assert.Contains(t, out, `"format": "2"`)
 
 	file := filepath.Join(t.TempDir(), "rooms.ndjson")
 	_, errOut, err := run("state", "export", "--target", "room:kind=meeting", "--target", "location", "--blobs", "-o", file)

@@ -15,7 +15,7 @@ import (
 	"github.com/nimling/nimbody/respond"
 )
 
-const FormatVersion = "1"
+const FormatVersion = "2"
 
 const MIMENDJSON = "application/x-ndjson"
 
