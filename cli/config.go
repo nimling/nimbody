@@ -436,7 +436,7 @@ func (s *Settings) ConfigCommand() *cobra.Command {
 		Example: s.Name + " config get --config prd",
 		Args:    cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return PrintValue(cmd.OutOrStdout(), s.Loaded, FormatFor(cmd.OutOrStdout(), false))
+			return PrintValue(cmd.OutOrStdout(), s.Loaded, FormatFor(cmd.OutOrStdout(), wantsJSON(cmd)))
 		},
 	}
 
@@ -463,7 +463,7 @@ func (s *Settings) ConfigCommand() *cobra.Command {
 			for _, name := range names {
 				rows = append(rows, map[string]any{"name": name, "default": name == home.Default, "active": name == s.Loaded.Config, "protected": home.Configs[name][KeyProtected] == "true"})
 			}
-			return PrintValue(cmd.OutOrStdout(), rows, FormatFor(cmd.OutOrStdout(), false))
+			return PrintValue(cmd.OutOrStdout(), rows, FormatFor(cmd.OutOrStdout(), wantsJSON(cmd)))
 		},
 	}
 

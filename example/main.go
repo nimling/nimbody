@@ -21,6 +21,10 @@ var settings = &cli.Settings{Name: "demo", Prefix: "DEMO_", Keys: []cli.Setting{
 	{Key: cli.KeyClientSecret, Env: "DEMO_CLIENT_SECRET", Secret: true},
 }}
 
+const banner = "demo, the example cli on the shared layer\n\n"
+
+const skill = "---\nname: demo\ndescription: Operates the demo articles api with the demo cli. Use when reading or changing articles.\n---\n\n# demo\n\n## Articles\n\n1. demo article get [id] reads articles; create, update and delete change them.\n2. demo api <method> <path> reaches any other path.\n"
+
 var output = &cli.Output{}
 
 var client = &cli.Client{Settings: settings, Product: "Demo", Version: func() string { return "v0.0.0" }, Output: output}
@@ -28,23 +32,13 @@ var client = &cli.Client{Settings: settings, Product: "Demo", Version: func() st
 func main() {
 	_ = godotenv.Load(".env")
 
-	root := &cobra.Command{
-		Use:         "demo",
-		Short:       "Operate the demo articles api",
-		Annotations: map[string]string{cli.AnnotationMCPInput: cli.InputTyped},
-		PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
-			if err := settings.Load(cmd); err != nil {
-				return err
-			}
-			return settings.Guard(cmd, args)
-		},
-	}
+	root := cli.Root(&cobra.Command{Use: "demo", Short: "Operate the demo articles api"}, settings, output)
+	root.SetHelpCommand(cli.HelpCommand(banner, skill))
+	root.SetHelpFunc(cli.HelpFunc(banner, root.HelpFunc()))
 	flags := root.PersistentFlags()
 	flags.String("endpoint", "", "service base url, defaults to DEMO_ENDPOINT")
 	flags.String("app", "", "app slug, defaults to DEMO_APP_SLUG")
 	flags.String("client-id", "", "machine client id, defaults to DEMO_CLIENT_ID")
-	settings.Flags(root)
-	output.Flags(root)
 
 	table := cli.Table{Name: "demo", Send: client.Send, Output: output, Resources: []cli.Resource{{
 		Name: "article", Short: "Articles",
