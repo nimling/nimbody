@@ -433,6 +433,19 @@ func TestCLIBodyFlagsNestDecodeAndRefuseBoth(t *testing.T) {
 	assert.True(t, strings.HasPrefix(contentType, "multipart/form-data; boundary="))
 	assert.Contains(t, string(payload), `name="name"`)
 	assert.Contains(t, string(payload), `filename="logo.png"`)
+
+	template := filepath.Join(t.TempDir(), "login.html")
+	assert.NoError(t, os.WriteFile(template, []byte("<p>{{.App.Name}}</p>"), 0o600))
+	settings := filepath.Join(t.TempDir(), "settings.json")
+	assert.NoError(t, os.WriteFile(settings, []byte(`{"a":1}`), 0o600))
+	payload, _, err = (&cli.Body{Sets: []string{"template=@" + template, "settings=@" + settings}}).Get(nil)
+	assert.NoError(t, err)
+	assert.JSONEq(t, `{"template":"<p>{{.App.Name}}</p>","settings":{"a":1}}`, string(payload))
+	_, _, err = (&cli.Body{Sets: []string{"template=@" + filepath.Join(t.TempDir(), "missing.html")}}).Get(nil)
+	assert.Equal(t, cli.ExitRejected, cli.ExitCode(err))
+	payload, _, err = (&cli.Body{Upload: file, Sets: []string{"name=@" + template}}).Get(nil)
+	assert.NoError(t, err)
+	assert.Contains(t, string(payload), "<p>{{.App.Name}}</p>")
 }
 
 func TestCLIAPICommandReachesAnyPath(t *testing.T) {

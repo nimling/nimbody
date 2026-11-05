@@ -25,7 +25,7 @@ type Body struct {
 
 func (b *Body) Flags(cmd *cobra.Command, upload bool) {
 	flags := cmd.Flags()
-	flags.StringArrayVar(&b.Sets, "set", nil, "body field as key=value, repeatable, dotted keys nest, json values decode")
+	flags.StringArrayVar(&b.Sets, "set", nil, "body field as key=value, repeatable, dotted keys nest, json values decode, key=@path reads the value from a file")
 	flags.StringVar(&b.Data, "data", "", "request body as a json object")
 	flags.StringVarP(&b.File, "file", "f", "", "read the request body from a json file, or - for stdin")
 	if upload {
@@ -67,6 +67,10 @@ func (b *Body) Get(in io.Reader) ([]byte, string, error) {
 		if !found || key == "" {
 			return nil, "", Rejected("set entries look like key=value, got "+entry, "")
 		}
+		value, err := getSetValue(value)
+		if err != nil {
+			return nil, "", err
+		}
 		assign(payload, strings.Split(key, "."), decodeValue(value))
 	}
 	if len(payload) == 0 {
@@ -88,6 +92,10 @@ func (b *Body) multipart() ([]byte, string, error) {
 		key, value, found := strings.Cut(entry, "=")
 		if !found || key == "" {
 			return nil, "", Rejected("set entries look like key=value, got "+entry, "")
+		}
+		value, err := getSetValue(value)
+		if err != nil {
+			return nil, "", err
 		}
 		if err := writer.WriteField(key, value); err != nil {
 			return nil, "", err
@@ -116,6 +124,18 @@ func assign(target map[string]any, path []string, value any) {
 		target = next
 	}
 	target[path[len(path)-1]] = value
+}
+
+func getSetValue(value string) (string, error) {
+	path, isFile := strings.CutPrefix(value, "@")
+	if !isFile {
+		return value, nil
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return "", Rejected("cannot read "+path, "")
+	}
+	return string(raw), nil
 }
 
 func decodeValue(value string) any {
