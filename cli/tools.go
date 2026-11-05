@@ -389,8 +389,17 @@ func OperationCommand(operation mcp.Operation, call Call) *cobra.Command {
 		Annotations: map[string]string{AnnotationMCP: operation.Access},
 	}
 	flags := cmd.Flags()
+	raw, declared := &Body{Raw: true}, false
 	for _, input := range operation.Inputs {
 		if input.In == mcp.InPath || input.In == mcp.InHeader {
+			continue
+		}
+		if input.In == mcp.InBody && input.Param == "*" {
+			raw.Flags(cmd, false)
+			declared = true
+			if input.Required {
+				cmd.MarkFlagsOneRequired("data", "file")
+			}
 			continue
 		}
 		if input.In == mcp.InQuery && strings.HasSuffix(input.Param, "*") {
@@ -469,6 +478,13 @@ func OperationCommand(operation mcp.Operation, call Call) *cobra.Command {
 				return err
 			}
 			body = encoded
+		}
+		if declared {
+			given, _, err := raw.Get(cmd.InOrStdin())
+			if err != nil {
+				return err
+			}
+			body = given
 		}
 		return call(cmd, operation.Method, path, query, body)
 	}

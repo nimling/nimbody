@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -770,4 +771,44 @@ func TestDefineRawBodyAnswersNotFoundBeforeTheBodyIsRead(t *testing.T) {
 
 	rec = serveRoute(e, http.MethodPut, "/api/devices/7", nil, `{"name":`)
 	assert.Equal(t, http.StatusBadRequest, rec.Code)
+}
+
+func TestOperationCommandSendsTheRawBodyAsGiven(t *testing.T) {
+	operation := mcp.Define(mcp.Spec{Name: "operation_call", Description: "Call an operation", Method: http.MethodPost, Path: "/calls/:name", Access: mcp.AccessWrite},
+		func(ctx echo.Context, in callInput) (map[string]any, error) {
+			return nil, nil
+		})
+	var sent []byte
+	call := func(cmd *cobra.Command, m, p string, q url.Values, b []byte) error {
+		sent = b
+		return nil
+	}
+	file := t.TempDir() + "/input.json"
+	assert.NoError(t, os.WriteFile(file, []byte(`42`), 0o600))
+	for _, run := range []struct {
+		args  []string
+		stdin string
+		want  string
+	}{
+		{[]string{"read", "--data", `[1,"two"]`}, "", `[1,"two"]`},
+		{[]string{"read", "--file", file}, "", `42`},
+		{[]string{"read", "--file", "-"}, `"hall"`, `"hall"`},
+		{[]string{"read"}, "", ``},
+	} {
+		sent = nil
+		cmd := cli.OperationCommand(operation, call)
+		assert.Nil(t, cmd.Flags().Lookup("*"))
+		assert.Nil(t, cmd.Flags().Lookup("set"))
+		cmd.SetIn(strings.NewReader(run.stdin))
+		cmd.SetArgs(run.args)
+		assert.NoError(t, cmd.Execute(), run.args)
+		assert.Equal(t, run.want, string(sent), run.args)
+	}
+
+	for _, args := range [][]string{{"read", "--data", `{"broken`}, {"read", "--data", `1`, "--file", file}} {
+		cmd := cli.OperationCommand(operation, call)
+		cmd.SilenceErrors, cmd.SilenceUsage = true, true
+		cmd.SetArgs(args)
+		assert.Error(t, cmd.Execute(), args)
+	}
 }
