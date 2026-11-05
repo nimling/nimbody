@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -467,6 +468,19 @@ func TestStateFieldFlagsDecideDrift(t *testing.T) {
 	created := importState(t, e, "mode=create", []byte(edited))
 	assert.Equal(t, state.OutcomeRefused, outcomes(created)["room:room-2"])
 	assert.Equal(t, state.OutcomeUnchanged, outcomes(created)["room:room-1"])
+}
+
+func TestStateExportDeclaresAnUnboundedFrame(t *testing.T) {
+	e, _ := stateService(seeded())
+	rec := call(e, http.MethodPost, "/api/state/export", echo.MIMEApplicationJSON, respond.MIMEEventStream, []byte(`{}`))
+	assert.Equal(t, "0", rec.Header().Get(respond.HeaderFrameLimit))
+	out, err := stream.Read(rec.Result(), nil)
+	assert.NoError(t, err)
+	assert.Equal(t, http.StatusOK, out.Status)
+
+	file := exportState(t, e, ``)
+	rec = call(e, http.MethodPost, "/api/state/import", state.MIMENDJSON, respond.MIMEEventStream, file)
+	assert.Equal(t, strconv.Itoa(respond.FrameLimit), rec.Header().Get(respond.HeaderFrameLimit), "a route that declares nothing announces the default")
 }
 
 func TestStateImportReportsOverTheStepStream(t *testing.T) {

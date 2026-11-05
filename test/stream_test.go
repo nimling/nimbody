@@ -1,9 +1,11 @@
 package test
 
 import (
+	"bufio"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -73,4 +75,45 @@ func TestLoginPageEscapesAndMarksFailure(t *testing.T) {
 	assert.NoError(t, err)
 	assert.Contains(t, string(failed), "card failed")
 	assert.NotContains(t, string(failed), "<script>x</script>")
+}
+
+func frameServer(middleware ...echo.MiddlewareFunc) *echo.Echo {
+	e := echo.New()
+	e.POST("/big", func(ctx echo.Context) error {
+		return respond.JSON(ctx, http.StatusOK, strings.Repeat("x", respond.FrameLimit+1), 1)
+	}, middleware...)
+	return e
+}
+
+func streamFrame(e *echo.Echo) *http.Response {
+	req := httptest.NewRequest(http.MethodPost, "/big", nil)
+	req.Header.Set(echo.HeaderAccept, respond.MIMEEventStream)
+	rec := httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+	return rec.Result()
+}
+
+func TestStreamReadTakesTheFrameLimitTheEndpointDeclares(t *testing.T) {
+	res := streamFrame(frameServer(respond.FrameLimitMiddleware(respond.FrameLimit * 2)))
+	assert.Equal(t, strconv.Itoa(respond.FrameLimit*2), res.Header.Get(respond.HeaderFrameLimit))
+	out, err := stream.Read(res, nil)
+	assert.NoError(t, err)
+	assert.Equal(t, http.StatusOK, out.Status)
+	assert.Greater(t, len(out.Body), respond.FrameLimit)
+
+	out, err = stream.Read(streamFrame(frameServer(respond.FrameLimitMiddleware(0))), nil)
+	assert.NoError(t, err, "a limit of 0 is unbounded")
+	assert.Greater(t, len(out.Body), respond.FrameLimit)
+}
+
+func TestStreamReadKeepsTheDefaultFrameLimit(t *testing.T) {
+	res := streamFrame(frameServer())
+	assert.Equal(t, strconv.Itoa(respond.FrameLimit), res.Header.Get(respond.HeaderFrameLimit))
+	_, err := stream.Read(res, nil)
+	assert.ErrorIs(t, err, bufio.ErrTooLong)
+
+	res = streamFrame(frameServer())
+	res.Header.Del(respond.HeaderFrameLimit)
+	_, err = stream.Read(res, nil)
+	assert.ErrorIs(t, err, bufio.ErrTooLong, "a stream that announces nothing keeps the default")
 }

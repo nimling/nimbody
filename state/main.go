@@ -335,7 +335,7 @@ func Register(router *echo.Group, host Context, definitions ...Definition) []mcp
 		middleware = append(middleware, host.Access)
 	}
 	router.GET("/state", s.getDocument, middleware...)
-	router.POST("/state/export", s.postExport, middleware...)
+	router.POST("/state/export", s.postExport, append([]echo.MiddlewareFunc{respond.FrameLimitMiddleware(0)}, middleware...)...)
 	router.POST("/state/import", s.postImport, middleware...)
 
 	return []mcp.Operation{

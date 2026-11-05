@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -12,7 +13,11 @@ import (
 	"github.com/labstack/echo/v4"
 )
 
-const MIMEEventStream = "text/event-stream"
+const (
+	MIMEEventStream  = "text/event-stream"
+	HeaderFrameLimit = "X-Frame-Limit"
+	FrameLimit       = 1 << 24
+)
 
 type Step struct {
 	ID        string     `json:"id"`
@@ -39,6 +44,15 @@ type Steps struct {
 }
 
 type stepsKey struct{}
+
+func FrameLimitMiddleware(bytes int) echo.MiddlewareFunc {
+	return func(next echo.HandlerFunc) echo.HandlerFunc {
+		return func(ctx echo.Context) error {
+			ctx.Set("frame_limit", bytes)
+			return next(ctx)
+		}
+	}
+}
 
 func Streaming(ctx echo.Context) bool {
 	return strings.Contains(ctx.Request().Header.Get(echo.HeaderAccept), MIMEEventStream)
@@ -108,6 +122,11 @@ func writeEvent(ctx echo.Context, event string, data any) error {
 		res.Header().Set("Cache-Control", "no-cache")
 		res.Header().Set("Connection", "keep-alive")
 		res.Header().Set("X-Accel-Buffering", "no")
+		limit := FrameLimit
+		if declared, ok := ctx.Get("frame_limit").(int); ok {
+			limit = declared
+		}
+		res.Header().Set(HeaderFrameLimit, strconv.Itoa(limit))
 		res.WriteHeader(http.StatusOK)
 	}
 	body, err := json.Marshal(data)
