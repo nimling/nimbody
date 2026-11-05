@@ -389,7 +389,7 @@ func (c *Client) Remote(ctx context.Context) (string, string, error) {
 }
 
 func (c *Client) Mount(root *cobra.Command) {
-	root.AddCommand(c.LoginCommand(), c.LogoutCommand(), c.StatusCommand(), c.TokenCommand())
+	root.AddCommand(c.LoginCommand(), c.LogoutCommand(), c.StatusCommand(), c.TokenCommand(), APICommand(c.Send, c.output()))
 	if Bridge == nil {
 		Bridge = c.Remote
 	}

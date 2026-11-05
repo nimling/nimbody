@@ -38,7 +38,7 @@ The shared cli layer the `cli` skill describes.
 
 4.2. `Client` is the api client and its login. The credential is `<PREFIX>TOKEN` (or `<PREFIX>ACCESS_TOKEN`) for CI, else the stored login, refreshed before expiry under the cross process lock, else the machine pair sent as Basic auth to the service. A cli whose service is the prophet sets `Exchange` and exchanges the pair for a token, cached under the same lock, so parallel runs share one. `Send` sends through it with the step stream, the `User-Agent` and the family exit codes. `Mount` adds `login` (PKCE, loopback or `--no-browser`), `logout`, `status` and `token`, and makes `Remote` the default `Bridge`: `<cli> mcp` relays to the service's `/mcp` when `/status` lists it and the credential is a bearer token, and serves the tools locally otherwise.
 
-5. `Output` is the shared renderer with `--json`, `--raw`, `--plain`, `--fields`, `--sort`, `--jq`, `--template`, `--limit` and `--cursor`. `OperationCommand` builds a command from an `mcp.Operation`. `Bridge` and `Relay` make `<cli> mcp` relay stdio to the backend `/mcp` with the stored login.
+5. `Output` is the shared renderer with `--json`, `--raw`, `--plain`, `--fields`, `--sort`, `--jq`, `--template`, `--limit` and `--cursor`. `OperationCommand` builds a command from an `mcp.Operation`. `Table` builds the resource commands from `Resource` and `Verb` declarations, with the ids positional in path order, the access from the method, the body flags and an `Example` per command; `Body` is `--set`, `--data`, `--file` and `--upload`, and `APICommand` is `api <method> <path>`. `Bridge` and `Relay` make `<cli> mcp` relay stdio to the backend `/mcp` with the stored login.
 
 ## state
 

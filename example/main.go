@@ -46,26 +46,20 @@ func main() {
 	settings.Flags(root)
 	output.Flags(root)
 
-	articles := &cobra.Command{Use: "article", Short: "Articles"}
-	get := cli.PutOutput[[]article](&cobra.Command{
-		Use:     "get [id]",
-		Short:   "Read articles, or one by id",
-		Example: "demo article get 42",
-		Args:    cobra.MaximumNArgs(1),
-		RunE: func(cmd *cobra.Command, args []string) error {
-			path := "/api/articles"
-			if len(args) == 1 {
-				path += "/" + args[0]
-			}
-			body, err := client.Send(cmd, http.MethodGet, path, output.GetQuery(), "", nil)
-			if err != nil {
-				return err
-			}
-			return output.Print(cmd.OutOrStdout(), cmd.ErrOrStderr(), body)
+	table := cli.Table{Name: "demo", Send: client.Send, Output: output, Resources: []cli.Resource{{
+		Name: "article", Short: "Articles",
+		Verbs: []cli.Verb{
+			{Name: "get", Short: "Read articles, or one by id", Method: http.MethodGet, Paths: []string{"/api/articles", "/api/articles/{id}"}},
+			{Name: "create", Short: "Add an article", Method: http.MethodPost, Paths: []string{"/api/articles"}, Body: true},
+			{Name: "update", Short: "Change fields of an article", Method: http.MethodPatch, Paths: []string{"", "/api/articles/{id}"}, Body: true},
+			{Name: "delete", Short: "Remove an article", Method: http.MethodDelete, Paths: []string{"", "/api/articles/{id}"}},
 		},
-	})
-	articles.AddCommand(get)
-	root.AddCommand(articles, settings.ConfigCommand(), cli.MCPCommand(root, "demo", client.Version))
+	}}}
+	table.Mount(root)
+	if get, _, err := root.Find([]string{"article", "get"}); err == nil {
+		cli.PutOutput[[]article](get)
+	}
+	root.AddCommand(settings.ConfigCommand(), cli.MCPCommand(root, "demo", client.Version))
 	client.Mount(root)
 	os.Exit(cli.Execute(root))
 }

@@ -5,6 +5,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -393,4 +395,109 @@ func TestCLIOperationExampleReachesCommandAndTool(t *testing.T) {
 	assert.Equal(t, "demo article get 42", cli.OperationCommand(operation, nil).Example)
 	assert.Contains(t, operation.Tool().Description, "example: demo article get 42")
 	assert.LessOrEqual(t, len([]rune(mcp.Describe(strings.Repeat("x", 5000), ""))), mcp.DescriptionLimit)
+}
+
+type sent struct {
+	method, path, contentType string
+	query                     url.Values
+	body                      []byte
+}
+
+func recordSend(into *sent) cli.Send {
+	return func(cmd *cobra.Command, method, path string, query url.Values, contentType string, body []byte) ([]byte, error) {
+		*into = sent{method: method, path: path, query: query, contentType: contentType, body: body}
+		return []byte(`{"data":{"id":"1"},"request_id":"r"}`), nil
+	}
+}
+
+func TestCLIBodyFlagsNestDecodeAndRefuseBoth(t *testing.T) {
+	body := cli.Body{Data: `{"title":"Orion"}`, Sets: []string{"owner.email=a@x.no", "tags=[\"news\"]", "count=3"}}
+	payload, contentType, err := body.Get(nil)
+	assert.NoError(t, err)
+	assert.Equal(t, cli.ContentTypeJSON, contentType)
+	assert.JSONEq(t, `{"title":"Orion","owner":{"email":"a@x.no"},"tags":["news"],"count":3}`, string(payload))
+
+	payload, _, err = (&cli.Body{File: "-"}).Get(strings.NewReader(`{"a":1}`))
+	assert.NoError(t, err)
+	assert.JSONEq(t, `{"a":1}`, string(payload))
+
+	_, _, err = (&cli.Body{Data: "{}", File: "x.json"}).Get(nil)
+	assert.Equal(t, cli.ExitRejected, cli.ExitCode(err))
+	_, _, err = (&cli.Body{Sets: []string{"nokey"}}).Get(nil)
+	assert.Equal(t, cli.ExitRejected, cli.ExitCode(err))
+
+	file := filepath.Join(t.TempDir(), "logo.png")
+	assert.NoError(t, os.WriteFile(file, []byte("png"), 0o600))
+	payload, contentType, err = (&cli.Body{Upload: file, Sets: []string{"name=logo"}}).Get(nil)
+	assert.NoError(t, err)
+	assert.True(t, strings.HasPrefix(contentType, "multipart/form-data; boundary="))
+	assert.Contains(t, string(payload), `name="name"`)
+	assert.Contains(t, string(payload), `filename="logo.png"`)
+}
+
+func TestCLIAPICommandReachesAnyPath(t *testing.T) {
+	var got sent
+	root := &cobra.Command{Use: "demo"}
+	root.AddCommand(cli.APICommand(recordSend(&got), &cli.Output{}))
+	root.SetOut(&bytes.Buffer{})
+	root.SetArgs([]string{"api", "post", "/api/articles", "--set", "title=Orion"})
+	assert.NoError(t, root.Execute())
+	assert.Equal(t, sent{method: "POST", path: "/api/articles", contentType: cli.ContentTypeJSON, query: url.Values{}, body: []byte(`{"title":"Orion"}`)}, got)
+
+	api, _, _ := root.Find([]string{"api"})
+	root.SetArgs([]string{"api", "GET", "/api/articles"})
+	assert.NoError(t, root.Execute())
+	assert.Equal(t, mcp.AccessRead, cli.Access(api), "a GET through api is a read, so a protected config does not ask")
+
+	root.SetArgs([]string{"api", "FETCH", "/x"})
+	assert.Equal(t, cli.ExitRejected, cli.ExitCode(root.Execute()))
+	root.SetArgs([]string{"api", "GET", "x"})
+	assert.Equal(t, cli.ExitRejected, cli.ExitCode(root.Execute()))
+}
+
+func TestCLIResourceTableBuildsVerbsExamplesAndShortcuts(t *testing.T) {
+	var got sent
+	table := cli.Table{Name: "demo", Send: recordSend(&got), Output: &cli.Output{}, Fill: map[string]func() (string, error){"app": func() (string, error) { return "my-app", nil }}, Resources: []cli.Resource{{
+		Name: "app", Short: "Apps",
+		Verbs: []cli.Verb{
+			{Name: "get", Short: "Read apps", Method: http.MethodGet, Paths: []string{"/api/app", "/api/app/{id}"}},
+			{Name: "delete", Short: "Remove an app", Method: http.MethodDelete, Paths: []string{"", "/api/app/{id}"}},
+		},
+		Children: []cli.Resource{{Name: "client", Short: "Clients of the app", Verbs: []cli.Verb{
+			{Name: "create", Short: "Add a client", Method: http.MethodPost, Paths: []string{"/api/app/{app}/client"}, Body: true},
+			{Name: "rotate", Short: "Rotate a secret", Method: http.MethodPost, Paths: []string{"", "/api/app/{app}/client/{id}/rotate"}, Example: "demo app client rotate 7"},
+		}}},
+	}}}
+	root := &cobra.Command{Use: "demo"}
+	table.Mount(root)
+	root.SetOut(&bytes.Buffer{})
+	root.SetErr(&bytes.Buffer{})
+
+	get, _, _ := root.Find([]string{"app", "get"})
+	assert.Equal(t, "get [id]", get.Use)
+	assert.Equal(t, "demo app get\ndemo app get <id>", get.Example)
+	remove, _, _ := root.Find([]string{"app", "delete"})
+	assert.Equal(t, "delete <id>", remove.Use)
+	assert.Equal(t, mcp.AccessDestructive, cli.Access(remove))
+	create, _, _ := root.Find([]string{"app", "client", "create"})
+	assert.Equal(t, "create", create.Use, "a filled placeholder is no positional")
+	assert.Contains(t, create.Example, "demo app client create --set name=Orion")
+	rotate, _, _ := root.Find([]string{"app", "client", "rotate"})
+	assert.Equal(t, "demo app client rotate 7", rotate.Example)
+
+	root.SetArgs([]string{"app", "client", "create", "--set", "name=ci"})
+	assert.NoError(t, root.Execute())
+	assert.Equal(t, "/api/app/my-app/client", got.path)
+	assert.JSONEq(t, `{"name":"ci"}`, string(got.body))
+
+	root.SetArgs([]string{"client", "rotate", "a b"})
+	assert.NoError(t, root.Execute(), "a child name used once is a hidden top level shortcut")
+	assert.Equal(t, "/api/app/my-app/client/a%20b/rotate", got.path)
+
+	root.SetArgs([]string{"app", "delete"})
+	assert.Equal(t, cli.ExitRejected, cli.ExitCode(root.Execute()))
+
+	for _, tool := range cli.Tools(root, "/bin/demo") {
+		assert.Contains(t, tool.Description, "example: demo ", tool.Name)
+	}
 }
