@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/labstack/echo/v4"
 	"github.com/nimling/nimbody/cli"
+	"github.com/nimling/nimbody/endpoint"
 	"github.com/nimling/nimbody/mcp"
 	"github.com/nimling/nimbody/respond"
 	"github.com/spf13/cobra"
@@ -282,4 +284,292 @@ func TestOperationCommandMapsTheRoute(t *testing.T) {
 	assert.NoError(t, create.Execute())
 	assert.Equal(t, http.MethodPost, method)
 	assert.JSONEq(t, `{"title":"Atlas","draft":true}`, string(body))
+}
+
+type sourceInput struct {
+	SourceID string            `param:"source_id" json:"source_id,omitempty" jsonschema:"the source to read, every source when left out"`
+	AppSlug  string            `header:"SAuth-App-Slug" json:"app_slug,omitempty" jsonschema:"the app the session belongs to"`
+	Format   string            `query:"format" json:"format,omitempty"`
+	Vars     map[string]string `query:"var.*" json:"var,omitempty" jsonschema:"variables, var.<name>"`
+	Filters  map[string]any    `query:"*" json:"filter,omitempty" jsonschema:"any other filter"`
+	Title    string            `json:"title,omitempty"`
+}
+
+type source struct {
+	ID     string            `json:"id"`
+	App    string            `json:"app"`
+	Route  string            `json:"route"`
+	Title  string            `json:"title"`
+	Format string            `json:"format"`
+	Vars   map[string]string `json:"vars"`
+	Filter map[string]any    `json:"filter"`
+	Query  map[string]string `json:"query"`
+}
+
+func routeService(chain *int) (*echo.Echo, []mcp.Operation) {
+	auth := func(next echo.HandlerFunc) echo.HandlerFunc {
+		return func(ctx echo.Context) error {
+			if ctx.Request().Header.Get(echo.HeaderAuthorization) != "Bearer good" {
+				return ctx.String(http.StatusUnauthorized, "Unauthorized")
+			}
+			*chain++
+			return next(ctx)
+		}
+	}
+	session := func(next echo.HandlerFunc) echo.HandlerFunc {
+		return func(ctx echo.Context) error {
+			slug := ctx.Param("app_slug")
+			if slug == "" {
+				slug = ctx.Request().Header.Get("SAuth-App-Slug")
+			}
+			if slug == "" {
+				return respond.Error(ctx, http.StatusUnauthorized, "no app session", map[string]any{"needs": "app_slug"})
+			}
+			ctx.Set("app", slug)
+			return next(ctx)
+		}
+	}
+	read := func(ctx echo.Context, in sourceInput) (source, error) {
+		query := map[string]string{}
+		for key := range ctx.QueryParams() {
+			query[key] = ctx.QueryParam(key)
+		}
+		return source{ID: in.SourceID, App: ctx.Get("app").(string), Route: ctx.Path(), Title: in.Title, Format: in.Format, Vars: in.Vars, Filter: in.Filters, Query: query}, nil
+	}
+	chained := []echo.MiddlewareFunc{auth, session}
+	get := mcp.Define(mcp.Spec{Name: "source_get", Description: "Read sources, or one source", Method: http.MethodGet, Path: "/sources", Paths: []string{"/sources/:source_id"}, Access: mcp.AccessRead, Middleware: chained}, read)
+	put := mcp.Define(mcp.Spec{Name: "source_replace", Description: "Replace a source", Method: http.MethodPut, Path: "/sources/:source_id", Access: mcp.AccessWrite, Middleware: chained}, read)
+	test := mcp.Define(mcp.Spec{Name: "source_test", Description: "Test a source", Method: http.MethodPost, Path: "/sources/:source_id/test", Status: http.StatusOK, Access: mcp.AccessWrite, Middleware: chained}, read)
+	run := mcp.Define(mcp.Spec{Name: "source_run", Description: "Run a source", Method: http.MethodPost, Path: "/sources/:source_id/run", Status: http.StatusAccepted, Access: mcp.AccessWrite, Middleware: chained}, read)
+	remove := mcp.Define(mcp.Spec{Name: "source_delete", Description: "Delete a source", Method: http.MethodDelete, Path: "/sources/:source_id", Status: http.StatusNoContent, Access: mcp.AccessDestructive, Middleware: chained},
+		func(ctx echo.Context, in sourceInput) (struct{}, error) {
+			return struct{}{}, nil
+		})
+	check := mcp.Define(mcp.Spec{Name: "source_check", Description: "Check a source", Method: http.MethodPost, Path: "/sources/:source_id/check", Status: http.StatusOK, Invalid: "the check body is malformed", Access: mcp.AccessRead, Middleware: chained},
+		func(ctx echo.Context, in struct {
+			SourceID string `param:"source_id" json:"source_id"`
+			AppSlug  string `header:"SAuth-App-Slug" json:"app_slug,omitempty"`
+			Limit    int    `json:"limit_rows"`
+		}) (map[string]any, error) {
+			switch in.SourceID {
+			case "bad":
+				return nil, &respond.Rejection{Status: http.StatusBadRequest, Message: "source_id must be a uuid"}
+			case "conflict":
+				return nil, &respond.Rejection{Status: http.StatusConflict, Message: "the source is running", Data: map[string]any{"run_id": "r1"}}
+			case "broken":
+				return nil, errors.New("database refused the query")
+			case "loud":
+				return nil, &respond.Rejection{Status: http.StatusInternalServerError, Message: errors.New("database refused the query").Error()}
+			}
+			return map[string]any{"checked": in.SourceID, "rows": in.Limit}, nil
+		})
+	operations := []mcp.Operation{get, put, test, run, remove, check}
+	e := echo.New()
+	mcp.Route(e.Group("/api"), operations...)
+	server := &mcp.Server{Name: "demo", Version: "v1", Operations: operations, AuthorizationServer: "https://auth.example.test"}
+	server.Mount(e)
+	return e, operations
+}
+
+func serveRoute(e *echo.Echo, method, target string, header map[string]string, body string) *httptest.ResponseRecorder {
+	req := httptest.NewRequest(method, target, strings.NewReader(body))
+	req.Header.Set(echo.HeaderAuthorization, "Bearer good")
+	if body != "" {
+		req.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
+	}
+	for key, value := range header {
+		req.Header.Set(key, value)
+	}
+	rec := httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+	return rec
+}
+
+func callTool(t *testing.T, e *echo.Echo, name, arguments string) map[string]any {
+	rec := post(e, "good", "application/json", `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"`+name+`","arguments":`+arguments+`}}`)
+	assert.Equal(t, http.StatusOK, rec.Code)
+	return result(t, rec)
+}
+
+func routeEnvelope(t *testing.T, rec *httptest.ResponseRecorder) map[string]any {
+	var envelope map[string]any
+	assert.NoError(t, json.Unmarshal(rec.Body.Bytes(), &envelope), rec.Body.String())
+	return envelope
+}
+
+func TestDefineStatusIsTheSpecs(t *testing.T) {
+	var chain int
+	e, _ := routeService(&chain)
+	slug := map[string]string{"SAuth-App-Slug": "portal"}
+	assert.Equal(t, http.StatusOK, serveRoute(e, http.MethodPost, "/api/sources/7/test", slug, "").Code)
+	assert.Equal(t, http.StatusAccepted, serveRoute(e, http.MethodPost, "/api/sources/7/run", slug, "").Code)
+	removed := serveRoute(e, http.MethodDelete, "/api/sources/7", slug, "")
+	assert.Equal(t, http.StatusNoContent, removed.Code)
+	assert.Empty(t, removed.Body.String())
+
+	for _, name := range []string{"source_test", "source_run", "source_delete"} {
+		called := callTool(t, e, name, `{"source_id":"7","app_slug":"portal"}`)
+		assert.Nil(t, called["isError"], name)
+	}
+}
+
+func TestDefineErrorIsTheServicesOnBothTransports(t *testing.T) {
+	var chain int
+	e, _ := routeService(&chain)
+	slug := map[string]string{"SAuth-App-Slug": "portal"}
+	for id, want := range map[string]struct {
+		status  int
+		message string
+		data    any
+	}{
+		"bad":      {http.StatusBadRequest, "source_id must be a uuid", nil},
+		"conflict": {http.StatusConflict, "the source is running", map[string]any{"run_id": "r1"}},
+		"broken":   {http.StatusInternalServerError, "Internal server error", nil},
+		"loud":     {http.StatusInternalServerError, "database refused the query", nil},
+	} {
+		rec := serveRoute(e, http.MethodPost, "/api/sources/"+id+"/check", slug, "")
+		assert.Equal(t, want.status, rec.Code, id)
+		envelope := routeEnvelope(t, rec)
+		assert.Equal(t, want.message, envelope["error"].(map[string]any)["message"], id)
+		called := callTool(t, e, "source_check", `{"source_id":"`+id+`","app_slug":"portal"}`)
+		assert.Equal(t, true, called["isError"], id)
+		if id == "broken" {
+			assert.Equal(t, "the server failed on source_check", called["content"].([]any)[0].(map[string]any)["text"])
+			continue
+		}
+		assert.Equal(t, want.message, called["content"].([]any)[0].(map[string]any)["text"], id)
+		if want.data == nil {
+			assert.Nil(t, called["structuredContent"], id)
+			continue
+		}
+		assert.Equal(t, want.data, envelope["data"], id)
+		assert.Equal(t, want.data, called["structuredContent"].(map[string]any)["data"], id)
+	}
+
+	rec := serveRoute(e, http.MethodPost, "/api/sources/7/check", slug, `{"limit_rows":"many"}`)
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
+	assert.Equal(t, "the check body is malformed", routeEnvelope(t, rec)["error"].(map[string]any)["message"])
+	called := callTool(t, e, "source_check", `{"source_id":"7","app_slug":"portal","limit_rows":"many"}`)
+	assert.Equal(t, true, called["isError"])
+	assert.Equal(t, "the check body is malformed", called["content"].([]any)[0].(map[string]any)["text"])
+}
+
+func TestDefineOpenQueryKeysReachBothTransports(t *testing.T) {
+	var chain int
+	e, _ := routeService(&chain)
+	rec := serveRoute(e, http.MethodGet, "/api/sources/7?format=d2&var.region=eu&claim=reader&with=owner&limit=5", map[string]string{"SAuth-App-Slug": "portal"}, "")
+	assert.Equal(t, http.StatusOK, rec.Code)
+	routed := routeEnvelope(t, rec)["data"].(map[string]any)
+	called := callTool(t, e, "source_get", `{"source_id":"7","app_slug":"portal","format":"d2","var":{"region":"eu"},"filter":{"claim":"reader","with":"owner"},"limit":5}`)
+	assert.Nil(t, called["isError"])
+	tooled := called["structuredContent"].(map[string]any)["data"].(map[string]any)
+	for _, data := range []map[string]any{routed, tooled} {
+		assert.Equal(t, "d2", data["format"])
+		assert.Equal(t, map[string]any{"region": "eu"}, data["vars"])
+		assert.Equal(t, map[string]any{"claim": "reader", "with": "owner"}, data["filter"])
+		assert.Equal(t, map[string]any{"format": "d2", "var.region": "eu", "claim": "reader", "with": "owner", "limit": "5"}, data["query"])
+	}
+
+	_, operations := routeService(&chain)
+	properties := operations[0].InputSchema["properties"].(map[string]any)
+	assert.Equal(t, "variables, var.<name>", properties["var"].(map[string]any)["description"])
+	assert.Contains(t, properties, "filter")
+}
+
+func TestDefineHeaderPlaceholderReachesTheMiddleware(t *testing.T) {
+	var chain int
+	e, _ := routeService(&chain)
+	rec := serveRoute(e, http.MethodGet, "/api/sources/7", map[string]string{"SAuth-App-Slug": "portal"}, "")
+	assert.Equal(t, "portal", routeEnvelope(t, rec)["data"].(map[string]any)["app"])
+	called := callTool(t, e, "source_get", `{"source_id":"7","app_slug":"portal"}`)
+	assert.Equal(t, "portal", called["structuredContent"].(map[string]any)["data"].(map[string]any)["app"])
+
+	rec = serveRoute(e, http.MethodGet, "/api/sources/7", nil, "")
+	assert.Equal(t, http.StatusUnauthorized, rec.Code)
+	assert.Equal(t, map[string]any{"needs": "app_slug"}, routeEnvelope(t, rec)["data"])
+	called = callTool(t, e, "source_get", `{"source_id":"7"}`)
+	assert.Equal(t, true, called["isError"])
+	assert.Equal(t, "no app session", called["content"].([]any)[0].(map[string]any)["text"])
+	assert.Equal(t, map[string]any{"needs": "app_slug"}, called["structuredContent"].(map[string]any)["data"])
+}
+
+func TestDefineOneOperationOverSeveralPaths(t *testing.T) {
+	var chain int
+	e, operations := routeService(&chain)
+	assert.NotContains(t, operations[0].InputSchema, "required")
+	assert.Equal(t, []string{"source_id"}, operations[1].InputSchema["required"])
+
+	slug := map[string]string{"SAuth-App-Slug": "portal"}
+	listed := routeEnvelope(t, serveRoute(e, http.MethodGet, "/api/sources", slug, ""))["data"].(map[string]any)
+	one := routeEnvelope(t, serveRoute(e, http.MethodGet, "/api/sources/7", slug, ""))["data"].(map[string]any)
+	assert.Equal(t, "/api/sources", listed["route"])
+	assert.Equal(t, "", listed["id"])
+	assert.Equal(t, "/api/sources/:source_id", one["route"])
+	assert.Equal(t, "7", one["id"])
+
+	listed = callTool(t, e, "source_get", `{"app_slug":"portal"}`)["structuredContent"].(map[string]any)["data"].(map[string]any)
+	one = callTool(t, e, "source_get", `{"source_id":"7","app_slug":"portal"}`)["structuredContent"].(map[string]any)["data"].(map[string]any)
+	assert.Equal(t, "/sources", listed["route"])
+	assert.Equal(t, "", listed["id"])
+	assert.Equal(t, "/sources/:source_id", one["route"])
+	assert.Equal(t, "7", one["id"])
+
+	called := callTool(t, e, "source_replace", `{"app_slug":"portal"}`)
+	assert.Equal(t, true, called["isError"])
+	assert.Equal(t, "source_replace needs source_id", called["content"].([]any)[0].(map[string]any)["text"])
+}
+
+func TestDefinePathParamsWinOverTheBody(t *testing.T) {
+	var chain int
+	e, _ := routeService(&chain)
+	rec := serveRoute(e, http.MethodPut, "/api/sources/7", map[string]string{"SAuth-App-Slug": "portal"}, `{"source_id":"other","title":"Atlas"}`)
+	data := routeEnvelope(t, rec)["data"].(map[string]any)
+	assert.Equal(t, "7", data["id"])
+	assert.Equal(t, "Atlas", data["title"])
+}
+
+func TestDefineMiddlewareIsOneChain(t *testing.T) {
+	var chain int
+	e, _ := routeService(&chain)
+	serveRoute(e, http.MethodGet, "/api/sources/7", map[string]string{"SAuth-App-Slug": "portal"}, "")
+	assert.Equal(t, 1, chain)
+	callTool(t, e, "source_get", `{"source_id":"7","app_slug":"portal"}`)
+	assert.Equal(t, 2, chain)
+
+	rec := httptest.NewRecorder()
+	e.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/sources/7", nil))
+	assert.Equal(t, http.StatusUnauthorized, rec.Code)
+	called := callTool(t, e, "source_get", `{"source_id":"7","app_slug":"portal"}`)
+	assert.Nil(t, called["isError"])
+}
+
+func TestMountRefusesTwoToolsWithOneName(t *testing.T) {
+	var chain int
+	_, operations := routeService(&chain)
+	e := echo.New()
+	err := endpoint.Mount(e, endpoint.Set{Service: "demo", Version: "v1", MCP: &mcp.Server{Name: "demo", Operations: append(operations, operations[0])}})
+	assert.EqualError(t, err, "endpoint: two tools are called source_get")
+	assert.NoError(t, endpoint.Mount(echo.New(), endpoint.Set{Service: "demo", Version: "v1", MCP: &mcp.Server{Name: "demo", Operations: operations}}))
+}
+
+func TestOperationCommandCoversSeveralPaths(t *testing.T) {
+	var chain int
+	_, operations := routeService(&chain)
+	var path string
+	var query url.Values
+	call := func(cmd *cobra.Command, m, p string, q url.Values, b []byte) error {
+		path, query = p, q
+		return nil
+	}
+	get := cli.OperationCommand(operations[0], call)
+	assert.Equal(t, "get [source_id]", get.Use)
+	assert.Nil(t, get.Flags().Lookup("SAuth-App-Slug"))
+	get.SetArgs([]string{})
+	assert.NoError(t, get.Execute())
+	assert.Equal(t, "/sources", path)
+	get = cli.OperationCommand(operations[0], call)
+	get.SetArgs([]string{"7", "--var", "region=eu", "--filter", "claim=reader"})
+	assert.NoError(t, get.Execute())
+	assert.Equal(t, "/sources/7", path)
+	assert.Equal(t, url.Values{"var.region": {"eu"}, "claim": {"reader"}}, query)
 }

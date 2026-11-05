@@ -237,8 +237,13 @@ func (s *Server) invoke(ctx echo.Context, operation Operation, arguments json.Ra
 	}
 
 	value, total, err := s.dispatch(ctx, operation, arguments, values, page, onStep)
+	var rejection *respond.Rejection
 	var rejected *echo.HTTPError
 	switch {
+	case errors.As(err, &rejection) && rejection.Data != nil:
+		return callResult{Content: []content{{Type: "text", Text: rejection.Message}}, StructuredContent: structured{Data: rejection.Data}, IsError: true}
+	case errors.As(err, &rejection):
+		return callResult{Content: []content{{Type: "text", Text: rejection.Message}}, IsError: true}
 	case errors.As(err, &rejected):
 		return callResult{Content: []content{{Type: "text", Text: message(rejected)}}, IsError: true}
 	case err != nil:
@@ -279,9 +284,19 @@ func (s *Server) invoke(ctx echo.Context, operation Operation, arguments json.Ra
 }
 
 func (s *Server) dispatch(ctx echo.Context, operation Operation, arguments json.RawMessage, values map[string]any, page paging, onStep func(respond.Step)) (any, int, error) {
-	path := operation.Path
+	given := map[string]string{}
 	var names, params []string
 	query := url.Values{}
+	header := http.Header{}
+	add := func(key string, value any) {
+		if items, many := value.([]any); many {
+			for _, item := range items {
+				query.Add(key, shape.Cell(item))
+			}
+			return
+		}
+		query.Set(key, shape.Cell(value))
+	}
 	for _, input := range operation.Inputs {
 		value, present := values[input.Name]
 		if !present || value == nil {
@@ -289,17 +304,31 @@ func (s *Server) dispatch(ctx echo.Context, operation Operation, arguments json.
 		}
 		switch input.In {
 		case InPath:
-			path = strings.Replace(path, ":"+input.Param, url.PathEscape(shape.Cell(value)), 1)
-			names = append(names, input.Param)
-			params = append(params, shape.Cell(value))
-		case InQuery:
-			if items, many := value.([]any); many {
-				for _, item := range items {
-					query.Add(input.Param, shape.Cell(item))
-				}
+			if shape.Cell(value) == "" {
 				continue
 			}
-			query.Set(input.Param, shape.Cell(value))
+			given[input.Param] = shape.Cell(value)
+			names = append(names, input.Param)
+			params = append(params, shape.Cell(value))
+		case InHeader:
+			header.Set(input.Param, shape.Cell(value))
+		case InQuery:
+			prefix, open := strings.CutSuffix(input.Param, "*")
+			if !open {
+				continue
+			}
+			entries, _ := value.(map[string]any)
+			for key, entry := range entries {
+				if entry != nil && !(prefix == "" && taken(key, operation.Inputs)) {
+					add(prefix+key, entry)
+				}
+			}
+		}
+	}
+	for _, input := range operation.Inputs {
+		if value, present := values[input.Name]; present && value != nil && input.In == InQuery && !strings.HasSuffix(input.Param, "*") {
+			query.Del(input.Param)
+			add(input.Param, value)
 		}
 	}
 	if page.Limit > 0 {
@@ -308,8 +337,16 @@ func (s *Server) dispatch(ctx echo.Context, operation Operation, arguments json.
 	if page.Cursor != "" {
 		query.Set("cursor", page.Cursor)
 	}
+	route, err := operation.pick(given)
+	if err != nil {
+		return nil, 0, err
+	}
+	path := route
+	for name, value := range given {
+		path = strings.Replace(path, ":"+name, url.PathEscape(value), 1)
+	}
 
-	request, response, route := ctx.Request(), ctx.Response(), ctx.Path()
+	request, response, matched := ctx.Request(), ctx.Response(), ctx.Path()
 	savedNames, savedParams := ctx.ParamNames(), ctx.ParamValues()
 	cached := ctx.QueryParams()
 	savedQuery := url.Values{}
@@ -321,10 +358,13 @@ func (s *Server) dispatch(ctx echo.Context, operation Operation, arguments json.
 	clone.URL = &url.URL{Path: path, RawQuery: query.Encode()}
 	clone.Body = http.NoBody
 	clone.Header.Set(echo.HeaderAccept, respond.MIMEEventStream)
+	for key, value := range header {
+		clone.Header[key] = value
+	}
 	recorder := &capture{header: http.Header{}, onStep: onStep}
 	ctx.SetRequest(clone)
 	ctx.SetResponse(echo.NewResponse(recorder, ctx.Echo()))
-	ctx.SetPath(operation.Path)
+	ctx.SetPath(route)
 	ctx.SetParamNames(names...)
 	ctx.SetParamValues(params...)
 	clear(cached)
@@ -334,7 +374,7 @@ func (s *Server) dispatch(ctx echo.Context, operation Operation, arguments json.
 	defer func() {
 		ctx.SetRequest(request)
 		ctx.SetResponse(response)
-		ctx.SetPath(route)
+		ctx.SetPath(matched)
 		ctx.SetParamNames(savedNames...)
 		ctx.SetParamValues(savedParams...)
 		clear(cached)
@@ -345,7 +385,6 @@ func (s *Server) dispatch(ctx echo.Context, operation Operation, arguments json.
 
 	var value any
 	var total int
-	var err error
 	reached := false
 	handler := func(inner echo.Context) error {
 		reached = true
@@ -359,9 +398,46 @@ func (s *Server) dispatch(ctx echo.Context, operation Operation, arguments json.
 		if failed != nil {
 			return nil, 0, failed
 		}
-		return nil, 0, echo.NewHTTPError(recorder.code(), recorder.message())
+		return nil, 0, recorder.rejection()
 	}
 	return value, total, err
+}
+
+func (o Operation) pick(given map[string]string) (string, error) {
+	chosen, most := "", -1
+	for _, path := range o.paths() {
+		count, complete := 0, true
+		for _, segment := range strings.Split(path, "/") {
+			name, placeholder := strings.CutPrefix(segment, ":")
+			if !placeholder {
+				continue
+			}
+			if _, found := given[name]; !found {
+				complete = false
+			}
+			count++
+		}
+		if complete && count > most {
+			chosen, most = path, count
+		}
+	}
+	if most >= 0 {
+		return chosen, nil
+	}
+	var missing []string
+	for _, segment := range strings.Split(o.Path, "/") {
+		name, placeholder := strings.CutPrefix(segment, ":")
+		if _, found := given[name]; !placeholder || found {
+			continue
+		}
+		for _, input := range o.Inputs {
+			if input.In == InPath && input.Param == name {
+				name = input.Name
+			}
+		}
+		missing = append(missing, name)
+	}
+	return "", echo.NewHTTPError(http.StatusBadRequest, o.Name+" needs "+strings.Join(missing, ", "))
 }
 
 type capture struct {
@@ -438,4 +514,11 @@ func (c *capture) message() string {
 		return text
 	}
 	return http.StatusText(c.code())
+}
+
+func (c *capture) rejection() error {
+	if c.result != nil && c.result.Body.Count > 0 {
+		return &respond.Rejection{Status: c.code(), Message: c.message(), Data: c.result.Body.Data}
+	}
+	return echo.NewHTTPError(c.code(), c.message())
 }
