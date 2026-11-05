@@ -2,10 +2,12 @@ package mcp
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"mime"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -239,10 +241,17 @@ func (s *Server) invoke(ctx echo.Context, operation Operation, arguments json.Ra
 		return callResult{Content: []content{{Type: "text", Text: "a template file is read by the cli only, pass the template itself"}}, IsError: true}
 	}
 
-	value, total, err := s.dispatch(ctx, operation, arguments, values, page, onStep)
+	value, total, path, err := s.dispatch(ctx, operation, arguments, values, page, onStep)
 	var rejection *respond.Rejection
 	var rejected *echo.HTTPError
+	blob, isBlob := value.Data.(Blob)
 	switch {
+	case err == nil && isBlob && int64(len(blob.Content)) > operation.fileLimit():
+		return callResult{Content: []content{{Type: "text", Text: operation.Name + " answers " + strconv.Itoa(len(blob.Content)) + " bytes, more than the " + strconv.FormatInt(operation.fileLimit(), 10) + " a tool call carries"}}, IsError: true}
+	case err == nil && isBlob && strings.HasPrefix(blob.ContentType, "image/"):
+		return callResult{Content: []content{{Type: "image", Data: base64.StdEncoding.EncodeToString(blob.Content), MimeType: blob.ContentType}}}
+	case err == nil && isBlob:
+		return callResult{Content: []content{{Type: "resource", Resource: &resource{URI: s.Name + "://" + strings.TrimPrefix(path, "/"), MimeType: blob.ContentType, Blob: base64.StdEncoding.EncodeToString(blob.Content)}}}}
 	case errors.As(err, &rejection) && rejection.Data != nil:
 		return callResult{Content: []content{{Type: "text", Text: rejection.Message}}, StructuredContent: structured{Data: rejection.Data}, IsError: true}
 	case errors.As(err, &rejection):
@@ -286,7 +295,7 @@ func (s *Server) invoke(ctx echo.Context, operation Operation, arguments json.Ra
 	return callResult{Content: []content{{Type: "text", Text: out.String()}}, StructuredContent: value}
 }
 
-func (s *Server) dispatch(ctx echo.Context, operation Operation, arguments json.RawMessage, values map[string]any, page paging, onStep func(respond.Step)) (structured, int, error) {
+func (s *Server) dispatch(ctx echo.Context, operation Operation, arguments json.RawMessage, values map[string]any, page paging, onStep func(respond.Step)) (structured, int, string, error) {
 	given := map[string]string{}
 	var names, params []string
 	query := url.Values{}
@@ -342,7 +351,7 @@ func (s *Server) dispatch(ctx echo.Context, operation Operation, arguments json.
 	}
 	route, err := operation.pick(given)
 	if err != nil {
-		return structured{}, 0, err
+		return structured{}, 0, "", err
 	}
 	path := route
 	for name, value := range given {
@@ -364,6 +373,10 @@ func (s *Server) dispatch(ctx echo.Context, operation Operation, arguments json.
 		fields := map[string]json.RawMessage{}
 		_ = json.Unmarshal(arguments, &fields)
 		if body, given := fields[input.Name]; given {
+			var text string
+			if kind := header.Get(echo.HeaderContentType); kind != "" && !isJSON(kind) && json.Unmarshal(body, &text) == nil {
+				body = []byte(text)
+			}
 			clone.Body, clone.ContentLength = io.NopCloser(bytes.NewReader(body)), int64(len(body))
 			clone.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
 		}
@@ -411,11 +424,16 @@ func (s *Server) dispatch(ctx echo.Context, operation Operation, arguments json.
 	}
 	if failed := handler(ctx); !reached {
 		if failed != nil {
-			return structured{}, 0, failed
+			return structured{}, 0, path, failed
 		}
-		return structured{}, 0, recorder.rejection()
+		return structured{}, 0, path, recorder.rejection()
 	}
-	return value, total, err
+	return value, total, path, err
+}
+
+func isJSON(contentType string) bool {
+	kind, _, err := mime.ParseMediaType(contentType)
+	return err == nil && (kind == echo.MIMEApplicationJSON || strings.HasSuffix(kind, "+json"))
 }
 
 func (o Operation) pick(given map[string]string) (string, error) {

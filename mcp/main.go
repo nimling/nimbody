@@ -104,10 +104,17 @@ type call struct {
 }
 
 type content struct {
-	Type     string `json:"type"`
-	Text     string `json:"text,omitempty"`
-	Data     string `json:"data,omitempty"`
-	MimeType string `json:"mimeType,omitempty"`
+	Type     string    `json:"type"`
+	Text     string    `json:"text,omitempty"`
+	Data     string    `json:"data,omitempty"`
+	MimeType string    `json:"mimeType,omitempty"`
+	Resource *resource `json:"resource,omitempty"`
+}
+
+type resource struct {
+	URI      string `json:"uri"`
+	MimeType string `json:"mimeType"`
+	Blob     string `json:"blob"`
 }
 
 type callResult struct {

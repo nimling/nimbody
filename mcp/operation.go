@@ -6,9 +6,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"reflect"
+	"strconv"
 	"strings"
 	"time"
 
@@ -22,7 +24,10 @@ const (
 	InQuery  = "query"
 	InHeader = "header"
 	InBody   = "body"
+	InFile   = "file"
 )
+
+const FileLimit = 8 << 20
 
 type Spec struct {
 	Name        string
@@ -35,7 +40,28 @@ type Spec struct {
 	Access      string
 	Page        string
 	Example     string
+	FileLimit   int64
+	Headers     []Header
 	Middleware  []echo.MiddlewareFunc
+}
+
+type Header struct {
+	Name  string
+	Param string
+	Usage string
+}
+
+type File struct {
+	Name        string `json:"name,omitempty"`
+	ContentType string `json:"content_type,omitempty"`
+	Content     []byte `json:"content"`
+}
+
+type Blob struct {
+	Content      []byte `json:"content"`
+	ContentType  string `json:"content_type"`
+	ETag         string `json:"etag,omitempty"`
+	CacheControl string `json:"cache_control,omitempty"`
 }
 
 type Input struct {
@@ -107,6 +133,8 @@ var (
 	textMarshaler = reflect.TypeFor[encoding.TextMarshaler]()
 	timeType      = reflect.TypeFor[time.Time]()
 	rawType       = reflect.TypeFor[json.RawMessage]()
+	fileType      = reflect.TypeFor[File]()
+	blobType      = reflect.TypeFor[Blob]()
 	reserved      = []string{"limit", "page", "order", "column", "cursor"}
 )
 
@@ -140,6 +168,12 @@ func Define[In any, Out any](spec Spec, service func(ctx echo.Context, in In) (O
 		return structured{Data: value, Status: chosen, Count: &count}, count, chosen, nil
 	}
 	inputs := inputsOf(reflect.TypeFor[In](), nil)
+	for _, header := range spec.Headers {
+		if !named(inputs, header.Name) {
+			inputs = append(inputs, Input{Name: header.Name, Param: header.Param, In: InHeader, Kind: "string", Usage: header.Usage})
+		}
+	}
+	limit := spec.fileLimit()
 	for i, input := range inputs {
 		if input.In != InPath {
 			continue
@@ -158,13 +192,19 @@ func Define[In any, Out any](spec Spec, service func(ctx echo.Context, in In) (O
 		OutputSchema: GetOutputSchema(reflect.TypeFor[Out]()),
 		Route: func(ctx echo.Context) error {
 			var in In
-			if err := bind(ctx, &in, inputs); err != nil {
+			if err := bind(ctx, &in, inputs, limit); err != nil {
 				return refuse(ctx, spec.Name, invalid(spec, err))
 			}
+			if err := uploaded(&in, inputs, limit); err != nil {
+				return refuse(ctx, spec.Name, err)
+			}
 			value, count, chosen, err := run(ctx, in)
+			blob, isBlob := value.Data.(Blob)
 			switch {
 			case err != nil:
 				return refuse(ctx, spec.Name, err)
+			case isBlob:
+				return answerBlob(ctx, chosen, blob)
 			case chosen == http.StatusNoContent && !respond.Streaming(ctx):
 				return ctx.NoContent(chosen)
 			case chosen == http.StatusNoContent:
@@ -184,6 +224,9 @@ func Define[In any, Out any](spec Spec, service func(ctx echo.Context, in In) (O
 			} else if err := recorded(ctx, &in, inputs, arguments); err != nil {
 				return structured{}, 0, invalid(spec, err)
 			}
+			if err := uploaded(&in, inputs, limit); err != nil {
+				return structured{}, 0, err
+			}
 			value, count, _, err := run(ctx, in)
 			return value, count, err
 		},
@@ -201,6 +244,165 @@ func Route(group *echo.Group, operations ...Operation) {
 
 func (s Spec) paths() []string {
 	return append([]string{s.Path}, s.Paths...)
+}
+
+func (s Spec) fileLimit() int64 {
+	if s.FileLimit > 0 {
+		return s.FileLimit
+	}
+	return FileLimit
+}
+
+func named(inputs []Input, name string) bool {
+	for _, input := range inputs {
+		if input.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+func answerBlob(ctx echo.Context, status int, blob Blob) error {
+	header := ctx.Response().Header()
+	if blob.ETag != "" {
+		header.Set("ETag", blob.ETag)
+	}
+	if blob.CacheControl != "" {
+		header.Set(echo.HeaderCacheControl, blob.CacheControl)
+	}
+	if blob.ETag != "" && ctx.Request().Header.Get("If-None-Match") == blob.ETag {
+		return ctx.NoContent(http.StatusNotModified)
+	}
+	if ctx.Response().Committed {
+		return respond.JSON(ctx, status, blob, 1)
+	}
+	header.Set(echo.HeaderContentLength, strconv.Itoa(len(blob.Content)))
+	return ctx.Blob(status, blob.ContentType, blob.Content)
+}
+
+func files(value reflect.Value, input Input) []*File {
+	field := value.FieldByIndex(input.index)
+	switch {
+	case field.Type() == fileType:
+		return []*File{field.Addr().Interface().(*File)}
+	case field.Kind() == reflect.Pointer && !field.IsNil():
+		return []*File{field.Interface().(*File)}
+	case field.Kind() == reflect.Slice:
+		found := make([]*File, 0, field.Len())
+		for i := 0; i < field.Len(); i++ {
+			found = append(found, field.Index(i).Addr().Interface().(*File))
+		}
+		return found
+	}
+	return nil
+}
+
+func uploaded(in any, inputs []Input, limit int64) error {
+	value := reflect.ValueOf(in).Elem()
+	if value.Kind() != reflect.Struct {
+		return nil
+	}
+	for _, input := range inputs {
+		if input.In != InFile {
+			continue
+		}
+		for _, file := range files(value, input) {
+			if int64(len(file.Content)) > limit {
+				return echo.NewHTTPError(http.StatusRequestEntityTooLarge, input.Name+" is larger than "+strconv.FormatInt(limit, 10)+" bytes")
+			}
+			if file.ContentType == "" || file.ContentType == echo.MIMEOctetStream {
+				file.ContentType = http.DetectContentType(file.Content)
+			}
+		}
+	}
+	return nil
+}
+
+func bindForm(ctx echo.Context, in any, inputs []Input, limit int64) error {
+	req := ctx.Request()
+	if err := req.ParseMultipartForm(limit); err != nil {
+		return err
+	}
+	value := reflect.ValueOf(in).Elem()
+	fields := map[string]any{}
+	for _, input := range inputs {
+		values, given := req.MultipartForm.Value[input.Param]
+		if input.In != InBody || input.Param == "*" || !given {
+			continue
+		}
+		fields[input.Name] = formValue(value.FieldByIndex(input.index).Type(), values)
+	}
+	encoded, err := json.Marshal(fields)
+	if err != nil {
+		return err
+	}
+	if err := json.Unmarshal(encoded, in); err != nil {
+		return err
+	}
+	for _, input := range inputs {
+		parts := req.MultipartForm.File[input.Param]
+		if input.In != InFile || len(parts) == 0 {
+			continue
+		}
+		read := make([]File, 0, len(parts))
+		for _, part := range parts {
+			opened, err := part.Open()
+			if err != nil {
+				return err
+			}
+			content, err := io.ReadAll(io.LimitReader(opened, limit+1))
+			opened.Close()
+			if err != nil {
+				return err
+			}
+			read = append(read, File{Name: part.Filename, ContentType: part.Header.Get(echo.HeaderContentType), Content: content})
+		}
+		field := value.FieldByIndex(input.index)
+		switch {
+		case field.Type() == fileType:
+			field.Set(reflect.ValueOf(read[0]))
+		case field.Kind() == reflect.Pointer:
+			field.Set(reflect.ValueOf(&read[0]))
+		default:
+			field.Set(reflect.ValueOf(read))
+		}
+	}
+	return recorded(ctx, in, inputs, encoded)
+}
+
+func formValue(t reflect.Type, values []string) any {
+	for t.Kind() == reflect.Pointer {
+		t = t.Elem()
+	}
+	decode := func(value string) any {
+		var decoded any
+		if t.Kind() != reflect.String && json.Unmarshal([]byte(value), &decoded) == nil {
+			return decoded
+		}
+		return value
+	}
+	if t.Kind() != reflect.Slice || t.Elem().Kind() == reflect.Uint8 {
+		return decode(values[0])
+	}
+	if len(values) == 1 {
+		var decoded []any
+		if json.Unmarshal([]byte(values[0]), &decoded) == nil {
+			return decoded
+		}
+	}
+	items := make([]any, 0, len(values))
+	for _, value := range values {
+		if t.Elem().Kind() == reflect.String {
+			items = append(items, value)
+			continue
+		}
+		var decoded any
+		if json.Unmarshal([]byte(value), &decoded) != nil {
+			decoded = value
+		}
+		items = append(items, decoded)
+	}
+	return items
 }
 
 func invalid(spec Spec, err error) error {
@@ -225,12 +427,16 @@ func refuse(ctx echo.Context, name string, err error) error {
 	return respond.ErrorInternal(ctx)
 }
 
-func bind(ctx echo.Context, in any, inputs []Input) error {
+func bind(ctx echo.Context, in any, inputs []Input, limit int64) error {
 	binder := &echo.DefaultBinder{}
 	_, raw := undecoded(inputs)
 	body, bound := in.(bounder)
 	switch {
 	case raw:
+	case declares(inputs, InFile) && strings.HasPrefix(ctx.Request().Header.Get(echo.HeaderContentType), echo.MIMEMultipartForm):
+		if err := bindForm(ctx, in, inputs, limit); err != nil {
+			return err
+		}
 	case bound && ctx.Request().ContentLength != 0:
 		if err := body.Bound(ctx, in); err != nil {
 			return err
@@ -443,6 +649,12 @@ func inputsOf(t reflect.Type, index []int) []Input {
 		case field.Tag.Get("body") == "*" && field.Type == rawType:
 			input.Param = "*"
 			input.Required = !omit
+		case field.Tag.Get("file") != "" && (field.Type == fileType || field.Type == reflect.PointerTo(fileType) || field.Type == reflect.SliceOf(fileType)):
+			input.In, input.Param, input.Kind = InFile, field.Tag.Get("file"), "object"
+			if field.Type.Kind() == reflect.Slice {
+				input.Kind = "array"
+			}
+			input.Required = !omit && field.Type.Kind() != reflect.Pointer
 		default:
 			input.Required = !omit && field.Type.Kind() != reflect.Pointer
 		}
@@ -475,6 +687,9 @@ func inputSchema(inputs []Input, t reflect.Type) map[string]any {
 	fields := fieldTypes(t)
 	for _, input := range inputs {
 		property := schemaOf(fields[input.Name], map[reflect.Type]bool{})
+		if input.index == nil {
+			property["type"] = input.Kind
+		}
 		if input.Usage != "" {
 			property["description"] = input.Usage
 		}
@@ -523,6 +738,9 @@ func GetOutputSchema(t reflect.Type) map[string]any {
 		properties["status"] = map[string]any{"type": "integer"}
 		properties["count"] = map[string]any{"type": "integer"}
 	}
+	if t == blobType {
+		return nil
+	}
 	data := schemaOf(t, map[reflect.Type]bool{})
 	if t.Implements(reflect.TypeFor[lister]()) {
 		rows, _ := reflect.Zero(t).Interface().(lister).rows()
@@ -554,6 +772,12 @@ func schemaOf(t reflect.Type, seen map[reflect.Type]bool) map[string]any {
 	switch {
 	case t == timeType:
 		return map[string]any{"type": "string", "format": "date-time"}
+	case t == fileType:
+		return map[string]any{"type": "object", "required": []string{"content"}, "properties": map[string]any{
+			"name":         map[string]any{"type": "string", "description": "the file name"},
+			"content_type": map[string]any{"type": "string", "description": "the media type, sniffed from the content when left out"},
+			"content":      map[string]any{"type": "string", "contentEncoding": "base64", "description": "the file content, base64"},
+		}}
 	case t.Implements(marshaler) || reflect.PointerTo(t).Implements(marshaler):
 		return map[string]any{}
 	case t.Implements(textMarshaler) || reflect.PointerTo(t).Implements(textMarshaler):

@@ -17,11 +17,12 @@ import (
 const ContentTypeJSON = "application/json"
 
 type Body struct {
-	Data   string
-	File   string
-	Sets   []string
-	Upload string
-	Raw    bool
+	Data        string
+	File        string
+	Sets        []string
+	Upload      string
+	Raw         bool
+	ContentType string
 }
 
 func (b *Body) Flags(cmd *cobra.Command, upload bool) {
@@ -67,6 +68,8 @@ func (b *Body) Get(in io.Reader) ([]byte, string, error) {
 		switch {
 		case len(bytes.TrimSpace(raw)) == 0:
 			return nil, "", nil
+		case b.ContentType != "":
+			return raw, b.ContentType, nil
 		case !json.Valid(raw):
 			return nil, "", Rejected("the body is not json", "")
 		}
@@ -96,13 +99,7 @@ func (b *Body) Get(in io.Reader) ([]byte, string, error) {
 }
 
 func (b *Body) multipart() ([]byte, string, error) {
-	source, err := os.Open(b.Upload)
-	if err != nil {
-		return nil, "", Rejected("cannot read "+b.Upload, "")
-	}
-	defer source.Close()
-	var buffer bytes.Buffer
-	writer := multipart.NewWriter(&buffer)
+	fields := make([][2]string, 0, len(b.Sets))
 	for _, entry := range b.Sets {
 		key, value, found := strings.Cut(entry, "=")
 		if !found || key == "" {
@@ -112,16 +109,32 @@ func (b *Body) multipart() ([]byte, string, error) {
 		if err != nil {
 			return nil, "", err
 		}
-		if err := writer.WriteField(key, value); err != nil {
+		fields = append(fields, [2]string{key, value})
+	}
+	return writeMultipart(fields, [][2]string{{"file", b.Upload}})
+}
+
+func writeMultipart(fields [][2]string, uploads [][2]string) ([]byte, string, error) {
+	var buffer bytes.Buffer
+	writer := multipart.NewWriter(&buffer)
+	for _, field := range fields {
+		if err := writer.WriteField(field[0], field[1]); err != nil {
 			return nil, "", err
 		}
 	}
-	part, err := writer.CreateFormFile("file", filepath.Base(b.Upload))
-	if err != nil {
-		return nil, "", err
-	}
-	if _, err := io.Copy(part, source); err != nil {
-		return nil, "", err
+	for _, upload := range uploads {
+		source, err := os.Open(upload[1])
+		if err != nil {
+			return nil, "", Rejected("cannot read "+upload[1], "")
+		}
+		written, err := writer.CreateFormFile(upload[0], filepath.Base(upload[1]))
+		if err == nil {
+			_, err = io.Copy(written, source)
+		}
+		source.Close()
+		if err != nil {
+			return nil, "", err
+		}
 	}
 	if err := writer.Close(); err != nil {
 		return nil, "", err

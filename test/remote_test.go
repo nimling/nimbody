@@ -4,11 +4,15 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"io"
+	"mime"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"net/textproto"
 	"net/url"
 	"os"
 	"strconv"
@@ -307,7 +311,7 @@ func TestOperationCommandMapsTheRoute(t *testing.T) {
 	var method, path string
 	var query url.Values
 	var body []byte
-	call := func(cmd *cobra.Command, m, p string, q url.Values, b []byte) error {
+	call := func(cmd *cobra.Command, m, p string, q url.Values, kind string, b []byte) error {
 		method, path, query, body = m, p, q, b
 		return nil
 	}
@@ -599,7 +603,7 @@ func TestOperationCommandCoversSeveralPaths(t *testing.T) {
 	_, operations := routeService(&chain)
 	var path string
 	var query url.Values
-	call := func(cmd *cobra.Command, m, p string, q url.Values, b []byte) error {
+	call := func(cmd *cobra.Command, m, p string, q url.Values, kind string, b []byte) error {
 		path, query = p, q
 		return nil
 	}
@@ -780,7 +784,7 @@ func TestOperationCommandSendsTheRawBodyAsGiven(t *testing.T) {
 			return nil, nil
 		})
 	var sent []byte
-	call := func(cmd *cobra.Command, m, p string, q url.Values, b []byte) error {
+	call := func(cmd *cobra.Command, m, p string, q url.Values, kind string, b []byte) error {
 		sent = b
 		return nil
 	}
@@ -922,4 +926,297 @@ func TestDefineCountIsTheServicesOnBothTransports(t *testing.T) {
 	assert.Contains(t, properties["data"].(map[string]any)["properties"], "mappers")
 	assert.Equal(t, []string{"data"}, operations[1].OutputSchema["required"])
 	assert.Equal(t, []string{"array", "null"}, operations[3].OutputSchema["properties"].(map[string]any)["data"].(map[string]any)["type"])
+}
+
+type assetUpload struct {
+	nimbody.Body
+	Name  string     `json:"name,omitempty"`
+	Size  int        `json:"size,omitempty"`
+	File  mcp.File   `file:"file" json:"file"`
+	Extra []mcp.File `file:"extra" json:"extra,omitempty"`
+}
+
+type feedInput struct {
+	Feed        json.RawMessage `body:"*" json:"feed"`
+	ContentType string          `header:"Content-Type" json:"content_type,omitempty"`
+}
+
+func fileService() (*echo.Echo, []mcp.Operation) {
+	create := mcp.Define(mcp.Spec{Name: "asset_create", Description: "Add an asset", Method: http.MethodPost, Path: "/assets", FileLimit: 16, Access: mcp.AccessWrite},
+		func(ctx echo.Context, in assetUpload) (map[string]any, error) {
+			extra := []string{}
+			for _, file := range in.Extra {
+				extra = append(extra, file.Name+":"+string(file.Content))
+			}
+			return map[string]any{"name": in.Name, "size": in.Size, "has_name": in.HasKey("name"), "file_name": in.File.Name, "content_type": in.File.ContentType, "content": string(in.File.Content), "extra": extra}, nil
+		})
+	data := mcp.Define(mcp.Spec{Name: "asset_data", Description: "Read the bytes of an asset", Method: http.MethodGet, Path: "/assets/:asset_id/data", FileLimit: 32, Access: mcp.AccessRead},
+		func(ctx echo.Context, in struct {
+			AssetID string `param:"asset_id" json:"asset_id"`
+		}) (mcp.Blob, error) {
+			switch in.AssetID {
+			case "logo":
+				return mcp.Blob{Content: []byte("\x89PNG\r\n\x1a\nlogo"), ContentType: "image/png", ETag: `"v1"`, CacheControl: "no-store"}, nil
+			case "big":
+				return mcp.Blob{Content: bytes.Repeat([]byte("a"), 33), ContentType: "text/plain"}, nil
+			case "gone":
+				return mcp.Blob{}, &respond.Rejection{Status: http.StatusNotFound, Message: "no asset is gone"}
+			}
+			return mcp.Blob{Content: []byte("%PDF-1.7"), ContentType: "application/pdf"}, nil
+		})
+	feed := mcp.Define(mcp.Spec{Name: "subscription_create", Description: "Add a subscription from a feed", Method: http.MethodPost, Path: "/subscriptions", Status: http.StatusOK, Access: mcp.AccessWrite},
+		func(ctx echo.Context, in feedInput) (map[string]any, error) {
+			raw, err := io.ReadAll(ctx.Request().Body)
+			if err != nil {
+				return nil, err
+			}
+			return map[string]any{"content_type": ctx.Request().Header.Get(echo.HeaderContentType), "body": string(raw)}, nil
+		})
+	operations := []mcp.Operation{create, data, feed}
+	e := echo.New()
+	mcp.Route(e.Group("/api"), operations...)
+	server := &mcp.Server{Name: "demo", Version: "v1", Operations: operations, AuthorizationServer: "https://auth.example.test"}
+	server.Mount(e)
+	return e, operations
+}
+
+func multipartBody(t *testing.T, fields map[string]string, files ...[3]string) (*bytes.Buffer, string) {
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	for key, value := range fields {
+		assert.NoError(t, writer.WriteField(key, value))
+	}
+	for _, file := range files {
+		header := textproto.MIMEHeader{}
+		header.Set("Content-Disposition", `form-data; name="`+file[0]+`"; filename="`+file[1]+`"`)
+		part, err := writer.CreatePart(header)
+		assert.NoError(t, err)
+		_, err = part.Write([]byte(file[2]))
+		assert.NoError(t, err)
+	}
+	assert.NoError(t, writer.Close())
+	return &body, writer.FormDataContentType()
+}
+
+func TestDefineFileBindsFromMultipartAndFromATool(t *testing.T) {
+	e, operations := fileService()
+	body, contentType := multipartBody(t, map[string]string{"name": "logo", "size": "5"}, [3]string{"file", "logo.txt", "hello"}, [3]string{"extra", "a.txt", "one"}, [3]string{"extra", "b.txt", "two"})
+	rec := serveRoute(e, http.MethodPost, "/api/assets", map[string]string{echo.HeaderContentType: contentType}, body.String())
+	assert.Equal(t, http.StatusCreated, rec.Code, rec.Body.String())
+	routed := routeEnvelope(t, rec)["data"].(map[string]any)
+
+	encoded := base64.StdEncoding.EncodeToString([]byte("hello"))
+	called := callTool(t, e, "asset_create", `{"name":"logo","size":5,"file":{"name":"logo.txt","content":"`+encoded+`"},"extra":[{"name":"a.txt","content":"`+base64.StdEncoding.EncodeToString([]byte("one"))+`"},{"name":"b.txt","content":"`+base64.StdEncoding.EncodeToString([]byte("two"))+`"}]}`)
+	assert.Nil(t, called["isError"], called["content"])
+	tooled := called["structuredContent"].(map[string]any)["data"].(map[string]any)
+	for _, data := range []map[string]any{routed, tooled} {
+		assert.Equal(t, "logo", data["name"])
+		assert.Equal(t, float64(5), data["size"])
+		assert.Equal(t, true, data["has_name"])
+		assert.Equal(t, "logo.txt", data["file_name"])
+		assert.Equal(t, "text/plain; charset=utf-8", data["content_type"])
+		assert.Equal(t, "hello", data["content"])
+		assert.Equal(t, []any{"a.txt:one", "b.txt:two"}, data["extra"])
+	}
+
+	called = callTool(t, e, "asset_create", `{"file":{"name":"logo.svg","content_type":"image/svg+xml","content":"`+encoded+`"}}`)
+	assert.Equal(t, "image/svg+xml", called["structuredContent"].(map[string]any)["data"].(map[string]any)["content_type"])
+
+	body, contentType = multipartBody(t, nil, [3]string{"file", "big.txt", strings.Repeat("a", 17)})
+	rec = serveRoute(e, http.MethodPost, "/api/assets", map[string]string{echo.HeaderContentType: contentType}, body.String())
+	assert.Equal(t, http.StatusRequestEntityTooLarge, rec.Code)
+	assert.Equal(t, "file is larger than 16 bytes", routeEnvelope(t, rec)["error"].(map[string]any)["message"])
+	called = callTool(t, e, "asset_create", `{"file":{"content":"`+base64.StdEncoding.EncodeToString(bytes.Repeat([]byte("a"), 17))+`"}}`)
+	assert.Equal(t, true, called["isError"])
+	assert.Equal(t, "file is larger than 16 bytes", called["content"].([]any)[0].(map[string]any)["text"])
+
+	rec = serveRoute(e, http.MethodPost, "/api/assets", nil, `{"name":"pending"}`)
+	assert.Equal(t, http.StatusCreated, rec.Code)
+	assert.Equal(t, "pending", routeEnvelope(t, rec)["data"].(map[string]any)["name"])
+
+	schema := operations[0].InputSchema
+	file := schema["properties"].(map[string]any)["file"].(map[string]any)
+	assert.Equal(t, "base64", file["properties"].(map[string]any)["content"].(map[string]any)["contentEncoding"])
+	assert.Contains(t, schema["required"], "file")
+	assert.NotContains(t, schema["required"], "extra")
+}
+
+func TestOperationCommandSendsAnUploadAsMultipart(t *testing.T) {
+	_, operations := fileService()
+	var kind string
+	var sent []byte
+	call := func(cmd *cobra.Command, m, p string, q url.Values, contentType string, b []byte) error {
+		kind, sent = contentType, b
+		return nil
+	}
+	file := t.TempDir() + "/logo.txt"
+	assert.NoError(t, os.WriteFile(file, []byte("hello"), 0o600))
+	cmd := cli.OperationCommand(operations[0], call)
+	assert.NotNil(t, cmd.Flags().Lookup("upload"))
+	assert.NotNil(t, cmd.Flags().Lookup("upload-extra"))
+	cmd.SetArgs([]string{"--upload", file, "--upload-extra", file, "--name", "logo", "--size", "5"})
+	assert.NoError(t, cmd.Execute())
+	mediaType, params, err := mime.ParseMediaType(kind)
+	assert.NoError(t, err)
+	assert.Equal(t, "multipart/form-data", mediaType)
+	form, err := multipart.NewReader(bytes.NewReader(sent), params["boundary"]).ReadForm(1 << 20)
+	assert.NoError(t, err)
+	assert.Equal(t, []string{"logo"}, form.Value["name"])
+	assert.Equal(t, []string{"5"}, form.Value["size"])
+	assert.Equal(t, "logo.txt", form.File["file"][0].Filename)
+	assert.Len(t, form.File["extra"], 1)
+
+	cmd = cli.OperationCommand(operations[0], call)
+	cmd.SetArgs([]string{"--name", "logo"})
+	assert.NoError(t, cmd.Execute())
+	assert.Equal(t, cli.ContentTypeJSON, kind)
+	assert.JSONEq(t, `{"name":"logo"}`, string(sent))
+}
+
+func TestDefineBlobAnswersTheBytes(t *testing.T) {
+	e, operations := fileService()
+	rec := serveRoute(e, http.MethodGet, "/api/assets/logo/data", nil, "")
+	assert.Equal(t, http.StatusOK, rec.Code)
+	assert.Equal(t, "\x89PNG\r\n\x1a\nlogo", rec.Body.String())
+	assert.Equal(t, "image/png", rec.Header().Get(echo.HeaderContentType))
+	assert.Equal(t, "12", rec.Header().Get(echo.HeaderContentLength))
+	assert.Equal(t, `"v1"`, rec.Header().Get("ETag"))
+	assert.Equal(t, "no-store", rec.Header().Get(echo.HeaderCacheControl))
+	cached := serveRoute(e, http.MethodGet, "/api/assets/logo/data", map[string]string{"If-None-Match": `"v1"`}, "")
+	assert.Equal(t, http.StatusNotModified, cached.Code)
+	assert.Empty(t, cached.Body.String())
+	assert.Equal(t, http.StatusNotFound, serveRoute(e, http.MethodGet, "/api/assets/gone/data", nil, "").Code)
+
+	called := callTool(t, e, "asset_data", `{"asset_id":"logo"}`)
+	assert.Nil(t, called["isError"])
+	assert.Nil(t, called["structuredContent"])
+	image := called["content"].([]any)[0].(map[string]any)
+	assert.Equal(t, "image", image["type"])
+	assert.Equal(t, "image/png", image["mimeType"])
+	assert.Equal(t, base64.StdEncoding.EncodeToString([]byte("\x89PNG\r\n\x1a\nlogo")), image["data"])
+
+	called = callTool(t, e, "asset_data", `{"asset_id":"report"}`)
+	block := called["content"].([]any)[0].(map[string]any)
+	assert.Equal(t, "resource", block["type"])
+	assert.Equal(t, map[string]any{"uri": "demo://assets/report/data", "mimeType": "application/pdf", "blob": base64.StdEncoding.EncodeToString([]byte("%PDF-1.7"))}, block["resource"])
+
+	called = callTool(t, e, "asset_data", `{"asset_id":"big"}`)
+	assert.Equal(t, true, called["isError"])
+	assert.Equal(t, "asset_data answers 33 bytes, more than the 32 a tool call carries", called["content"].([]any)[0].(map[string]any)["text"])
+	called = callTool(t, e, "asset_data", `{"asset_id":"gone"}`)
+	assert.Equal(t, "no asset is gone", called["content"].([]any)[0].(map[string]any)["text"])
+
+	assert.Nil(t, operations[1].OutputSchema)
+	listed, _ := json.Marshal(operations[1].Tool())
+	assert.NotContains(t, string(listed), "outputSchema")
+}
+
+func TestDefineRawBodyTakesAStringWithItsContentType(t *testing.T) {
+	e, _ := fileService()
+	rec := serveRoute(e, http.MethodPost, "/api/subscriptions", map[string]string{echo.HeaderContentType: "application/rss+xml"}, "<rss/>")
+	assert.Equal(t, http.StatusOK, rec.Code)
+	routed := routeEnvelope(t, rec)["data"].(map[string]any)
+	tooled := callTool(t, e, "subscription_create", `{"feed":"<rss/>","content_type":"application/rss+xml"}`)["structuredContent"].(map[string]any)["data"].(map[string]any)
+	for _, data := range []map[string]any{routed, tooled} {
+		assert.Equal(t, "application/rss+xml", data["content_type"])
+		assert.Equal(t, "<rss/>", data["body"])
+	}
+	for arguments, want := range map[string]map[string]any{
+		`{"feed":"<rss/>"}`: {"content_type": "application/json", "body": `"<rss/>"`},
+		`{"feed":"<rss/>","content_type":"application/feed+json"}`: {"content_type": "application/feed+json", "body": `"<rss/>"`},
+		`{"feed":{"items":[]},"content_type":"text/xml"}`:          {"content_type": "text/xml", "body": `{"items":[]}`},
+	} {
+		assert.Equal(t, want, callTool(t, e, "subscription_create", arguments)["structuredContent"].(map[string]any)["data"], arguments)
+	}
+}
+
+func TestOperationCommandSendsTheRawBodyWithItsContentType(t *testing.T) {
+	_, operations := fileService()
+	var kind string
+	var sent []byte
+	call := func(cmd *cobra.Command, m, p string, q url.Values, contentType string, b []byte) error {
+		kind, sent = contentType, b
+		return nil
+	}
+	feed := t.TempDir() + "/feed.xml"
+	assert.NoError(t, os.WriteFile(feed, []byte("<rss/>"), 0o600))
+	cmd := cli.OperationCommand(operations[2], call)
+	cmd.SetArgs([]string{"--file", feed, "--content-type", "application/rss+xml"})
+	assert.NoError(t, cmd.Execute())
+	assert.Equal(t, "application/rss+xml", kind)
+	assert.Equal(t, "<rss/>", string(sent))
+
+	cmd = cli.OperationCommand(operations[2], call)
+	cmd.SilenceErrors, cmd.SilenceUsage = true, true
+	cmd.SetArgs([]string{"--file", feed})
+	assert.Error(t, cmd.Execute())
+
+	cmd = cli.OperationCommand(operations[2], call)
+	cmd.SetArgs([]string{"--data", `{"items":[]}`})
+	assert.NoError(t, cmd.Execute())
+	assert.Equal(t, cli.ContentTypeJSON, kind)
+}
+
+func TestRemoteBridgeKeepsTheLocalTools(t *testing.T) {
+	e, _ := remoteService()
+	backend := httptest.NewServer(e)
+	defer backend.Close()
+	remote := func(ctx context.Context) (string, string, error) { return backend.URL + "/mcp", "good", nil }
+	ran := func(text string) func(context.Context, json.RawMessage, func(respond.Step)) (string, bool) {
+		return func(ctx context.Context, arguments json.RawMessage, onStep func(respond.Step)) (string, bool) {
+			return text, false
+		}
+	}
+	local := &mcp.Server{Name: "demo", Version: "v1", Tools: []mcp.Tool{
+		{Name: "article_get", Description: "the local article get", InputSchema: map[string]any{"type": "object"}, Run: ran("local article")},
+		{Name: "cache_clear", Description: "Clear the local cache", InputSchema: map[string]any{"type": "object"}, Run: ran("cleared")},
+	}}
+	relay := func(lines ...string) map[float64]map[string]any {
+		var out bytes.Buffer
+		assert.NoError(t, cli.Relay(context.Background(), "demo", remote, strings.NewReader(strings.Join(lines, "\n")), &out, local))
+		byID := map[float64]map[string]any{}
+		scanner := bufio.NewScanner(&out)
+		for scanner.Scan() {
+			var message map[string]any
+			assert.NoError(t, json.Unmarshal(scanner.Bytes(), &message), scanner.Text())
+			if id, ok := message["id"].(float64); ok {
+				byID[id] = message
+			}
+		}
+		return byID
+	}
+
+	byID := relay(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"cache_clear","arguments":{}}}`)
+	assert.Equal(t, "cleared", byID[1]["result"].(map[string]any)["content"].([]any)[0].(map[string]any)["text"])
+
+	byID = relay(
+		`{"jsonrpc":"2.0","id":1,"method":"tools/list"}`,
+		`{"jsonrpc":"2.0","id":2,"method":"resources/list"}`,
+	)
+	described := map[string]string{}
+	for _, tool := range byID[1]["result"].(map[string]any)["tools"].([]any) {
+		listed := tool.(map[string]any)
+		_, twice := described[listed["name"].(string)]
+		assert.False(t, twice, listed["name"])
+		described[listed["name"].(string)] = listed["description"].(string)
+	}
+	assert.Contains(t, described["article_get"], "Read one article")
+	assert.Contains(t, described, "article_publish")
+	assert.Contains(t, described, "cache_clear")
+	assert.Contains(t, described, "steps")
+	uris := []string{}
+	for _, listed := range byID[2]["result"].(map[string]any)["resources"].([]any) {
+		uris = append(uris, listed.(map[string]any)["uri"].(string))
+	}
+	assert.Contains(t, uris, "ui://demo/run")
+
+	byID = relay(
+		`{"jsonrpc":"2.0","id":1,"method":"tools/list"}`,
+		`{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"article_get","arguments":{"article_id":"9"}}}`,
+		`{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"cache_clear","arguments":{}}}`,
+		`{"jsonrpc":"2.0","id":4,"method":"resources/read","params":{"uri":"ui://demo/run"}}`,
+	)
+	assert.Equal(t, "9", byID[2]["result"].(map[string]any)["structuredContent"].(map[string]any)["data"].(map[string]any)["id"])
+	assert.Equal(t, "cleared", byID[3]["result"].(map[string]any)["content"].([]any)[0].(map[string]any)["text"])
+	assert.Equal(t, "ui://demo/run", byID[4]["result"].(map[string]any)["contents"].([]any)[0].(map[string]any)["uri"])
 }
