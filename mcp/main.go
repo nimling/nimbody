@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"os/exec"
 	"sort"
@@ -191,7 +192,7 @@ func Exec(ctx context.Context, executable string, argv []string, onStep func(res
 		return err.Error(), true
 	}
 	lines := bufio.NewScanner(errPipe)
-	lines.Buffer(make([]byte, 0, 1<<16), 1<<24)
+	lines.Buffer(make([]byte, 0, 1<<16), math.MaxInt)
 	for lines.Scan() {
 		if step, ok := stream.Parse(lines.Text()); ok {
 			if onStep != nil {

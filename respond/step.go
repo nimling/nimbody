@@ -54,6 +54,13 @@ func FrameLimitMiddleware(bytes int) echo.MiddlewareFunc {
 	}
 }
 
+func GetFrameLimit(ctx echo.Context) int {
+	if declared, ok := ctx.Get("frame_limit").(int); ok {
+		return declared
+	}
+	return FrameLimit
+}
+
 func Streaming(ctx echo.Context) bool {
 	return strings.Contains(ctx.Request().Header.Get(echo.HeaderAccept), MIMEEventStream)
 }
@@ -122,11 +129,7 @@ func writeEvent(ctx echo.Context, event string, data any) error {
 		res.Header().Set("Cache-Control", "no-cache")
 		res.Header().Set("Connection", "keep-alive")
 		res.Header().Set("X-Accel-Buffering", "no")
-		limit := FrameLimit
-		if declared, ok := ctx.Get("frame_limit").(int); ok {
-			limit = declared
-		}
-		res.Header().Set(HeaderFrameLimit, strconv.Itoa(limit))
+		res.Header().Set(HeaderFrameLimit, strconv.Itoa(GetFrameLimit(ctx)))
 		res.WriteHeader(http.StatusOK)
 	}
 	body, err := json.Marshal(data)

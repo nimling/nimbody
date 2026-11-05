@@ -67,15 +67,7 @@ func Read(res *http.Response, onStep func(respond.Step)) (Result, error) {
 		return nil
 	}
 
-	limit := respond.FrameLimit
-	if declared, err := strconv.Atoi(res.Header.Get(respond.HeaderFrameLimit)); err == nil && declared >= 0 {
-		limit = declared
-	}
-	if limit == 0 {
-		limit = math.MaxInt
-	}
-	scanner := bufio.NewScanner(res.Body)
-	scanner.Buffer(make([]byte, 0, min(1<<16, limit)), limit)
+	scanner := Scanner(res)
 	for scanner.Scan() {
 		line := scanner.Text()
 		switch {
@@ -96,6 +88,19 @@ func Read(res *http.Response, onStep func(respond.Step)) (Result, error) {
 		return out, err
 	}
 	return out, flush()
+}
+
+func Scanner(res *http.Response) *bufio.Scanner {
+	limit := respond.FrameLimit
+	if declared, err := strconv.Atoi(res.Header.Get(respond.HeaderFrameLimit)); err == nil && declared >= 0 {
+		limit = declared
+	}
+	if limit == 0 {
+		limit = math.MaxInt
+	}
+	scanner := bufio.NewScanner(res.Body)
+	scanner.Buffer(make([]byte, 0, min(1<<16, limit)), limit)
+	return scanner
 }
 
 func Machine() bool {

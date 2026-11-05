@@ -16,6 +16,7 @@
 12. Module: `golang.org/x/crypto` is a direct requirement, for the test of the signed sums under `test/` only.
 13. `cli`: `config set --config <name> key=value` creates a named config that does not exist yet, as the refusal's hint says; `Load` no longer refuses the unknown name for that one command, and every other command still refuses it with the same message and hint.
 14. `respond`: a route declares the largest step stream frame it sends with `FrameLimitMiddleware(bytes)`, `0` for unbounded, and every stream announces it in the `X-Frame-Limit` header; a route that declares nothing announces `FrameLimit`, 16 MiB, as before. `stream.Read` sizes its line scanner from that header, so a result frame over 16 MiB no longer fails with `bufio.Scanner: token too long` where the route allows it. `POST /state/export` declares an unbounded frame, so a streamed export with blobs reads whole.
+15. The step stream frame limit reaches the mcp path. `/mcp` announces `X-Frame-Limit` from the operation it calls, `stream.Scanner` is the one reader sized from that header, and the stdio bridge reads the service's `/mcp` stream through it, so a `state_export` result over 16 MiB passes `<cli> mcp`. The `state_export` tool declares the unbounded frame its route does. `mcp.Exec` reads the cli's own stderr without a fixed cap. The lines a host sends on stdin to `<cli> mcp` stay capped at 16 MiB, as no endpoint has answered when they are read.
 
 ## v1.0.0
 

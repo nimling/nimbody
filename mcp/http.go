@@ -176,6 +176,7 @@ func (s *Server) handle(ctx echo.Context) error {
 			res.Header().Set(echo.HeaderContentType, respond.MIMEEventStream)
 			res.Header().Set("Cache-Control", "no-cache")
 			res.Header().Set("X-Accel-Buffering", "no")
+			res.Header().Set(respond.HeaderFrameLimit, strconv.Itoa(respond.GetFrameLimit(ctx)))
 			res.WriteHeader(http.StatusOK)
 		}
 		fmt.Fprintf(res, "event: message\ndata: %s\n\n", encoded)

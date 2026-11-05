@@ -24,6 +24,7 @@ import (
 	"github.com/nimling/nimbody/stream"
 	"github.com/spf13/cobra"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 type locationBody struct {
@@ -481,6 +482,39 @@ func TestStateExportDeclaresAnUnboundedFrame(t *testing.T) {
 	file := exportState(t, e, ``)
 	rec = call(e, http.MethodPost, "/api/state/import", state.MIMENDJSON, respond.MIMEEventStream, file)
 	assert.Equal(t, strconv.Itoa(respond.FrameLimit), rec.Header().Get(respond.HeaderFrameLimit), "a route that declares nothing announces the default")
+}
+
+func TestStateExportOverTheStdioBridgePassesAFrameOver16MiB(t *testing.T) {
+	m := seeded()
+	m.add("location", "loc-big", map[string]any{"name": strings.Repeat("x", respond.FrameLimit+1), "region": "south"})
+	e, operations := stateService(m)
+	server := &mcp.Server{Name: "demo", Version: "v1", Operations: operations}
+	server.Mount(e, func(next echo.HandlerFunc) echo.HandlerFunc { return next })
+	backend := httptest.NewServer(e)
+	defer backend.Close()
+	remote := func(ctx context.Context) (string, string, error) { return backend.URL + "/mcp", "owner", nil }
+
+	in := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"state_export","arguments":{"targets":[{"group":"location","keys":["loc-big"]}]},"_meta":{"progressToken":1}}}`
+	var out bytes.Buffer
+	assert.NoError(t, cli.Relay(context.Background(), "demo", remote, strings.NewReader(in), &out))
+	var answer map[string]any
+	progress := 0
+	for _, line := range bytes.Split(bytes.TrimSpace(out.Bytes()), []byte("\n")) {
+		var message map[string]any
+		assert.NoError(t, json.Unmarshal(line, &message))
+		if message["id"] == float64(1) {
+			answer = message
+			continue
+		}
+		progress++
+	}
+	assert.Positive(t, progress, "the call streamed its steps, so the result came as one frame")
+	require.NotNil(t, answer, "the result frame passed the bridge")
+	called := answer["result"].(map[string]any)
+	assert.Nil(t, called["isError"], fmt.Sprint(called["content"]))
+	body, _ := json.Marshal(called["structuredContent"])
+	assert.Greater(t, len(body), respond.FrameLimit)
+	assert.Contains(t, string(body), "loc-big")
 }
 
 func TestStateImportReportsOverTheStepStream(t *testing.T) {
