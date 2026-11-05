@@ -93,7 +93,7 @@ func Tools(root *cobra.Command, executable string) []mcp.Tool {
 		var flags []mcp.Flag
 		names := map[string]bool{}
 		add := func(flag *pflag.Flag) {
-			if flag.Hidden || flag.Name == "help" || flag.Name == "version" || secrets[flag.Name] || len(flag.Annotations[AnnotationSecret]) > 0 {
+			if flag.Hidden || flag.Name == "help" || flag.Name == "version" || flag.Name == FlagStream || secrets[flag.Name] || len(flag.Annotations[AnnotationSecret]) > 0 {
 				return
 			}
 			required := len(flag.Annotations[cobra.BashCompOneRequiredFlag]) > 0 && flag.Annotations[cobra.BashCompOneRequiredFlag][0] == "true"

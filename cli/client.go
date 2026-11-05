@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"os"
@@ -33,6 +34,9 @@ const (
 
 	PathStatus = "/status"
 	PathHealth = "/status/health"
+
+	FlagStream  = "stream"
+	StreamUsage = "send Accept: text/event-stream and print every frame as it arrives until the stream ends"
 
 	tokenSkew = 30 * time.Second
 )
@@ -268,8 +272,12 @@ func (c *Client) Send(cmd *cobra.Command, method, path string, query url.Values,
 		target += "?" + query.Encode()
 	}
 	ctx := context.Background()
+	live := false
 	if cmd != nil && cmd.Context() != nil {
 		ctx = cmd.Context()
+	}
+	if cmd != nil {
+		live, _ = cmd.Flags().GetBool(FlagStream)
 	}
 	req, err := http.NewRequestWithContext(ctx, method, target, bytes.NewReader(body))
 	if err != nil {
@@ -280,7 +288,11 @@ func (c *Client) Send(cmd *cobra.Command, method, path string, query url.Values,
 	} else if contentType != "" {
 		req.Header.Set("Content-Type", contentType)
 	}
-	req.Header.Set("Accept", respond.MIMEEventStream)
+	accept := respond.MIMEEventStream
+	if (method == http.MethodGet || method == http.MethodHead) && !live {
+		accept = ContentTypeJSON
+	}
+	req.Header.Set("Accept", accept)
 	c.headers(req)
 	if err := c.authorize(ctx, req); err != nil {
 		return nil, err
@@ -289,11 +301,20 @@ func (c *Client) Send(cmd *cobra.Command, method, path string, query url.Values,
 	if cmd != nil {
 		report = stream.Report(cmd.ErrOrStderr())
 	}
-	res, err := c.http().Do(req)
+	client := c.http()
+	if live {
+		unbounded := *client
+		unbounded.Timeout = 0
+		client = &unbounded
+	}
+	res, err := client.Do(req)
 	if err != nil {
 		return nil, &Error{Code: ExitFailure, Message: c.Endpoint() + " is unreachable", Cause: err}
 	}
 	defer res.Body.Close()
+	if live && (res.StatusCode != http.StatusUnauthorized || !c.reused) {
+		return nil, c.frames(cmd, method, path, res)
+	}
 	out, err := stream.Read(res, report)
 	if err != nil {
 		return nil, err
@@ -306,6 +327,76 @@ func (c *Client) Send(cmd *cobra.Command, method, path string, query url.Values,
 		return nil, c.failure(method, path, out.Status, out.Body)
 	}
 	return out.Body, nil
+}
+
+type frame struct {
+	Event string          `json:"event"`
+	Data  json.RawMessage `json:"data"`
+}
+
+func (c *Client) frames(cmd *cobra.Command, method, path string, res *http.Response) error {
+	out, errOut := cmd.OutOrStdout(), cmd.ErrOrStderr()
+	if res.StatusCode >= http.StatusMultipleChoices {
+		raw, _ := io.ReadAll(res.Body)
+		return c.failure(method, path, res.StatusCode, raw)
+	}
+	if !strings.HasPrefix(res.Header.Get("Content-Type"), respond.MIMEEventStream) {
+		raw, err := io.ReadAll(res.Body)
+		if err != nil {
+			return err
+		}
+		return c.output().Print(out, errOut, raw)
+	}
+	current := frame{Event: "message"}
+	flush := func() error {
+		defer func() { current = frame{Event: "message"} }()
+		if len(current.Data) == 0 {
+			return nil
+		}
+		if current.Event == "result" {
+			var ended struct {
+				Status int             `json:"status"`
+				Body   json.RawMessage `json:"body"`
+			}
+			if json.Unmarshal(current.Data, &ended) == nil && ended.Status >= http.StatusMultipleChoices {
+				return c.failure(method, path, ended.Status, ended.Body)
+			}
+		}
+		if c.output().Raw {
+			line, err := json.Marshal(current)
+			if err != nil {
+				return err
+			}
+			_, err = out.Write(append(line, '\n'))
+			return err
+		}
+		shown := StyleFor(out)
+		if _, err := fmt.Fprintln(out, shown.Bold(shown.Accent("event: "+current.Event))); err != nil {
+			return err
+		}
+		return c.output().Print(out, errOut, current.Data)
+	}
+	lines := stream.Scanner(res)
+	for lines.Scan() {
+		line := lines.Text()
+		switch {
+		case line == "":
+			if err := flush(); err != nil {
+				return err
+			}
+		case strings.HasPrefix(line, "event:"):
+			current.Event = strings.TrimSpace(strings.TrimPrefix(line, "event:"))
+		case strings.HasPrefix(line, "data:"):
+			if len(current.Data) > 0 {
+				current.Data = append(current.Data, '\n')
+			}
+			current.Data = append(current.Data, strings.TrimSpace(strings.TrimPrefix(line, "data:"))...)
+		}
+	}
+	if err := lines.Err(); err != nil && res.Request.Context().Err() == nil {
+		return err
+	}
+	return flush()
 }
 
 func (c *Client) do(req *http.Request) ([]byte, error) {
