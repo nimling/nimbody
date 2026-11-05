@@ -93,7 +93,7 @@ func Tools(root *cobra.Command, executable string) []mcp.Tool {
 		var flags []mcp.Flag
 		names := map[string]bool{}
 		add := func(flag *pflag.Flag) {
-			if flag.Hidden || flag.Name == "help" || flag.Name == "version" || secrets[flag.Name] || len(flag.Annotations[AnnotationSecret]) > 0 {
+			if flag.Hidden || flag.Name == "help" || flag.Name == "version" || flag.Name == FlagStream || secrets[flag.Name] || len(flag.Annotations[AnnotationSecret]) > 0 {
 				return
 			}
 			required := len(flag.Annotations[cobra.BashCompOneRequiredFlag]) > 0 && flag.Annotations[cobra.BashCompOneRequiredFlag][0] == "true"
@@ -353,26 +353,48 @@ type Call func(cmd *cobra.Command, method, path string, query url.Values, body [
 
 func OperationCommand(operation mcp.Operation, call Call) *cobra.Command {
 	verb := operation.Name[strings.LastIndex(operation.Name, "_")+1:]
+	paths := map[int]string{}
 	var positional []string
-	for _, segment := range strings.Split(operation.Path, "/") {
-		if strings.HasPrefix(segment, ":") {
-			positional = append(positional, strings.TrimPrefix(segment, ":"))
+	fewest := -1
+	for _, path := range append([]string{operation.Path}, operation.Paths...) {
+		var params []string
+		for _, segment := range strings.Split(path, "/") {
+			if strings.HasPrefix(segment, ":") {
+				params = append(params, strings.TrimPrefix(segment, ":"))
+			}
+		}
+		if _, taken := paths[len(params)]; !taken {
+			paths[len(params)] = path
+		}
+		if len(params) > len(positional) {
+			positional = params
+		}
+		if fewest < 0 || len(params) < fewest {
+			fewest = len(params)
 		}
 	}
 	use := verb
-	for _, param := range positional {
-		use += " <" + param + ">"
+	for index, param := range positional {
+		if index < fewest {
+			use += " <" + param + ">"
+			continue
+		}
+		use += " [" + param + "]"
 	}
 	cmd := &cobra.Command{
 		Use:         use,
 		Short:       operation.Description,
 		Example:     operation.Example,
-		Args:        cobra.ExactArgs(len(positional)),
+		Args:        cobra.RangeArgs(fewest, len(positional)),
 		Annotations: map[string]string{AnnotationMCP: operation.Access},
 	}
 	flags := cmd.Flags()
 	for _, input := range operation.Inputs {
-		if input.In == mcp.InPath {
+		if input.In == mcp.InPath || input.In == mcp.InHeader {
+			continue
+		}
+		if input.In == mcp.InQuery && strings.HasSuffix(input.Param, "*") {
+			flags.StringArray(input.Name, nil, input.Usage)
 			continue
 		}
 		switch input.Kind {
@@ -392,13 +414,27 @@ func OperationCommand(operation mcp.Operation, call Call) *cobra.Command {
 		}
 	}
 	cmd.RunE = func(cmd *cobra.Command, args []string) error {
-		path := operation.Path
-		for index, param := range positional {
+		path, found := paths[len(args)]
+		if !found {
+			return Rejected(fmt.Sprintf("%s takes %d to %d arguments", operation.Name, fewest, len(positional)), "")
+		}
+		for index, param := range positional[:len(args)] {
 			path = strings.Replace(path, ":"+param, url.PathEscape(args[index]), 1)
 		}
 		query := url.Values{}
 		fields := map[string]any{}
 		for _, input := range operation.Inputs {
+			if prefix, open := strings.CutSuffix(input.Param, "*"); input.In == mcp.InQuery && open {
+				entries, _ := cmd.Flags().GetStringArray(input.Name)
+				for _, entry := range entries {
+					key, value, paired := strings.Cut(entry, "=")
+					if !paired {
+						return Rejected("--"+input.Name+" takes key=value, not "+entry, "")
+					}
+					query.Add(prefix+key, value)
+				}
+				continue
+			}
 			flag := cmd.Flags().Lookup(input.Param)
 			if flag == nil || !flag.Changed {
 				continue

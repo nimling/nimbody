@@ -378,3 +378,90 @@ func TestClientMountNamesTheMissingPaths(t *testing.T) {
 	err = (&cli.Client{Settings: &cli.Settings{Name: "demo"}, LoginPath: "login", TokenPath: "/t", RevokePath: "/r", IdentityPath: "/me", AppHeader: "X-App"}).Mount(&cobra.Command{Use: "demo"})
 	assert.EqualError(t, err, "cli.Client paths start with a slash, got login")
 }
+
+func liveService(t *testing.T) *atomic.Value {
+	var accepted atomic.Value
+	served := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		accepted.Store(r.Method + " " + r.Header.Get("Accept"))
+		if r.Header.Get("Accept") != "text/event-stream" {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"data":{"id":"7"},"request_id":"r"}`))
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		if r.Method != http.MethodGet {
+			_, _ = w.Write([]byte("event: result\ndata: {\"status\":200,\"body\":{\"data\":{\"id\":\"7\"},\"request_id\":\"r\"}}\n\n"))
+			return
+		}
+		_, _ = w.Write([]byte("data: {\"rows\":1}\n\ndata: {\"rows\":2}\n\n"))
+	}))
+	t.Cleanup(served.Close)
+	t.Setenv("DEMO_ENDPOINT", served.URL)
+	t.Setenv("DEMO_TOKEN", "from-ci")
+	return &accepted
+}
+
+func TestClientReadsOnceAndStreamsOnlyWhenAsked(t *testing.T) {
+	accepted := liveService(t)
+	settings := credentialSettings(t, nil)
+	client := &cli.Client{LoginPath: "/api/auth/login", TokenPath: "/api/auth/cli/token", RevokePath: "/api/auth/cli/revoke", IdentityPath: "/api/me", AppHeader: "X-App-Slug", Settings: settings}
+
+	answer, err := client.Send(nil, http.MethodGet, "/api/views/7/data", nil, "", nil)
+	require.NoError(t, err)
+	assert.Equal(t, "GET application/json", accepted.Load(), "a plain read reports no steps, so it never asks for the stream")
+	assert.JSONEq(t, `{"data":{"id":"7"},"request_id":"r"}`, string(answer))
+	_, err = client.Send(nil, http.MethodHead, "/api/views/7/data", nil, "", nil)
+	require.NoError(t, err)
+	assert.Equal(t, "HEAD application/json", accepted.Load())
+	answer, err = client.Send(nil, http.MethodPost, "/api/views/7/run", nil, "", nil)
+	require.NoError(t, err)
+	assert.Equal(t, "POST text/event-stream", accepted.Load(), "every other method keeps the step stream")
+	assert.JSONEq(t, `{"data":{"id":"7"},"request_id":"r"}`, string(answer))
+
+	output := &cli.Output{}
+	root := &cobra.Command{Use: "demo", SilenceErrors: true, SilenceUsage: true}
+	output.Flags(root)
+	cli.Table{Name: "demo", Send: client.Send, Output: output, Resources: []cli.Resource{{Name: "view", Verbs: []cli.Verb{
+		{Name: "data", Method: http.MethodGet, Paths: []string{"", "/api/views/{id}/data"}, Stream: true},
+		{Name: "get", Method: http.MethodGet, Paths: []string{"", "/api/views/{id}"}},
+	}}}}.Mount(root)
+	var stdout bytes.Buffer
+	root.SetOut(&stdout)
+	root.SetErr(&bytes.Buffer{})
+
+	root.SetArgs([]string{"view", "data", "7", "--json"})
+	require.NoError(t, root.Execute())
+	assert.Equal(t, "GET application/json", accepted.Load())
+	assert.JSONEq(t, `{"id":"7"}`, stdout.String())
+
+	stdout.Reset()
+	root.SetArgs([]string{"view", "data", "7", "--stream", "--json"})
+	require.NoError(t, root.Execute())
+	assert.Equal(t, "GET text/event-stream", accepted.Load())
+	assert.Equal(t, "event: message\n{\n  \"rows\": 1\n}\nevent: message\n{\n  \"rows\": 2\n}\n", stdout.String(), "each frame prints as it arrives, as hvrg prints them")
+
+	get, _, _ := root.Find([]string{"view", "get"})
+	assert.Nil(t, get.Flags().Lookup(cli.FlagStream), "only a verb that declares a stream takes --stream")
+	for _, tool := range cli.Tools(root, "/bin/demo") {
+		schema, _ := json.Marshal(tool.InputSchema)
+		assert.NotContains(t, string(schema), `"stream"`, "a tool reads once and never opens the live stream: "+tool.Name)
+	}
+}
+
+func TestClientAPIStreamsWhenAsked(t *testing.T) {
+	accepted := liveService(t)
+	settings := credentialSettings(t, nil)
+	output := &cli.Output{}
+	root, stdout, _ := clientTree(settings, &cli.Client{LoginPath: "/api/auth/login", TokenPath: "/api/auth/cli/token", RevokePath: "/api/auth/cli/revoke", IdentityPath: "/api/me", AppHeader: "X-App-Slug", Settings: settings, Output: output})
+	root.PersistentFlags().BoolVar(&output.Raw, "raw", false, "raw")
+
+	root.SetArgs([]string{"api", "GET", "/api/views/7/data"})
+	require.NoError(t, root.Execute())
+	assert.Equal(t, "GET application/json", accepted.Load())
+
+	stdout.Reset()
+	root.SetArgs([]string{"api", "GET", "/api/views/7/data", "--stream", "--raw"})
+	require.NoError(t, root.Execute())
+	assert.Equal(t, "GET text/event-stream", accepted.Load())
+	assert.Equal(t, "{\"event\":\"message\",\"data\":{\"rows\":1}}\n{\"event\":\"message\",\"data\":{\"rows\":2}}\n", stdout.String(), "--raw prints each frame as one json line")
+}

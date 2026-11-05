@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"reflect"
 	"strings"
 	"time"
@@ -15,9 +16,10 @@ import (
 )
 
 const (
-	InPath  = "path"
-	InQuery = "query"
-	InBody  = "body"
+	InPath   = "path"
+	InQuery  = "query"
+	InHeader = "header"
+	InBody   = "body"
 )
 
 type Spec struct {
@@ -25,6 +27,9 @@ type Spec struct {
 	Description string
 	Method      string
 	Path        string
+	Paths       []string
+	Status      int
+	Invalid     string
 	Access      string
 	Page        string
 	Example     string
@@ -38,6 +43,7 @@ type Input struct {
 	Kind     string
 	Usage    string
 	Required bool
+	index    []int
 }
 
 type Operation struct {
@@ -70,6 +76,7 @@ var (
 	textMarshaler = reflect.TypeFor[encoding.TextMarshaler]()
 	timeType      = reflect.TypeFor[time.Time]()
 	rawType       = reflect.TypeFor[json.RawMessage]()
+	reserved      = []string{"limit", "page", "order", "column", "cursor"}
 )
 
 func Define[In any, Out any](spec Spec, service func(ctx echo.Context, in In) (Out, error)) Operation {
@@ -88,11 +95,26 @@ func Define[In any, Out any](spec Spec, service func(ctx echo.Context, in In) (O
 		}
 		return out, 1, nil
 	}
-	status := http.StatusOK
-	if spec.Method == http.MethodPost {
+	status := spec.Status
+	switch {
+	case status != 0:
+	case spec.Method == http.MethodPost:
 		status = http.StatusCreated
+	default:
+		status = http.StatusOK
 	}
-	inputs := inputsOf(reflect.TypeFor[In]())
+	inputs := inputsOf(reflect.TypeFor[In](), nil)
+	for i, input := range inputs {
+		if input.In != InPath {
+			continue
+		}
+		inputs[i].Required = true
+		for _, path := range spec.paths() {
+			if !strings.Contains(path+"/", "/:"+input.Param+"/") {
+				inputs[i].Required = false
+			}
+		}
+	}
 	operation := Operation{
 		Spec:         spec,
 		Inputs:       inputs,
@@ -100,17 +122,17 @@ func Define[In any, Out any](spec Spec, service func(ctx echo.Context, in In) (O
 		OutputSchema: GetOutputSchema(reflect.TypeFor[Out]()),
 		Route: func(ctx echo.Context) error {
 			var in In
-			if err := (&echo.DefaultBinder{}).Bind(&in, ctx); err != nil {
-				return respond.Error(ctx, http.StatusBadRequest, message(err))
+			if err := bind(ctx, &in, inputs); err != nil {
+				return refuse(ctx, spec.Name, invalid(spec, err))
 			}
 			value, count, err := run(ctx, in)
-			var rejected *echo.HTTPError
 			switch {
-			case errors.As(err, &rejected):
-				return respond.Error(ctx, rejected.Code, message(rejected))
 			case err != nil:
-				ctx.Logger().Error(spec.Name + ": " + err.Error())
-				return respond.ErrorInternal(ctx)
+				return refuse(ctx, spec.Name, err)
+			case status == http.StatusNoContent && !respond.Streaming(ctx):
+				return ctx.NoContent(status)
+			case status == http.StatusNoContent:
+				return respond.NoContent(ctx, status)
 			}
 			return respond.JSON(ctx, status, value, count)
 		},
@@ -118,7 +140,7 @@ func Define[In any, Out any](spec Spec, service func(ctx echo.Context, in In) (O
 			var in In
 			if len(arguments) > 0 {
 				if err := json.Unmarshal(arguments, &in); err != nil {
-					return nil, 0, echo.NewHTTPError(http.StatusBadRequest, err.Error())
+					return nil, 0, invalid(spec, err)
 				}
 			}
 			return run(ctx, in)
@@ -129,8 +151,145 @@ func Define[In any, Out any](spec Spec, service func(ctx echo.Context, in In) (O
 
 func Route(group *echo.Group, operations ...Operation) {
 	for _, operation := range operations {
-		group.Add(operation.Method, operation.Path, operation.Route, operation.Middleware...)
+		for _, path := range operation.paths() {
+			group.Add(operation.Method, path, operation.Route, operation.Middleware...)
+		}
 	}
+}
+
+func (s Spec) paths() []string {
+	return append([]string{s.Path}, s.Paths...)
+}
+
+func invalid(spec Spec, err error) error {
+	if spec.Invalid != "" {
+		return echo.NewHTTPError(http.StatusBadRequest, spec.Invalid)
+	}
+	return echo.NewHTTPError(http.StatusBadRequest, message(err))
+}
+
+func refuse(ctx echo.Context, name string, err error) error {
+	var rejection *respond.Rejection
+	var rejected *echo.HTTPError
+	switch {
+	case errors.As(err, &rejection) && rejection.Data != nil:
+		return respond.Error(ctx, rejection.Status, rejection.Message, rejection.Data)
+	case errors.As(err, &rejection):
+		return respond.Error(ctx, rejection.Status, rejection.Message)
+	case errors.As(err, &rejected):
+		return respond.Error(ctx, rejected.Code, message(rejected))
+	}
+	ctx.Logger().Error(name + ": " + err.Error())
+	return respond.ErrorInternal(ctx)
+}
+
+func bind(ctx echo.Context, in any, inputs []Input) error {
+	binder := &echo.DefaultBinder{}
+	if err := binder.BindBody(ctx, in); err != nil {
+		return err
+	}
+	switch ctx.Request().Method {
+	case http.MethodGet, http.MethodDelete, http.MethodHead:
+		if err := binder.BindQueryParams(ctx, in); err != nil {
+			return err
+		}
+	default:
+		if declares(inputs, InQuery) {
+			if err := binder.BindQueryParams(ctx, in); err != nil {
+				return err
+			}
+		}
+	}
+	if declares(inputs, InHeader) {
+		if err := binder.BindHeaders(ctx, in); err != nil {
+			return err
+		}
+	}
+	if err := binder.BindPathParams(ctx, in); err != nil {
+		return err
+	}
+	value := reflect.ValueOf(in).Elem()
+	if value.Kind() != reflect.Struct {
+		return nil
+	}
+	for _, input := range inputs {
+		prefix, open := strings.CutSuffix(input.Param, "*")
+		if input.In != InQuery || !open {
+			continue
+		}
+		field := value.FieldByIndex(input.index)
+		if field.Kind() != reflect.Map || field.Type().Key().Kind() != reflect.String {
+			continue
+		}
+		entries := opened(ctx.QueryParams(), prefix, inputs)
+		if len(entries) == 0 {
+			continue
+		}
+		key, elem := field.Type().Key(), field.Type().Elem()
+		filled := reflect.MakeMap(field.Type())
+		for name, values := range entries {
+			var entry reflect.Value
+			switch {
+			case elem.Kind() == reflect.String:
+				entry = reflect.ValueOf(values[0]).Convert(elem)
+			case elem.Kind() == reflect.Slice && elem.Elem().Kind() == reflect.String:
+				entry = reflect.ValueOf(values).Convert(elem)
+			case elem.Kind() == reflect.Interface && len(values) == 1:
+				entry = reflect.ValueOf(values[0])
+			case elem.Kind() == reflect.Interface:
+				entry = reflect.ValueOf(values)
+			default:
+				continue
+			}
+			filled.SetMapIndex(reflect.ValueOf(name).Convert(key), entry)
+		}
+		field.Set(filled)
+	}
+	return nil
+}
+
+func declares(inputs []Input, in string) bool {
+	for _, input := range inputs {
+		if input.In == in {
+			return true
+		}
+	}
+	return false
+}
+
+func opened(query url.Values, prefix string, inputs []Input) url.Values {
+	entries := url.Values{}
+	for key, values := range query {
+		name, found := strings.CutPrefix(key, prefix)
+		if !found || name == "" || (prefix == "" && taken(key, inputs)) {
+			continue
+		}
+		entries[name] = values
+	}
+	return entries
+}
+
+func taken(key string, inputs []Input) bool {
+	for _, name := range reserved {
+		if key == name {
+			return true
+		}
+	}
+	for _, input := range inputs {
+		if input.In != InQuery {
+			continue
+		}
+		if prefix, open := strings.CutSuffix(input.Param, "*"); open {
+			if prefix != "" && strings.HasPrefix(key, prefix) {
+				return true
+			}
+			continue
+		}
+		if key == input.Param {
+			return true
+		}
+	}
+	return false
 }
 
 func message(err error) string {
@@ -155,7 +314,7 @@ func (o Operation) Tool() Tool {
 	return tool
 }
 
-func inputsOf(t reflect.Type) []Input {
+func inputsOf(t reflect.Type, index []int) []Input {
 	for t.Kind() == reflect.Pointer {
 		t = t.Elem()
 	}
@@ -172,16 +331,19 @@ func inputsOf(t reflect.Type) []Input {
 		if skip {
 			continue
 		}
+		at := append(append([]int{}, index...), i)
 		if field.Anonymous && field.Tag.Get("json") == "" && field.Type.Kind() == reflect.Struct {
-			inputs = append(inputs, inputsOf(field.Type)...)
+			inputs = append(inputs, inputsOf(field.Type, at)...)
 			continue
 		}
-		input := Input{Name: name, Param: name, In: InBody, Kind: kindOf(field.Type), Usage: field.Tag.Get("jsonschema")}
+		input := Input{Name: name, Param: name, In: InBody, Kind: kindOf(field.Type), Usage: field.Tag.Get("jsonschema"), index: at}
 		switch {
 		case field.Tag.Get("param") != "":
-			input.In, input.Param, input.Required = InPath, field.Tag.Get("param"), true
+			input.In, input.Param = InPath, field.Tag.Get("param")
 		case field.Tag.Get("query") != "":
 			input.In, input.Param = InQuery, field.Tag.Get("query")
+		case field.Tag.Get("header") != "":
+			input.In, input.Param = InHeader, field.Tag.Get("header")
 		default:
 			input.Required = !omit && field.Type.Kind() != reflect.Pointer
 		}

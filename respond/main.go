@@ -20,6 +20,16 @@ type ReturnError struct {
 	Message string `json:"message"`
 }
 
+type Rejection struct {
+	Status  int
+	Message string
+	Data    any
+}
+
+func (r *Rejection) Error() string {
+	return r.Message
+}
+
 type ReturnObject struct {
 	Data       any               `json:"data"`
 	Error      *ReturnError      `json:"error,omitempty"`

@@ -163,7 +163,7 @@ func APICommand(send Send, output *Output) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:         "api <method> <path>",
 		Short:       "Send a request to any api path the resource commands do not model",
-		Example:     "api GET /api/status\napi POST /api/articles --set title=Orion --set tags='[\"news\"]'",
+		Example:     "api GET /api/status\napi POST /api/articles --set title=Orion --set tags='[\"news\"]'\napi GET /api/views/7/data --stream",
 		Annotations: map[string]string{AnnotationMCP: mcp.AccessWrite},
 		Args: func(cmd *cobra.Command, args []string) error {
 			if err := cobra.ExactArgs(2)(cmd, args); err != nil {
@@ -192,5 +192,6 @@ func APICommand(send Send, output *Output) *cobra.Command {
 		},
 	}
 	body.Flags(cmd, true)
+	cmd.Flags().Bool(FlagStream, false, StreamUsage)
 	return cmd
 }

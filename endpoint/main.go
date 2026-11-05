@@ -2,6 +2,7 @@ package endpoint
 
 import (
 	"context"
+	"errors"
 	"net/http"
 
 	"github.com/labstack/echo/v4"
@@ -38,7 +39,7 @@ type Health struct {
 	Healthy bool `json:"healthy"`
 }
 
-func Mount(e *echo.Echo, set Set) {
+func Mount(e *echo.Echo, set Set) error {
 	status := Status{Service: set.Service, Version: set.Version, Endpoints: []string{"/api", StatusPath}}
 
 	var operations []mcp.Operation
@@ -56,6 +57,22 @@ func Mount(e *echo.Echo, set Set) {
 
 	if set.MCP != nil {
 		set.MCP.Operations = append(set.MCP.Operations, operations...)
+		var names []string
+		for _, operation := range set.MCP.Operations {
+			names = append(names, operation.Name)
+		}
+		for _, page := range set.MCP.Pages {
+			for _, tool := range page.Tools {
+				names = append(names, tool.Name)
+			}
+		}
+		named := map[string]bool{}
+		for _, name := range names {
+			if named[name] {
+				return errors.New("endpoint: two tools are called " + name)
+			}
+			named[name] = true
+		}
 		set.MCP.Mount(e, set.MCPAccess...)
 		status.Endpoints = append(status.Endpoints, mcp.MountPath)
 	}
@@ -84,4 +101,5 @@ func Mount(e *echo.Echo, set Set) {
 		}
 		return respond.JSON(ctx, http.StatusOK, Health{Healthy: true}, 1)
 	})
+	return nil
 }

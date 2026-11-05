@@ -17,6 +17,7 @@ type Verb struct {
 	Paths   []string
 	Body    bool
 	Upload  bool
+	Stream  bool
 	Access  string
 	Example string
 }
@@ -132,6 +133,9 @@ func (t Table) verb(verb Verb, path []string) *cobra.Command {
 			}
 			return t.output().Print(cmd.OutOrStdout(), cmd.ErrOrStderr(), answer)
 		},
+	}
+	if verb.Stream {
+		cmd.Flags().Bool(FlagStream, false, StreamUsage)
 	}
 	if verb.Body || verb.Upload {
 		body.Flags(cmd, verb.Upload)
