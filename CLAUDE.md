@@ -8,7 +8,7 @@ The shared contract of a Go service and its cli. Every Go service imports its ht
 2. `just build`: `go build ./...`.
 3. `just tidy`: `go mod tidy`.
 4. `just deploy`: `sbump patch --env APP_VERSION --push-version --auto --workflow`; `.github/workflows/release.yml` makes the GitHub release on the tag.
-5. `just install`: installs `sbump`.
+5. `just install`: checks go against `go.mod` and sbump, installs what is missing or older, then the module dependencies.
 
 ## Packages
 
