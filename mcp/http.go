@@ -357,7 +357,11 @@ func (s *Server) dispatch(ctx echo.Context, operation Operation, arguments json.
 	clone.Method = operation.Method
 	clone.URL = &url.URL{Path: path, RawQuery: query.Encode()}
 	clone.Body = http.NoBody
-	clone.Header.Set(echo.HeaderAccept, respond.MIMEEventStream)
+	accept := respond.MIMEEventStream
+	if operation.Method == http.MethodGet || operation.Method == http.MethodHead {
+		accept = echo.MIMEApplicationJSON
+	}
+	clone.Header.Set(echo.HeaderAccept, accept)
 	for key, value := range header {
 		clone.Header[key] = value
 	}
@@ -517,6 +521,10 @@ func (c *capture) message() string {
 }
 
 func (c *capture) rejection() error {
+	var answered respond.ReturnObject
+	if c.result == nil && json.Unmarshal(c.body.Bytes(), &answered) == nil && answered.Error != nil {
+		c.result = &respond.ReturnResult{Status: c.status, Body: answered}
+	}
 	if c.result != nil && c.result.Body.Count > 0 {
 		return &respond.Rejection{Status: c.code(), Message: c.message(), Data: c.result.Body.Data}
 	}

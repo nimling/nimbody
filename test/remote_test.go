@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/labstack/echo/v4"
@@ -38,6 +39,17 @@ type articleCreate struct {
 	Draft bool   `json:"draft,omitempty"`
 }
 
+var remoteSeen struct {
+	sync.Mutex
+	accept []string
+}
+
+func seeAccept(ctx echo.Context) {
+	remoteSeen.Lock()
+	defer remoteSeen.Unlock()
+	remoteSeen.accept = append(remoteSeen.accept, ctx.Request().Method+" "+ctx.Request().Header.Get(echo.HeaderAccept))
+}
+
 func remoteService() (*echo.Echo, *mcp.Server) {
 	auth := func(next echo.HandlerFunc) echo.HandlerFunc {
 		return func(ctx echo.Context) error {
@@ -58,9 +70,7 @@ func remoteService() (*echo.Echo, *mcp.Server) {
 	}
 	get := mcp.Define(mcp.Spec{Name: "article_get", Description: "Read one article", Method: http.MethodGet, Path: "/articles/:article_id", Access: mcp.AccessRead, Middleware: []echo.MiddlewareFunc{owner}},
 		func(ctx echo.Context, in articleInput) (article, error) {
-			steps := respond.GetSteps(ctx)
-			steps.Start("read", "read the article", "")
-			steps.Done("read", nil)
+			seeAccept(ctx)
 			if in.ArticleID == "gone" {
 				return article{}, echo.NewHTTPError(http.StatusNotFound, "no article is gone")
 			}
@@ -74,7 +84,15 @@ func remoteService() (*echo.Echo, *mcp.Server) {
 		func(ctx echo.Context, in articleCreate) (article, error) {
 			return article{ID: "new", Title: in.Title}, nil
 		})
-	operations := []mcp.Operation{get, list, create}
+	publish := mcp.Define(mcp.Spec{Name: "article_publish", Description: "Publish an article", Method: http.MethodPost, Path: "/articles/:article_id/publish", Status: http.StatusOK, Access: mcp.AccessWrite},
+		func(ctx echo.Context, in articleInput) (article, error) {
+			seeAccept(ctx)
+			steps := respond.GetSteps(ctx)
+			steps.Start("publish", "publish the article", "")
+			steps.Done("publish", nil)
+			return article{ID: in.ArticleID, Title: "Orion", Reader: ctx.Get("user").(string)}, nil
+		})
+	operations := []mcp.Operation{get, list, create, publish}
 	e := echo.New()
 	mcp.Route(e.Group("/api", auth), operations...)
 	server := &mcp.Server{Name: "demo", Version: "v1", Operations: operations, AuthorizationServer: "https://auth.example.test"}
@@ -129,7 +147,7 @@ func TestRemoteListsOperationsAsTools(t *testing.T) {
 	for _, tool := range result(t, rec)["tools"].([]any) {
 		tools[tool.(map[string]any)["name"].(string)] = tool.(map[string]any)
 	}
-	assert.Len(t, tools, 3, "no run page and no steps tool over http")
+	assert.Len(t, tools, 4, "no run page and no steps tool over http")
 	get := tools["article_get"]
 	assert.Equal(t, true, get["annotations"].(map[string]any)["readOnlyHint"])
 	schema := get["inputSchema"].(map[string]any)
@@ -179,7 +197,7 @@ func TestRemoteCallHintsWhenMoreRowsExist(t *testing.T) {
 
 func TestRemoteCallStreamsProgress(t *testing.T) {
 	e, _ := remoteService()
-	rec := post(e, "good", "application/json, text/event-stream", `{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"article_get","arguments":{"article_id":"42"},"_meta":{"progressToken":"p1"}}}`)
+	rec := post(e, "good", "application/json, text/event-stream", `{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"article_publish","arguments":{"article_id":"42"},"_meta":{"progressToken":"p1"}}}`)
 	assert.Equal(t, respond.MIMEEventStream, rec.Header().Get(echo.HeaderContentType))
 	var messages []map[string]any
 	for _, line := range strings.Split(rec.Body.String(), "\n") {
@@ -193,6 +211,26 @@ func TestRemoteCallStreamsProgress(t *testing.T) {
 	assert.Equal(t, "notifications/progress", messages[0]["method"])
 	assert.Equal(t, "p1", messages[0]["params"].(map[string]any)["progressToken"])
 	assert.Equal(t, float64(7), messages[2]["id"])
+}
+
+func TestRemoteGetToolReadsOnce(t *testing.T) {
+	e, _ := remoteService()
+	remoteSeen.Lock()
+	remoteSeen.accept = nil
+	remoteSeen.Unlock()
+	rec := post(e, "good", "application/json, text/event-stream", `{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"article_get","arguments":{"article_id":"42"},"_meta":{"progressToken":"p2"}}}`)
+	assert.Equal(t, echo.MIMEApplicationJSON, rec.Header().Get(echo.HeaderContentType), "a read answers once, never as a stream")
+	called := result(t, rec)
+	assert.Nil(t, called["isError"])
+	assert.Equal(t, "42", called["structuredContent"].(map[string]any)["data"].(map[string]any)["id"])
+
+	rec = post(e, "good", "application/json", `{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"article_get","arguments":{"article_id":"locked"}}}`)
+	assert.Equal(t, "no claim reaches article locked", result(t, rec)["content"].([]any)[0].(map[string]any)["text"], "a middleware refusal of a read keeps its message")
+
+	post(e, "good", "application/json", `{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"article_publish","arguments":{"article_id":"42"}}}`)
+	remoteSeen.Lock()
+	defer remoteSeen.Unlock()
+	assert.Equal(t, []string{"GET application/json", "POST text/event-stream"}, remoteSeen.accept, "a GET tool reaches the service with Accept: application/json, a write keeps the step stream")
 }
 
 func TestRemoteNotificationIsAccepted(t *testing.T) {
@@ -234,7 +272,7 @@ func TestRemoteBridgeRelaysStdio(t *testing.T) {
 	in := strings.Join([]string{
 		`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2026-07-28"}}`,
 		`{"jsonrpc":"2.0","method":"notifications/initialized"}`,
-		`{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"article_get","arguments":{"article_id":"9"},"_meta":{"progressToken":1}}}`,
+		`{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"article_publish","arguments":{"article_id":"9"},"_meta":{"progressToken":1}}}`,
 	}, "\n")
 	var out bytes.Buffer
 	assert.NoError(t, cli.Relay(context.Background(), "demo", remote, strings.NewReader(in), &out))
