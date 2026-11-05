@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -356,7 +357,15 @@ func (s *Server) dispatch(ctx echo.Context, operation Operation, arguments json.
 	clone := request.Clone(request.Context())
 	clone.Method = operation.Method
 	clone.URL = &url.URL{Path: path, RawQuery: query.Encode()}
-	clone.Body = http.NoBody
+	clone.Body, clone.ContentLength = http.NoBody, 0
+	if input, found := undecoded(operation.Inputs); found {
+		fields := map[string]json.RawMessage{}
+		_ = json.Unmarshal(arguments, &fields)
+		if body, given := fields[input.Name]; given {
+			clone.Body, clone.ContentLength = io.NopCloser(bytes.NewReader(body)), int64(len(body))
+			clone.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
+		}
+	}
 	accept := respond.MIMEEventStream
 	if operation.Method == http.MethodGet || operation.Method == http.MethodHead {
 		accept = echo.MIMEApplicationJSON

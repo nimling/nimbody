@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -14,6 +15,7 @@ import (
 	"testing"
 
 	"github.com/labstack/echo/v4"
+	"github.com/nimling/nimbody"
 	"github.com/nimling/nimbody/cli"
 	"github.com/nimling/nimbody/endpoint"
 	"github.com/nimling/nimbody/mcp"
@@ -610,4 +612,162 @@ func TestOperationCommandCoversSeveralPaths(t *testing.T) {
 	assert.NoError(t, get.Execute())
 	assert.Equal(t, "/sources/7", path)
 	assert.Equal(t, url.Values{"var.region": {"eu"}, "claim": {"reader"}}, query)
+}
+
+type deviceInput struct {
+	nimbody.Body
+	DeviceID   string  `param:"device_id" json:"device_id"`
+	Name       *string `json:"name"`
+	LocationID *string `json:"location_id"`
+}
+
+type callInput struct {
+	Name  string          `param:"name" json:"name"`
+	Input json.RawMessage `json:"input,omitempty" body:"*"`
+}
+
+type readCounter struct {
+	io.Reader
+	read *bool
+}
+
+func (r readCounter) Read(p []byte) (int, error) {
+	*r.read = true
+	return r.Reader.Read(p)
+}
+
+func bodyService() *echo.Echo {
+	put := mcp.Define(mcp.Spec{Name: "device_update", Description: "Change a device", Method: http.MethodPut, Path: "/devices/:device_id", Access: mcp.AccessWrite},
+		func(ctx echo.Context, in deviceInput) (map[string]any, error) {
+			if denied := in.Deny("id", "sa_*"); len(denied) > 0 {
+				return nil, &respond.Rejection{Status: http.StatusBadRequest, Message: "read only fields: " + denied[0]}
+			}
+			keys := []string{}
+			if in.Validator() != nil {
+				for key := range in.Validator().Body {
+					keys = append(keys, key)
+				}
+			}
+			return map[string]any{
+				"device":         in.DeviceID,
+				"keys":           keys,
+				"has_name":       in.HasKey("name"),
+				"clear_location": in.HasKey("location_id") && in.LocationID == nil,
+				"empty":          in.IsEmpty(),
+			}, nil
+		})
+	call := mcp.Define(mcp.Spec{Name: "operation_call", Description: "Call an operation", Method: http.MethodPost, Path: "/calls/:name", Status: http.StatusOK, Access: mcp.AccessWrite},
+		func(ctx echo.Context, in callInput) (map[string]any, error) {
+			if in.Name == "gone" {
+				return nil, &respond.Rejection{Status: http.StatusNotFound, Message: "operation not found"}
+			}
+			raw, err := io.ReadAll(io.LimitReader(ctx.Request().Body, 65))
+			if err != nil || len(raw) > 64 {
+				return nil, &respond.Rejection{Status: http.StatusRequestEntityTooLarge, Message: "input is larger than 64 bytes"}
+			}
+			var input any
+			if err := json.Unmarshal(raw, &input); err != nil {
+				return nil, &respond.Rejection{Status: http.StatusBadRequest, Message: "input must be json"}
+			}
+			return map[string]any{"input": input, "field": len(in.Input)}, nil
+		})
+	operations := []mcp.Operation{put, call}
+	e := echo.New()
+	mcp.Route(e.Group("/api"), operations...)
+	server := &mcp.Server{Name: "demo", Version: "v1", Operations: operations, AuthorizationServer: "https://auth.example.test"}
+	server.Mount(e)
+	return e
+}
+
+func TestDefineRecordsTheBodyKeysOnBothTransports(t *testing.T) {
+	e := bodyService()
+	rec := serveRoute(e, http.MethodPut, "/api/devices/7", nil, `{"name":"Hall","location_id":null}`)
+	assert.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+	routed := routeEnvelope(t, rec)["data"].(map[string]any)
+	called := callTool(t, e, "device_update", `{"device_id":"7","name":"Hall","location_id":null,"fields":["device"],"limit":3}`)
+	assert.Nil(t, called["isError"])
+	tooled := called["structuredContent"].(map[string]any)["data"].(map[string]any)
+	for _, data := range []map[string]any{routed, tooled} {
+		assert.Equal(t, "7", data["device"])
+		assert.ElementsMatch(t, []any{"name", "location_id"}, data["keys"])
+		assert.Equal(t, true, data["has_name"])
+		assert.Equal(t, true, data["clear_location"])
+		assert.Equal(t, false, data["empty"])
+	}
+
+	routed = routeEnvelope(t, serveRoute(e, http.MethodPut, "/api/devices/7", nil, `{"name":"Hall"}`))["data"].(map[string]any)
+	tooled = callTool(t, e, "device_update", `{"device_id":"7","name":"Hall"}`)["structuredContent"].(map[string]any)["data"].(map[string]any)
+	for _, data := range []map[string]any{routed, tooled} {
+		assert.Equal(t, false, data["clear_location"])
+	}
+
+	routed = routeEnvelope(t, serveRoute(e, http.MethodPut, "/api/devices/7", nil, ""))["data"].(map[string]any)
+	tooled = callTool(t, e, "device_update", `{"device_id":"7"}`)["structuredContent"].(map[string]any)["data"].(map[string]any)
+	for _, data := range []map[string]any{routed, tooled} {
+		assert.Equal(t, false, data["has_name"])
+		assert.Equal(t, true, data["empty"])
+	}
+
+	rec = serveRoute(e, http.MethodPut, "/api/devices/7", nil, `{"name":"Hall","sa_owner":"x"}`)
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
+	assert.Equal(t, "read only fields: sa_owner", routeEnvelope(t, rec)["error"].(map[string]any)["message"])
+	called = callTool(t, e, "device_update", `{"device_id":"7","name":"Hall","sa_owner":"x"}`)
+	assert.Equal(t, true, called["isError"])
+	assert.Equal(t, "read only fields: sa_owner", called["content"].([]any)[0].(map[string]any)["text"])
+}
+
+func TestDefineRawBodyIsAnyJSONOnBothTransports(t *testing.T) {
+	e := bodyService()
+	for _, input := range []string{`[1,"two",{"three":3}]`, `42`, `"hall"`, `true`} {
+		var want any
+		assert.NoError(t, json.Unmarshal([]byte(input), &want))
+		rec := serveRoute(e, http.MethodPost, "/api/calls/read", nil, input)
+		assert.Equal(t, http.StatusOK, rec.Code, input)
+		routed := routeEnvelope(t, rec)["data"].(map[string]any)
+		called := callTool(t, e, "operation_call", `{"name":"read","input":`+input+`}`)
+		assert.Nil(t, called["isError"], input)
+		tooled := called["structuredContent"].(map[string]any)["data"].(map[string]any)
+		for _, data := range []map[string]any{routed, tooled} {
+			assert.Equal(t, want, data["input"], input)
+			assert.Equal(t, float64(0), data["field"], input)
+		}
+	}
+
+	rec := serveRoute(e, http.MethodPost, "/api/calls/read", nil, `"`+strings.Repeat("a", 80)+`"`)
+	assert.Equal(t, http.StatusRequestEntityTooLarge, rec.Code)
+	called := callTool(t, e, "operation_call", `{"name":"read","input":"`+strings.Repeat("a", 80)+`"}`)
+	assert.Equal(t, "input is larger than 64 bytes", called["content"].([]any)[0].(map[string]any)["text"])
+}
+
+func TestDefineRawBodyNeedsNoContentType(t *testing.T) {
+	e := bodyService()
+	for _, contentType := range []string{"", "text/plain", "application/octet-stream"} {
+		req := httptest.NewRequest(http.MethodPost, "/api/calls/read", strings.NewReader(`[1,2]`))
+		if contentType != "" {
+			req.Header.Set(echo.HeaderContentType, contentType)
+		}
+		rec := httptest.NewRecorder()
+		e.ServeHTTP(rec, req)
+		assert.Equal(t, http.StatusOK, rec.Code, contentType)
+		assert.Equal(t, []any{float64(1), float64(2)}, routeEnvelope(t, rec)["data"].(map[string]any)["input"], contentType)
+	}
+}
+
+func TestDefineRawBodyAnswersNotFoundBeforeTheBodyIsRead(t *testing.T) {
+	e := bodyService()
+	read := false
+	req := httptest.NewRequest(http.MethodPost, "/api/calls/gone", readCounter{Reader: strings.NewReader(`{"broken`), read: &read})
+	req.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
+	rec := httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+	assert.Equal(t, http.StatusNotFound, rec.Code)
+	assert.Equal(t, "operation not found", routeEnvelope(t, rec)["error"].(map[string]any)["message"])
+	assert.False(t, read)
+
+	called := callTool(t, e, "operation_call", `{"name":"gone","input":[1]}`)
+	assert.Equal(t, true, called["isError"])
+	assert.Equal(t, "operation not found", called["content"].([]any)[0].(map[string]any)["text"])
+
+	rec = serveRoute(e, http.MethodPut, "/api/devices/7", nil, `{"name":`)
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
 }
