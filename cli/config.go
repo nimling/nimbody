@@ -58,6 +58,7 @@ type Settings struct {
 	Prefix   string
 	Keys     []Setting
 	Loaded   Loaded
+	values   map[string]string
 	config   string
 	envFiles []string
 	global   bool
@@ -269,6 +270,7 @@ func (s *Settings) Load(cmd *cobra.Command) error {
 		}
 	}
 
+	s.values = map[string]string{}
 	s.Loaded = Loaded{Config: name, Protected: block[KeyProtected] == "true", Home: homePath, Local: localPath, EnvFiles: s.envFiles}
 	for _, key := range s.Keys {
 		source := Source{Key: key.Key, Env: key.Env}
@@ -290,12 +292,23 @@ func (s *Settings) Load(cmd *cobra.Command) error {
 				return err
 			}
 		}
+		s.values[key.Key] = source.Value
 		if key.Secret {
 			source.Value = Mask(source.Value)
 		}
 		s.Loaded.Values = append(s.Loaded.Values, source)
 	}
 	return nil
+}
+
+func (s *Settings) Get(key string) string {
+	if value := s.values[key]; value != "" {
+		return value
+	}
+	if setting, ok := s.setting(key); ok {
+		return os.Getenv(setting.Env)
+	}
+	return os.Getenv(s.Prefix + strings.ToUpper(key))
 }
 
 func flagChanged(cmd *cobra.Command, name string) bool {

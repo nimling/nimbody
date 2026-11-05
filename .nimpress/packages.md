@@ -34,6 +34,10 @@ The shared cli layer the `cli` skill describes.
 
 4. `Settings` is the config. `Flags` adds `--config`, `--env`, `--global`, `--yes` and `--plan`. `Load` layers the flag, the environment, `--env` files, the local `.<cli>/config.yaml` found walking up and the named config in `~/.<cli>/config.yaml` into the environment; the local config takes over from the named one. `Guard` asks before a write on a `protected` config. `ConfigCommand` is `config get`, `list`, `set`, `use`, `init`, `local` and `path`.
 
+4.1. `Settings` holds the credentials too. `GetCredential`, `PutCredential`, `DeleteCredential`, `GetCredentials` and `LockCredential` keep a login per host in `~/.<cli>/<host>.cred` and a machine token per host and client in `<host>_<client>.client`, the tokens in the OS keychain (`Keychain`: `security` on macOS, `secret-tool` on Linux) and only where none answers in the 0600 file. `Get` answers a key's resolved value.
+
+4.2. `Client` is the api client and its login. The credential is `<PREFIX>TOKEN` (or `<PREFIX>ACCESS_TOKEN`) for CI, else the stored login, refreshed before expiry under the cross process lock, else the machine pair sent as Basic auth to the service. A cli whose service is the prophet sets `Exchange` and exchanges the pair for a token, cached under the same lock, so parallel runs share one. `Send` sends through it with the step stream, the `User-Agent` and the family exit codes. `Mount` adds `login` (PKCE, loopback or `--no-browser`), `logout`, `status` and `token`, and makes `Remote` the default `Bridge`: `<cli> mcp` relays to the service's `/mcp` when `/status` lists it and the credential is a bearer token, and serves the tools locally otherwise.
+
 5. `Output` is the shared renderer with `--json`, `--raw`, `--plain`, `--fields`, `--sort`, `--jq`, `--template`, `--limit` and `--cursor`. `OperationCommand` builds a command from an `mcp.Operation`. `Bridge` and `Relay` make `<cli> mcp` relay stdio to the backend `/mcp` with the stored login.
 
 ## state

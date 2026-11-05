@@ -1,0 +1,396 @@
+package cli
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+	"net/url"
+	"os"
+	"slices"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/nimling/nimbody/mcp"
+	"github.com/nimling/nimbody/respond"
+	"github.com/nimling/nimbody/stream"
+	"github.com/spf13/cobra"
+)
+
+const (
+	AuthToken  = "token"
+	AuthLogin  = "login"
+	AuthClient = "client_credentials"
+	AuthNone   = "none"
+
+	KeyEndpoint     = "endpoint"
+	KeyAppSlug      = "app_slug"
+	KeyClientID     = "client_id"
+	KeyClientSecret = "client_secret"
+
+	PathLogin     = "/api/auth/login"
+	PathCliLogin  = "/api/auth/cli/login"
+	PathCliToken  = "/api/auth/cli/token"
+	PathCliRevoke = "/api/auth/cli/revoke"
+	PathToken     = "/api/auth/oauth/token"
+	PathIdentity  = "/api/me"
+	PathStatus    = "/status"
+	PathHealth    = "/status/health"
+
+	HeaderAppSlug = "SAuth-App-Slug"
+
+	tokenSkew = 30 * time.Second
+)
+
+type Client struct {
+	Settings     *Settings
+	Product      string
+	Version      func() string
+	LoginPath    string
+	Exchange     string
+	IdentityPath string
+	HealthPath   string
+	AppHeader    string
+	HTTP         *http.Client
+	Output       *Output
+
+	mode     string
+	resolved bool
+	cred     Credential
+	token    string
+	expiry   time.Time
+	issued   Token
+	reused   bool
+	rejected string
+	probe    sync.Once
+	serves   bool
+}
+
+type Token struct {
+	AccessToken string `json:"access_token"`
+	TokenType   string `json:"token_type"`
+	ExpiresIn   int    `json:"expires_in"`
+	Scope       string `json:"scope,omitempty"`
+}
+
+type clientEnvelope struct {
+	Data  json.RawMessage `json:"data"`
+	Error *struct {
+		Message string `json:"message"`
+	} `json:"error"`
+}
+
+func (c *Client) name() string { return c.Settings.Name }
+
+func (c *Client) http() *http.Client {
+	if c.HTTP == nil {
+		c.HTTP = &http.Client{Timeout: 120 * time.Second}
+	}
+	return c.HTTP
+}
+
+func (c *Client) Endpoint() string {
+	return strings.TrimRight(c.Settings.Get(KeyEndpoint), "/")
+}
+
+func (c *Client) EnvToken() string {
+	return firstSet(os.Getenv(c.Settings.Prefix+"TOKEN"), os.Getenv(c.Settings.Prefix+"ACCESS_TOKEN"))
+}
+
+func (c *Client) Mode() string {
+	c.resolve()
+	return c.mode
+}
+
+func (c *Client) resolve() {
+	if c.resolved {
+		return
+	}
+	c.resolved = true
+	c.mode = AuthNone
+	switch {
+	case c.EnvToken() != "":
+		c.mode = AuthToken
+	case c.Endpoint() == "":
+	default:
+		if cred, err := c.Settings.GetCredential(c.Endpoint(), ""); err == nil {
+			c.mode, c.cred = AuthLogin, cred
+			return
+		}
+		if c.Settings.Get(KeyClientID) != "" && c.Settings.Get(KeyClientSecret) != "" {
+			c.mode = AuthClient
+		}
+	}
+}
+
+func (c *Client) unauthenticated() error {
+	return Unauthenticated("no credential for "+firstSet(c.Endpoint(), "this config"), "Run '"+c.name()+" login', set "+c.Settings.Prefix+"CLIENT_ID and "+c.Settings.Prefix+"CLIENT_SECRET, or "+c.Settings.Prefix+"TOKEN in CI.")
+}
+
+func (c *Client) GetToken(ctx context.Context) (Token, error) {
+	c.resolve()
+	switch {
+	case c.mode == AuthToken:
+		return Token{AccessToken: c.EnvToken(), TokenType: "Bearer"}, nil
+	case c.mode == AuthLogin:
+		return c.refresh(ctx)
+	case c.mode == AuthClient && c.Exchange != "":
+		return c.exchange(ctx)
+	case c.mode == AuthClient:
+		return Token{}, Rejected("a machine client sends "+c.Settings.Prefix+"CLIENT_ID and "+c.Settings.Prefix+"CLIENT_SECRET to "+c.Endpoint()+" as Basic auth on every request, so it holds no token", "")
+	}
+	return Token{}, c.unauthenticated()
+}
+
+func (c *Client) refresh(ctx context.Context) (Token, error) {
+	unlock, err := c.Settings.LockCredential(c.Endpoint(), "")
+	if err != nil {
+		return Token{}, err
+	}
+	defer unlock()
+	if stored, err := c.Settings.GetCredential(c.Endpoint(), ""); err == nil {
+		c.cred = stored
+	}
+	if c.cred.AccessToken != "" && time.Now().Add(tokenSkew).Before(c.cred.AccessExpiresAt) {
+		return Token{AccessToken: c.cred.AccessToken, TokenType: "Bearer", ExpiresIn: int(time.Until(c.cred.AccessExpiresAt).Seconds())}, nil
+	}
+	if c.cred.RefreshToken == "" {
+		return Token{}, c.unauthenticated()
+	}
+	var tokens cliTokens
+	if err := c.postForm(ctx, c.Endpoint(), PathCliToken, url.Values{"grant_type": {"refresh_token"}, "refresh_token": {c.cred.RefreshToken}}, &tokens); err != nil {
+		return Token{}, Unauthenticated(err.Error(), "Run '"+c.name()+" login' again.")
+	}
+	if tokens.RefreshToken != "" {
+		c.cred.RefreshToken = tokens.RefreshToken
+	}
+	c.cred.AccessToken = tokens.AccessToken
+	c.cred.AccessExpiresAt = time.Now().Add(time.Duration(tokens.ExpiresIn) * time.Second)
+	c.cred.ObtainedAt = time.Now()
+	if _, err := c.Settings.PutCredential(c.cred); err != nil {
+		return Token{}, err
+	}
+	return Token{AccessToken: tokens.AccessToken, TokenType: "Bearer", ExpiresIn: tokens.ExpiresIn}, nil
+}
+
+func (c *Client) exchange(ctx context.Context) (Token, error) {
+	clientID := c.Settings.Get(KeyClientID)
+	unlock, err := c.Settings.LockCredential(c.Endpoint(), clientID)
+	if err != nil {
+		return Token{}, err
+	}
+	defer unlock()
+	if stored, err := c.Settings.GetCredential(c.Endpoint(), clientID); err == nil {
+		c.cred = stored
+	}
+	if c.cred.AccessToken != "" && c.cred.AccessToken != c.rejected && time.Now().Add(tokenSkew).Before(c.cred.AccessExpiresAt) {
+		c.reused = true
+		return Token{AccessToken: c.cred.AccessToken, TokenType: "Bearer", ExpiresIn: int(time.Until(c.cred.AccessExpiresAt).Seconds())}, nil
+	}
+	c.reused = false
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.Endpoint()+c.Exchange, strings.NewReader(url.Values{"grant_type": {"client_credentials"}}.Encode()))
+	if err != nil {
+		return Token{}, err
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	c.headers(req)
+	req.SetBasicAuth(clientID, c.Settings.Get(KeyClientSecret))
+	body, err := c.do(req)
+	if err != nil {
+		return Token{}, err
+	}
+	var token Token
+	if err := json.Unmarshal(body, &token); err != nil || token.AccessToken == "" {
+		var wrapped struct {
+			Data Token `json:"data"`
+		}
+		if json.Unmarshal(body, &wrapped) != nil || wrapped.Data.AccessToken == "" {
+			return Token{}, errors.New("the token response of " + c.Exchange + " carried no access token")
+		}
+		token = wrapped.Data
+	}
+	c.cred = Credential{Endpoint: c.Endpoint(), AppSlug: c.Settings.Get(KeyAppSlug), ClientID: clientID, AccessToken: token.AccessToken, AccessExpiresAt: time.Now().Add(time.Duration(token.ExpiresIn) * time.Second), ObtainedAt: time.Now()}
+	if _, err := c.Settings.PutCredential(c.cred); err != nil {
+		return Token{}, err
+	}
+	return token, nil
+}
+
+func (c *Client) authorize(ctx context.Context, req *http.Request) error {
+	c.resolve()
+	if c.mode == AuthClient && c.Exchange == "" {
+		req.SetBasicAuth(c.Settings.Get(KeyClientID), c.Settings.Get(KeyClientSecret))
+		return nil
+	}
+	if c.token == "" || time.Now().After(c.expiry) {
+		token, err := c.GetToken(ctx)
+		if err != nil {
+			return err
+		}
+		c.issued, c.token = token, token.AccessToken
+		c.expiry = time.Now().Add(time.Duration(token.ExpiresIn) * time.Second).Add(-tokenSkew)
+		if token.ExpiresIn == 0 {
+			c.expiry = time.Now().Add(time.Hour)
+		}
+	}
+	req.Header.Set("Authorization", "Bearer "+c.token)
+	return nil
+}
+
+func (c *Client) UserAgent() string {
+	version := "dev"
+	if c.Version != nil {
+		version = c.Version()
+	}
+	if stream.Machine() {
+		return c.name() + "/" + version + " (mcp)"
+	}
+	return c.name() + "/" + version
+}
+
+func (c *Client) headers(req *http.Request) {
+	req.Header.Set("User-Agent", c.UserAgent())
+	if slug := c.Settings.Get(KeyAppSlug); slug != "" {
+		req.Header.Set(firstSet(c.AppHeader, HeaderAppSlug), slug)
+	}
+}
+
+func (c *Client) Send(cmd *cobra.Command, method, path string, query url.Values, contentType string, body []byte) ([]byte, error) {
+	if c.Endpoint() == "" {
+		return nil, Unauthenticated("no endpoint in config "+c.Settings.Loaded.Config, "Run '"+c.name()+" config set endpoint=https://...'.")
+	}
+	target := c.Endpoint() + path
+	if len(query) > 0 {
+		target += "?" + query.Encode()
+	}
+	ctx := context.Background()
+	if cmd != nil && cmd.Context() != nil {
+		ctx = cmd.Context()
+	}
+	req, err := http.NewRequestWithContext(ctx, method, target, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	if len(body) == 0 {
+		req.Body, req.GetBody, req.ContentLength = http.NoBody, nil, 0
+	} else if contentType != "" {
+		req.Header.Set("Content-Type", contentType)
+	}
+	req.Header.Set("Accept", respond.MIMEEventStream)
+	c.headers(req)
+	if err := c.authorize(ctx, req); err != nil {
+		return nil, err
+	}
+	report := stream.Report(os.Stderr)
+	if cmd != nil {
+		report = stream.Report(cmd.ErrOrStderr())
+	}
+	res, err := c.http().Do(req)
+	if err != nil {
+		return nil, &Error{Code: ExitFailure, Message: c.Endpoint() + " is unreachable", Cause: err}
+	}
+	defer res.Body.Close()
+	out, err := stream.Read(res, report)
+	if err != nil {
+		return nil, err
+	}
+	if out.Status == http.StatusUnauthorized && c.reused {
+		c.reused, c.rejected, c.token = false, c.token, ""
+		return c.Send(cmd, method, path, query, contentType, body)
+	}
+	if out.Status >= http.StatusMultipleChoices {
+		return nil, c.failure(method, path, out.Status, out.Body)
+	}
+	return out.Body, nil
+}
+
+func (c *Client) do(req *http.Request) ([]byte, error) {
+	res, err := c.http().Do(req)
+	if err != nil {
+		return nil, &Error{Code: ExitFailure, Message: c.Endpoint() + " is unreachable", Cause: err}
+	}
+	defer res.Body.Close()
+	out, err := stream.Read(res, nil)
+	if err != nil {
+		return nil, err
+	}
+	if out.Status >= http.StatusMultipleChoices {
+		return nil, c.failure(req.Method, req.URL.Path, out.Status, out.Body)
+	}
+	return out.Body, nil
+}
+
+func (c *Client) failure(method, path string, status int, body []byte) error {
+	detail := strings.TrimSpace(string(body))
+	var wrapped clientEnvelope
+	if json.Unmarshal(body, &wrapped) == nil && wrapped.Error != nil && wrapped.Error.Message != "" {
+		detail = wrapped.Error.Message
+	}
+	if detail == "" {
+		detail = "no response body"
+	}
+	message := fmt.Sprintf("%s %s: %d %s %s", method, path, status, http.StatusText(status), detail)
+	switch {
+	case status == http.StatusUnauthorized:
+		return Unauthenticated(message, "Run '"+c.name()+" login', or check "+c.Settings.Prefix+"CLIENT_ID and "+c.Settings.Prefix+"CLIENT_SECRET.")
+	case status == http.StatusBadRequest || status == http.StatusUnprocessableEntity:
+		return Rejected(message, "")
+	case status == http.StatusForbidden:
+		return Refused(message, "Run '"+c.name()+" status' to see the identity in use.")
+	case status < http.StatusInternalServerError:
+		return Refused(message, "")
+	}
+	return &Error{Code: ExitFailure, Message: message}
+}
+
+func (c *Client) ServesMCP(ctx context.Context) bool {
+	c.probe.Do(func() {
+		if c.Endpoint() == "" {
+			return
+		}
+		probe, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+		req, err := http.NewRequestWithContext(probe, http.MethodGet, c.Endpoint()+PathStatus, nil)
+		if err != nil {
+			return
+		}
+		req.Header.Set("Accept", "application/json")
+		req.Header.Set("User-Agent", c.UserAgent())
+		res, err := c.http().Do(req)
+		if err != nil {
+			return
+		}
+		defer res.Body.Close()
+		var status struct {
+			Data struct {
+				Endpoints []string `json:"endpoints"`
+			} `json:"data"`
+		}
+		if res.StatusCode == http.StatusOK && json.NewDecoder(res.Body).Decode(&status) == nil {
+			c.serves = slices.Contains(status.Data.Endpoints, mcp.MountPath)
+		}
+	})
+	return c.serves
+}
+
+func (c *Client) Remote(ctx context.Context) (string, string, error) {
+	c.resolve()
+	if c.mode == AuthNone || (c.mode == AuthClient && c.Exchange == "") || !c.ServesMCP(ctx) {
+		return "", "", nil
+	}
+	token, err := c.GetToken(ctx)
+	if err != nil {
+		return "", "", err
+	}
+	return c.Endpoint() + mcp.MountPath, token.AccessToken, nil
+}
+
+func (c *Client) Mount(root *cobra.Command) {
+	root.AddCommand(c.LoginCommand(), c.LogoutCommand(), c.StatusCommand(), c.TokenCommand())
+	if Bridge == nil {
+		Bridge = c.Remote
+	}
+}
