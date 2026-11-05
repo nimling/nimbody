@@ -50,6 +50,7 @@ type Context struct {
 	Service     string
 	Version     string
 	Access      echo.MiddlewareFunc
+	Headers     []mcp.Header
 	Transaction func(ctx context.Context, run func(ctx context.Context) error) error
 	Keys        Resolver
 	PostAsset   func(ctx echo.Context, name string, body []byte) (string, error)
@@ -340,11 +341,11 @@ func Register(router *echo.Group, host Context, definitions ...Definition) []mcp
 	router.POST("/state/import", s.postImport, middleware...)
 
 	return []mcp.Operation{
-		mcp.Define(mcp.Spec{Name: "state", Description: "The state schema: every group with its create body schema, dependencies, references, filters, field flags and the format version", Method: http.MethodGet, Path: "/state", Access: mcp.AccessRead, Middleware: middleware},
+		mcp.Define(mcp.Spec{Name: "state", Description: "The state schema: every group with its create body schema, dependencies, references, filters, field flags and the format version", Method: http.MethodGet, Path: "/state", Access: mcp.AccessRead, Headers: host.Headers, Middleware: middleware},
 			func(ctx echo.Context, in struct{}) (Document, error) {
 				return s.document(), nil
 			}),
-		mcp.Define(mcp.Spec{Name: "state_export", Description: "Export records by group, filter and keys as state lines, or store the export as an asset and answer its id", Method: http.MethodPost, Path: "/state/export", Access: mcp.AccessRead, Middleware: export},
+		mcp.Define(mcp.Spec{Name: "state_export", Description: "Export records by group, filter and keys as state lines, or store the export as an asset and answer its id", Method: http.MethodPost, Path: "/state/export", Access: mcp.AccessRead, Headers: host.Headers, Middleware: export},
 			func(ctx echo.Context, in ExportRequest) (any, error) {
 				file, err := s.export(s.context(ctx), in)
 				if err != nil {
@@ -355,7 +356,7 @@ func Register(router *echo.Group, host Context, definitions ...Definition) []mcp
 				}
 				return file.Lines()
 			}),
-		mcp.Define(mcp.Spec{Name: "state_import", Description: "Import a stored export by asset id: upsert, create or sync, with deletes by key and a dry run that lists every outcome", Method: http.MethodPost, Path: "/state/import", Access: mcp.AccessDestructive, Middleware: middleware},
+		mcp.Define(mcp.Spec{Name: "state_import", Description: "Import a stored export by asset id: upsert, create or sync, with deletes by key and a dry run that lists every outcome", Method: http.MethodPost, Path: "/state/import", Access: mcp.AccessDestructive, Headers: host.Headers, Middleware: middleware},
 			func(ctx echo.Context, in ImportRequest) (ImportResponse, error) {
 				if in.AssetID == "" {
 					return ImportResponse{}, echo.NewHTTPError(http.StatusBadRequest, "an import over mcp takes asset_id")

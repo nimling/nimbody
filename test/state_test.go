@@ -755,3 +755,53 @@ func TestStateFieldFlagsByPointer(t *testing.T) {
 	withSecret := strings.Replace(unhashed.String(), `"client_id":"public-id"`, `"client_id":"public-id","refresh_token":"new"`, 1)
 	assert.Equal(t, state.OutcomeUpdated, outcomes(importState(t, e, "", []byte(withSecret)))["connection:conn-1"], "a secret sent for the record's own type is always written")
 }
+
+func TestStateHeadersReachTheAccessOverTheRelay(t *testing.T) {
+	m := seeded()
+	session := func(next echo.HandlerFunc) echo.HandlerFunc {
+		return func(ctx echo.Context) error {
+			if ctx.Request().Header.Get("SAuth-App-Slug") == "" {
+				return ctx.NoContent(http.StatusUnauthorized)
+			}
+			return next(ctx)
+		}
+	}
+	e := echo.New()
+	operations := state.Register(e.Group("/api"), state.Context{Service: "demo", Version: "v1.2.3", Access: session, Keys: m, Headers: []mcp.Header{{Name: "app_slug", Param: "SAuth-App-Slug", Usage: "the app the session belongs to"}}}, memoryGroup[locationBody](m, "location"))
+	server := &mcp.Server{Name: "demo", Version: "v1", Operations: operations}
+	server.Mount(e)
+	backend := httptest.NewServer(e)
+	defer backend.Close()
+	remote := func(ctx context.Context) (string, string, error) { return backend.URL + "/mcp", "owner", nil }
+
+	for _, operation := range operations {
+		property := operation.InputSchema["properties"].(map[string]any)["app_slug"]
+		assert.Equal(t, map[string]any{"type": "string", "description": "the app the session belongs to"}, property, operation.Name)
+		required, _ := operation.InputSchema["required"].([]string)
+		assert.NotContains(t, required, "app_slug", operation.Name)
+	}
+	_, plain := stateService(seeded())
+	assert.NotContains(t, plain[1].InputSchema["properties"], "app_slug")
+
+	in := strings.Join([]string{
+		`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"state_export","arguments":{"app_slug":"portal","targets":[{"group":"location"}]}}}`,
+		`{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"state_export","arguments":{"targets":[{"group":"location"}]}}}`,
+		`{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"state","arguments":{"app_slug":"portal"}}}`,
+	}, "\n")
+	var out bytes.Buffer
+	assert.NoError(t, cli.Relay(context.Background(), "demo", remote, strings.NewReader(in), &out))
+	byID := map[float64]map[string]any{}
+	for _, line := range bytes.Split(bytes.TrimSpace(out.Bytes()), []byte("\n")) {
+		var message map[string]any
+		assert.NoError(t, json.Unmarshal(line, &message))
+		if id, ok := message["id"].(float64); ok {
+			byID[id] = message["result"].(map[string]any)
+		}
+	}
+	assert.Nil(t, byID[1]["isError"], fmt.Sprint(byID[1]["content"]))
+	exported, _ := json.Marshal(byID[1]["structuredContent"])
+	assert.Contains(t, string(exported), "Head office")
+	assert.Equal(t, true, byID[2]["isError"])
+	assert.Equal(t, http.StatusText(http.StatusUnauthorized), byID[2]["content"].([]any)[0].(map[string]any)["text"])
+	assert.Nil(t, byID[3]["isError"])
+}
