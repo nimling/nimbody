@@ -8,6 +8,11 @@ import (
 )
 
 func Root(root *cobra.Command, settings *Settings, output *Output) *cobra.Command {
+	for _, key := range settings.Keys {
+		if key.Secret && key.Flag != "" {
+			panic(settings.Name + ": " + key.Key + " is a secret and a secret is never a flag, it comes from " + key.Env + " or the home config; drop Flag from its Setting")
+		}
+	}
 	root.SilenceErrors = true
 	root.SilenceUsage = true
 	if root.Annotations == nil {

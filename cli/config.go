@@ -470,7 +470,7 @@ func (s *Settings) ConfigCommand() *cobra.Command {
 	set := &cobra.Command{
 		Use:     "set <key=value> [key=value]",
 		Short:   "Write values into a named config, or into the local ." + s.Name + " with --local",
-		Example: s.Name + " config set --config prd endpoint=https://example.com protected=true",
+		Example: s.Name + " config set --to prd endpoint=https://example.com protected=true",
 		Args:    cobra.MinimumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			values := map[string]string{}
@@ -490,6 +490,7 @@ func (s *Settings) ConfigCommand() *cobra.Command {
 				}
 				values[key] = value
 			}
+			change := s.changeText(values)
 			if local {
 				path := s.LocalPath()
 				if path == "" {
@@ -502,11 +503,7 @@ func (s *Settings) ConfigCommand() *cobra.Command {
 				for key, value := range values {
 					current[key] = value
 				}
-				if err := writeYAML(path, current); err != nil {
-					return err
-				}
-				cmd.PrintErrln("wrote " + path)
-				return nil
+				return s.write(cmd, path, current, "write "+change+" into "+path, "wrote "+path)
 			}
 			path, err := s.HomePath()
 			if err != nil {
@@ -526,11 +523,7 @@ func (s *Settings) ConfigCommand() *cobra.Command {
 			if home.Default == "" {
 				home.Default = name
 			}
-			if err := writeYAML(path, home); err != nil {
-				return err
-			}
-			cmd.PrintErrln("wrote " + name + " in " + path)
-			return nil
+			return s.write(cmd, path, home, "write "+change+" into "+name+" in "+path, "wrote "+name+" in "+path)
 		},
 	}
 	s.set = set
@@ -558,18 +551,10 @@ func (s *Settings) ConfigCommand() *cobra.Command {
 				return err
 			} else if localPath != "" {
 				values[keyUse] = args[0]
-				if err := writeYAML(localPath, values); err != nil {
-					return err
-				}
-				cmd.PrintErrln("using " + args[0] + " in " + localPath)
-				return nil
+				return s.write(cmd, localPath, values, "use "+args[0]+" in "+localPath, "using "+args[0]+" in "+localPath)
 			}
 			home.Default = args[0]
-			if err := writeYAML(path, home); err != nil {
-				return err
-			}
-			cmd.PrintErrln("using " + args[0] + " by default")
-			return nil
+			return s.write(cmd, path, home, "use "+args[0]+" by default in "+path, "using "+args[0]+" by default")
 		},
 	}
 
@@ -591,11 +576,7 @@ func (s *Settings) ConfigCommand() *cobra.Command {
 			if len(args) == 1 {
 				values[keyUse] = args[0]
 			}
-			if err := writeYAML(path, values); err != nil {
-				return err
-			}
-			cmd.PrintErrln("wrote " + path)
-			return nil
+			return s.write(cmd, path, values, "create "+path+" using "+values[keyUse], "wrote "+path)
 		},
 	}
 
@@ -622,11 +603,7 @@ func (s *Settings) ConfigCommand() *cobra.Command {
 			} else {
 				delete(values, keyActive)
 			}
-			if err := writeYAML(path, values); err != nil {
-				return err
-			}
-			cmd.PrintErrln("local " + args[0] + " in " + path)
-			return nil
+			return s.write(cmd, path, values, "turn local "+args[0]+" in "+path, "local "+args[0]+" in "+path)
 		},
 	}
 
@@ -654,4 +631,33 @@ func (s *Settings) keyNames() string {
 		names = append(names, key.Key)
 	}
 	return strings.Join(names, ", ")
+}
+
+func (s *Settings) write(cmd *cobra.Command, path string, value any, plan, done string) error {
+	if s.plan {
+		fmt.Fprintln(cmd.ErrOrStderr(), "plan: "+plan)
+		return &Error{Code: ExitOK, Message: "planned"}
+	}
+	if err := writeYAML(path, value); err != nil {
+		return err
+	}
+	cmd.PrintErrln(done)
+	return nil
+}
+
+func (s *Settings) changeText(values map[string]string) string {
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	parts := make([]string, 0, len(keys))
+	for _, key := range keys {
+		value := values[key]
+		if setting, ok := s.setting(key); ok && setting.Secret {
+			value = Mask(value)
+		}
+		parts = append(parts, key+"="+value)
+	}
+	return strings.Join(parts, ", ")
 }

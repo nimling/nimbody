@@ -35,6 +35,9 @@
 31. `cli`: `config get` and `config list` print json when the command's `--json` flag is set, on a terminal too.
 32. `cli`: `HelpCommand(banner, document)` is the shared `help`: with no topic it prints the bundled SKILL.md without its frontmatter to stdout, headings styled and the banner first only on a terminal; `help <command>` is that command's help, an unknown one exit 2. `HelpFunc(banner, base)` prints the banner above the root's help only on a terminal.
 33. `cli`: `Root(root, settings, output)` mounts `Settings` and `Output` on the root, with `--format` and `--query`, typed mcp input, silenced cobra errors, and a `PersistentPreRunE` that loads the settings and guards the write before the cli's own hook, so a cli cannot skip either.
+34. `cli`: `Root` refuses a `Setting` that is `Secret` and names a `Flag`, at start, since a secret is never a flag; `Settings.Flags` alone still takes one, so a cli that has not moved to `Root` keeps its flag.
+35. `cli`: `--plan` stops `config set`, `config use`, `config init` and `config local` too: each prints the write it would make, a secret masked, and exits 0 without touching a file.
+36. `cli`: the `config set` example writes a named config with `--to`.
 
 ## v1.0.0
 

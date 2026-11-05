@@ -32,7 +32,7 @@ The shared cli layer the `cli` skill describes.
 
 3. `SkillCommand` serves the skill, and `SkillTreeCommand` a cli with references or several skills. `PluginCommand` has `install` for Claude Code, `desktop` for Claude Desktop and `status` for drift.
 
-4. `Settings` is the config. `Flags` adds `--config`, `--env`, `--global`, `--yes` and `--plan`. `Load` layers the flag, the environment, `--env` files, the local `.<cli>/config.yaml` found walking up and the named config in `~/.<cli>/config.yaml` into the environment; the local config takes over from the named one. `Guard` asks before a write on a `protected` config. `ConfigCommand` is `config get`, `list`, `set`, `use`, `init`, `local` and `path`.
+4. `Settings` is the config. `Flags` adds `--config`, `--env`, `--global`, `--yes` and `--plan`. `Load` layers the flag, the environment, `--env` files, the local `.<cli>/config.yaml` found walking up and the named config in `~/.<cli>/config.yaml` into the environment; the local config takes over from the named one. `Guard` asks before a write on a `protected` config. `ConfigCommand` is `config get`, `list`, `set`, `use`, `init`, `local` and `path`; `--plan` prints the write `set`, `use`, `init` or `local` would make and stops. A secret is never a flag: `Root` refuses a `Setting` that is `Secret` and names a `Flag`.
 
 4.1. `Settings` holds the credentials too. `GetCredential`, `PutCredential`, `DeleteCredential`, `GetCredentials` and `LockCredential` keep a login per host in `~/.<cli>/<host>.cred` and a machine token per host and client in `<host>_<client>.client`, the tokens in the OS keychain (`Keychain`: `security` on macOS, `secret-tool` on Linux) and only where none answers in the 0600 file. `Get` answers a key's resolved value.
 
