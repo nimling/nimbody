@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"reflect"
 	"strings"
 	"sync"
 
@@ -24,6 +25,16 @@ const AnnotationMCP = "mcp"
 const AnnotationMCPPage = "mcp-page"
 
 const AnnotationMCPImage = "mcp-image"
+
+const AnnotationMCPInput = "mcp-input"
+
+const AnnotationMCPOutput = "mcp-output"
+
+const AnnotationMCPInstructions = "mcp-instructions"
+
+const AnnotationSecret = "secret"
+
+const InputTyped = "typed"
 
 const AccessNone = "none"
 
@@ -77,20 +88,32 @@ func Tools(root *cobra.Command, executable string) []mcp.Tool {
 		if access == AccessNone {
 			return
 		}
+		secrets := secretFlags(root)
+		typed := annotation(cmd, AnnotationMCPInput) == InputTyped
 		var flags []mcp.Flag
+		names := map[string]bool{}
 		add := func(flag *pflag.Flag) {
-			if flag.Hidden || flag.Name == "help" || flag.Name == "version" {
+			if flag.Hidden || flag.Name == "help" || flag.Name == "version" || secrets[flag.Name] || len(flag.Annotations[AnnotationSecret]) > 0 {
 				return
 			}
-			flags = append(flags, mcp.Flag{Name: flag.Name, Kind: flag.Value.Type(), Usage: flag.Usage})
+			required := len(flag.Annotations[cobra.BashCompOneRequiredFlag]) > 0 && flag.Annotations[cobra.BashCompOneRequiredFlag][0] == "true"
+			flags = append(flags, mcp.Flag{Name: flag.Name, Kind: flag.Value.Type(), Usage: flag.Usage, Required: required})
+			names[flag.Name] = true
 		}
 		cmd.LocalFlags().VisitAll(add)
 		cmd.InheritedFlags().VisitAll(add)
-		description := cmd.CommandPath() + ": " + cmd.Short + "\nusage: " + cmd.UseLine()
-		if cmd.Example != "" {
-			description += "\nexample: " + cmd.Example
+		if typed {
+			flags = append(positionals(cmd, names), flags...)
 		}
-		tool := mcp.Annotate(mcp.Command(executable, path, description, flags), access)
+		description := mcp.Describe(cmd.CommandPath()+": "+cmd.Short+"\nusage: "+cmd.UseLine(), cmd.Example)
+		tool := mcp.Command(executable, path, description, flags)
+		if typed {
+			tool.InputSchema = mcp.GetInputSchema(flags)
+		}
+		if schema := cmd.Annotations[AnnotationMCPOutput]; schema != "" {
+			_ = json.Unmarshal([]byte(schema), &tool.OutputSchema)
+		}
+		tool = mcp.Annotate(tool, access)
 		tool.Page = cmd.Annotations[AnnotationMCPPage]
 		tool.Image = cmd.Annotations[AnnotationMCPImage]
 		tools = append(tools, tool)
@@ -99,12 +122,91 @@ func Tools(root *cobra.Command, executable string) []mcp.Tool {
 	return tools
 }
 
+func annotation(cmd *cobra.Command, key string) string {
+	for current := cmd; current != nil; current = current.Parent() {
+		if value, ok := current.Annotations[key]; ok {
+			return value
+		}
+	}
+	return ""
+}
+
+func secretFlags(root *cobra.Command) map[string]bool {
+	secrets := map[string]bool{}
+	for _, name := range strings.Split(root.Annotations[AnnotationSecret], ",") {
+		if name != "" {
+			secrets[name] = true
+		}
+	}
+	return secrets
+}
+
+func positionals(cmd *cobra.Command, taken map[string]bool) []mcp.Flag {
+	var flags []mcp.Flag
+	fields := strings.Fields(cmd.Use)
+	for _, field := range fields[min(1, len(fields)):] {
+		variadic := strings.HasSuffix(field, "...")
+		field = strings.TrimSuffix(field, "...")
+		required := strings.HasPrefix(field, "<")
+		if !required && !strings.HasPrefix(field, "[") {
+			continue
+		}
+		inner := strings.Trim(field, "<>[]")
+		variadic = variadic || strings.HasSuffix(inner, "...")
+		name := strings.Trim(strings.Map(func(r rune) rune {
+			switch {
+			case r >= 'a' && r <= 'z', r >= '0' && r <= '9', r == '_':
+				return r
+			case r >= 'A' && r <= 'Z':
+				return r + 'a' - 'A'
+			}
+			return '_'
+		}, strings.TrimSuffix(inner, "...")), "_")
+		if name == "" || name == "flags" {
+			continue
+		}
+		if name == "id" && cmd.HasParent() && cmd.Parent().HasParent() {
+			name = strings.ReplaceAll(cmd.Parent().Name(), "-", "_") + "_id"
+		}
+		if taken[name] {
+			name = "arg_" + name
+		}
+		taken[name] = true
+		kind := "string"
+		if variadic {
+			kind = "stringSlice"
+		}
+		flags = append(flags, mcp.Flag{Name: name, Kind: kind, Usage: "positional " + strings.TrimSuffix(inner, "..."), Positional: true, Required: required})
+	}
+	return flags
+}
+
+func PutOutput[Out any](cmd *cobra.Command) *cobra.Command {
+	schema, _ := json.Marshal(mcp.GetOutputSchema(reflect.TypeFor[Out]()))
+	if cmd.Annotations == nil {
+		cmd.Annotations = map[string]string{}
+	}
+	cmd.Annotations[AnnotationMCPOutput] = string(schema)
+	return cmd
+}
+
+func GetInstructions(root *cobra.Command, name string) string {
+	if text := root.Annotations[AnnotationMCPInstructions]; text != "" {
+		return text
+	}
+	text := "The " + name + " tools"
+	if root.Short != "" {
+		text += ": " + strings.TrimSuffix(root.Short, ".")
+	}
+	return text + ". Reach for them to read or change what " + name + " manages. Every tool runs as the signed in identity and reaches only what it may; a tool that changes data needs the user's confirmation first."
+}
+
 func Serve(ctx context.Context, root *cobra.Command, name, version string, in io.Reader, out io.Writer, pages ...mcp.Page) error {
 	executable, err := os.Executable()
 	if err != nil {
 		return err
 	}
-	server := &mcp.Server{Name: name, Version: version, Tools: Tools(root, executable), Pages: pages}
+	server := &mcp.Server{Name: name, Version: version, Instructions: GetInstructions(root, name), Tools: Tools(root, executable), Pages: pages}
 	return server.Serve(ctx, in, out)
 }
 
@@ -264,6 +366,7 @@ func OperationCommand(operation mcp.Operation, call Call) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:         use,
 		Short:       operation.Description,
+		Example:     operation.Example,
 		Args:        cobra.ExactArgs(len(positional)),
 		Annotations: map[string]string{AnnotationMCP: operation.Access},
 	}

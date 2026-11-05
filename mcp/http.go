@@ -110,7 +110,7 @@ func (s *Server) remoteTools() []Tool {
 		}
 		tool.InputSchema = schema
 		if tool.Page != "" {
-			tool.Meta = map[string]any{"ui": map[string]any{"resourceUri": s.pageURI(tool.Page)}}
+			tool.Meta = withMeta(tool.Meta, "ui", map[string]any{"resourceUri": s.pageURI(tool.Page)})
 		}
 		tools = append(tools, tool)
 	}

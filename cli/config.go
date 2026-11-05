@@ -72,6 +72,18 @@ type homeFile struct {
 }
 
 func (s *Settings) Flags(root *cobra.Command) {
+	var secrets []string
+	for _, key := range s.Keys {
+		if key.Secret && key.Flag != "" {
+			secrets = append(secrets, key.Flag)
+		}
+	}
+	if len(secrets) > 0 {
+		if root.Annotations == nil {
+			root.Annotations = map[string]string{}
+		}
+		root.Annotations[AnnotationSecret] = strings.Join(secrets, ",")
+	}
 	flags := root.PersistentFlags()
 	flags.StringVar(&s.config, "config", "", "named config from ~/."+s.Name+"/"+ConfigFile+", defaults to "+s.Prefix+"CONFIG, the local ."+s.Name+" use, then the default")
 	flags.StringArrayVar(&s.envFiles, "env", nil, "dotenv file loaded as a layer above the configs, repeatable")

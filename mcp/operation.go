@@ -27,6 +27,7 @@ type Spec struct {
 	Path        string
 	Access      string
 	Page        string
+	Example     string
 	Middleware  []echo.MiddlewareFunc
 }
 
@@ -96,7 +97,7 @@ func Define[In any, Out any](spec Spec, service func(ctx echo.Context, in In) (O
 		Spec:         spec,
 		Inputs:       inputs,
 		InputSchema:  inputSchema(inputs, reflect.TypeFor[In]()),
-		OutputSchema: outputSchema(reflect.TypeFor[Out]()),
+		OutputSchema: GetOutputSchema(reflect.TypeFor[Out]()),
 		Route: func(ctx echo.Context) error {
 			var in In
 			if err := (&echo.DefaultBinder{}).Bind(&in, ctx); err != nil {
@@ -146,7 +147,7 @@ func message(err error) string {
 func (o Operation) Tool() Tool {
 	tool := Annotate(Tool{
 		Name:         o.Name,
-		Description:  o.Description,
+		Description:  Describe(o.Description, o.Example),
 		InputSchema:  o.InputSchema,
 		OutputSchema: o.OutputSchema,
 		Page:         o.Page,
@@ -253,7 +254,7 @@ func fieldTypes(t reflect.Type) map[string]reflect.Type {
 	return types
 }
 
-func outputSchema(t reflect.Type) map[string]any {
+func GetOutputSchema(t reflect.Type) map[string]any {
 	data := schemaOf(t, map[reflect.Type]bool{})
 	if t.Implements(reflect.TypeFor[lister]()) {
 		rows, _ := reflect.Zero(t).Interface().(lister).rows()

@@ -16,7 +16,7 @@ The stdio model context protocol server every cli serves through, with an embedd
 
 1. A `Page` is an MCP App resource `ui://<cli>/<name>` with its CSP domains and its app only tools. A `Tool` whose `Page` names it links its result there instead of the run page.
 
-2. Over streamable HTTP, `Define` is the one operation definition of a service, `Route` its echo routes, and `Server.Mount` mounts its tools at `/mcp` beside `/api`, behind the same auth middleware, with the RFC 9728 protected resource metadata and the 401 `WWW-Authenticate` challenge. A tool runs the service function the route runs, on the request's own context.
+2. Over streamable HTTP, `Define` is the one operation definition of a service, `Route` its echo routes, and `Server.Mount` mounts its tools at `/mcp` beside `/api`, behind the same auth middleware, with the RFC 9728 protected resource metadata and the 401 `WWW-Authenticate` challenge. A tool runs the service function the route runs, on the request's own context. `Spec.Example` is the operation's example, on its tool's description and its cli command.
 
 ## cli
 
@@ -25,6 +25,10 @@ The shared cli layer the `cli` skill describes.
 1. `Execute` runs with the family exit codes and `Error`. `Print` and `FormatFor` print a table on a terminal, json in a pipe and under mcp, and `FormatPlain` tab separated lines on request.
 
 2. `Tools`, `Access` and `MCPCommand` generate annotated mcp tools from the cobra tree. A command annotated `AnnotationMCPPage` links its tool to a page the cli passes to `MCPCommand`.
+
+2.1. A tree annotated `AnnotationMCPInput: InputTyped` gets typed tool input: one property per flag and per positional of the usage line, an `id` positional named for its parent (`article_id`), the required ones listed. Without it a tool takes `{args, flags}`, and a typed tool accepts that shape too. A secret setting's flag, or a flag annotated `AnnotationSecret`, is never an input. The description is the command path, `Short`, the usage line and the `Example`, at most 4096 characters.
+
+2.2. `PutOutput[Out]` declares a command's output struct: its tool carries `outputSchema` `{data: …}` and answers `structuredContent` from the json the command prints, unless the call shapes it. A destructive tool carries `_meta["anthropic/requiresUserInteraction"]`. The server answers `GetInstructions(root, name)` in `initialize`, the root's `AnnotationMCPInstructions` or a few lines from its `Short`.
 
 3. `SkillCommand` serves the skill, and `SkillTreeCommand` a cli with references or several skills. `PluginCommand` has `install` for Claude Code, `desktop` for Claude Desktop and `status` for drift.
 
