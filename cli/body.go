@@ -21,10 +21,16 @@ type Body struct {
 	File   string
 	Sets   []string
 	Upload string
+	Raw    bool
 }
 
 func (b *Body) Flags(cmd *cobra.Command, upload bool) {
 	flags := cmd.Flags()
+	if b.Raw {
+		flags.StringVar(&b.Data, "data", "", "request body as any json value, sent as given")
+		flags.StringVarP(&b.File, "file", "f", "", "read the request body from a json file, or - for stdin, sent as given")
+		return
+	}
 	flags.StringArrayVar(&b.Sets, "set", nil, "body field as key=value, repeatable, dotted keys nest, json values decode, key=@path reads the value from a file")
 	flags.StringVar(&b.Data, "data", "", "request body as a json object")
 	flags.StringVarP(&b.File, "file", "f", "", "read the request body from a json file, or - for stdin")
@@ -56,6 +62,15 @@ func (b *Body) Get(in io.Reader) ([]byte, string, error) {
 	}
 	if err != nil {
 		return nil, "", err
+	}
+	if b.Raw {
+		switch {
+		case len(bytes.TrimSpace(raw)) == 0:
+			return nil, "", nil
+		case !json.Valid(raw):
+			return nil, "", Rejected("the body is not json", "")
+		}
+		return raw, ContentTypeJSON, nil
 	}
 	if len(bytes.TrimSpace(raw)) > 0 {
 		if err := json.Unmarshal(raw, &payload); err != nil {

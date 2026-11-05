@@ -1,6 +1,7 @@
 package mcp
 
 import (
+	"bytes"
 	"encoding"
 	"encoding/json"
 	"errors"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/labstack/echo/v4"
 	"github.com/nimling/nimbody/respond"
+	"github.com/nimling/nimbody/shape"
 )
 
 const (
@@ -69,6 +71,10 @@ func (l List[T]) rows() (any, int) {
 
 type lister interface {
 	rows() (any, int)
+}
+
+type bounder interface {
+	Bound(ctx echo.Context, target any) error
 }
 
 var (
@@ -143,6 +149,11 @@ func Define[In any, Out any](spec Spec, service func(ctx echo.Context, in In) (O
 					return nil, 0, invalid(spec, err)
 				}
 			}
+			if input, found := undecoded(inputs); found {
+				reflect.ValueOf(&in).Elem().FieldByIndex(input.index).SetZero()
+			} else if err := recorded(ctx, &in, inputs, arguments); err != nil {
+				return nil, 0, invalid(spec, err)
+			}
 			return run(ctx, in)
 		},
 	}
@@ -185,8 +196,18 @@ func refuse(ctx echo.Context, name string, err error) error {
 
 func bind(ctx echo.Context, in any, inputs []Input) error {
 	binder := &echo.DefaultBinder{}
-	if err := binder.BindBody(ctx, in); err != nil {
-		return err
+	_, raw := undecoded(inputs)
+	body, bound := in.(bounder)
+	switch {
+	case raw:
+	case bound && ctx.Request().ContentLength != 0:
+		if err := body.Bound(ctx, in); err != nil {
+			return err
+		}
+	default:
+		if err := binder.BindBody(ctx, in); err != nil {
+			return err
+		}
 	}
 	switch ctx.Request().Method {
 	case http.MethodGet, http.MethodDelete, http.MethodHead:
@@ -255,6 +276,50 @@ func declares(inputs []Input, in string) bool {
 		}
 	}
 	return false
+}
+
+func undecoded(inputs []Input) (Input, bool) {
+	for _, input := range inputs {
+		if input.In == InBody && input.Param == "*" {
+			return input, true
+		}
+	}
+	return Input{}, false
+}
+
+func recorded(ctx echo.Context, in any, inputs []Input, arguments json.RawMessage) error {
+	body, bound := in.(bounder)
+	if !bound {
+		return nil
+	}
+	fields := map[string]json.RawMessage{}
+	if len(arguments) > 0 {
+		if err := json.Unmarshal(arguments, &fields); err != nil {
+			return err
+		}
+	}
+	consumed := map[string]bool{"limit": true, "cursor": true}
+	for name := range shape.Schema() {
+		consumed[name] = true
+	}
+	for _, input := range inputs {
+		consumed[input.Name] = input.In != InBody
+	}
+	for name := range fields {
+		if consumed[name] {
+			delete(fields, name)
+		}
+	}
+	encoded, err := json.Marshal(fields)
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx.Request().Context(), http.MethodPost, ctx.Request().URL.Path, bytes.NewReader(encoded))
+	if err != nil {
+		return err
+	}
+	req.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
+	return body.Bound(ctx.Echo().NewContext(req, ctx.Response()), in)
 }
 
 func opened(query url.Values, prefix string, inputs []Input) url.Values {
@@ -344,6 +409,9 @@ func inputsOf(t reflect.Type, index []int) []Input {
 			input.In, input.Param = InQuery, field.Tag.Get("query")
 		case field.Tag.Get("header") != "":
 			input.In, input.Param = InHeader, field.Tag.Get("header")
+		case field.Tag.Get("body") == "*" && field.Type == rawType:
+			input.Param = "*"
+			input.Required = !omit
 		default:
 			input.Required = !omit && field.Type.Kind() != reflect.Pointer
 		}
