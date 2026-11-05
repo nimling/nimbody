@@ -63,6 +63,7 @@ type Settings struct {
 	global   bool
 	yes      bool
 	plan     bool
+	set      *cobra.Command
 }
 
 type homeFile struct {
@@ -226,7 +227,7 @@ func (s *Settings) Load(cmd *cobra.Command) error {
 
 	name := firstSet(s.config, os.Getenv(s.Prefix+"CONFIG"), local[keyUse], home.Default, defaultConfig)
 	block, known := home.Configs[name]
-	if !known && (s.config != "" || os.Getenv(s.Prefix+"CONFIG") != "" || local[keyUse] != "") {
+	if !known && (cmd == nil || cmd != s.set) && (s.config != "" || os.Getenv(s.Prefix+"CONFIG") != "" || local[keyUse] != "") {
 		return Rejected("no config named "+name+" in "+homePath, "Run '"+s.Name+" config list' to see the configs, or '"+s.Name+" config set --config "+name+" key=value' to add it.")
 	}
 
@@ -507,6 +508,7 @@ func (s *Settings) ConfigCommand() *cobra.Command {
 			return nil
 		},
 	}
+	s.set = set
 	set.Flags().BoolVar(&local, "local", false, "write into the local ."+s.Name+" instead of a named config")
 	set.Flags().StringVar(&target, "to", "", "the named config to write, defaults to the active one")
 

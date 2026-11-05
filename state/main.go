@@ -335,7 +335,8 @@ func Register(router *echo.Group, host Context, definitions ...Definition) []mcp
 		middleware = append(middleware, host.Access)
 	}
 	router.GET("/state", s.getDocument, middleware...)
-	router.POST("/state/export", s.postExport, middleware...)
+	export := append([]echo.MiddlewareFunc{respond.FrameLimitMiddleware(0)}, middleware...)
+	router.POST("/state/export", s.postExport, export...)
 	router.POST("/state/import", s.postImport, middleware...)
 
 	return []mcp.Operation{
@@ -343,7 +344,7 @@ func Register(router *echo.Group, host Context, definitions ...Definition) []mcp
 			func(ctx echo.Context, in struct{}) (Document, error) {
 				return s.document(), nil
 			}),
-		mcp.Define(mcp.Spec{Name: "state_export", Description: "Export records by group, filter and keys as state lines, or store the export as an asset and answer its id", Method: http.MethodPost, Path: "/state/export", Access: mcp.AccessRead, Middleware: middleware},
+		mcp.Define(mcp.Spec{Name: "state_export", Description: "Export records by group, filter and keys as state lines, or store the export as an asset and answer its id", Method: http.MethodPost, Path: "/state/export", Access: mcp.AccessRead, Middleware: export},
 			func(ctx echo.Context, in ExportRequest) (any, error) {
 				file, err := s.export(s.context(ctx), in)
 				if err != nil {

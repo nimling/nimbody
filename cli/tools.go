@@ -14,6 +14,7 @@ import (
 	"sync"
 
 	"github.com/nimling/nimbody/mcp"
+	"github.com/nimling/nimbody/stream"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
 )
@@ -225,8 +226,7 @@ func Relay(ctx context.Context, name string, remote Remote, in io.Reader, out io
 				write(answer)
 				return
 			}
-			frames := bufio.NewScanner(res.Body)
-			frames.Buffer(make([]byte, 0, 1<<16), 1<<24)
+			frames := stream.Scanner(res)
 			var data bytes.Buffer
 			for frames.Scan() {
 				line := frames.Text()

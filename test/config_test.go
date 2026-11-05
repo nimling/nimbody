@@ -2,6 +2,7 @@ package test
 
 import (
 	"bytes"
+	"errors"
 	"os"
 	"os/user"
 	"path/filepath"
@@ -138,6 +139,41 @@ func TestConfigUnknownNameIsRejected(t *testing.T) {
 	err := configTree(t).execute("article", "get", "--config", "stg")
 	assert.Equal(t, cli.ExitRejected, cli.ExitCode(err))
 	assert.Contains(t, err.Error(), "no config named stg")
+}
+
+func TestConfigSetCreatesANamedConfig(t *testing.T) {
+	home, _ := configHome(t)
+	require.NoError(t, configTree(t).execute("config", "set", "--config", "stg", "endpoint=https://stg.example.com"))
+	body, err := os.ReadFile(filepath.Join(home, ".demo", cli.ConfigFile))
+	require.NoError(t, err)
+	assert.Contains(t, string(body), "stg:")
+	assert.Contains(t, string(body), "default: tst", "creating a config leaves the default alone")
+
+	run := configTree(t)
+	require.NoError(t, run.execute("config", "get", "--config", "stg"))
+	assert.Equal(t, "stg", run.settings.Loaded.Config)
+	assert.Equal(t, "https://stg.example.com", layer(run.settings.Loaded, "endpoint").Value)
+	assert.Equal(t, cli.LayerConfig, layer(run.settings.Loaded, "endpoint").Layer)
+}
+
+func TestConfigUnknownNameIsRejectedOutsideSet(t *testing.T) {
+	home, _ := configHome(t)
+	path := filepath.Join(home, ".demo", cli.ConfigFile)
+	for _, args := range [][]string{
+		{"article", "get", "--config", "unknown"},
+		{"article", "create", "--config", "unknown"},
+		{"config", "get", "--config", "unknown"},
+		{"config", "list", "--config", "unknown"},
+		{"config", "use", "tst", "--config", "unknown"},
+	} {
+		name := strings.Join(args, " ")
+		err := configTree(t).execute(args...)
+		var coded *cli.Error
+		require.True(t, errors.As(err, &coded), name)
+		assert.Equal(t, cli.ExitRejected, coded.Code, name)
+		assert.Equal(t, "no config named unknown in "+path, coded.Message, name)
+		assert.Equal(t, "Run 'demo config list' to see the configs, or 'demo config set --config unknown key=value' to add it.", coded.Hint, name)
+	}
 }
 
 func TestConfigLocalTakesOverUntilTurnedOff(t *testing.T) {

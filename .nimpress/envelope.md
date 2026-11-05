@@ -38,4 +38,6 @@ lastUpdated: true
 
 4. `GetSteps(ctx)` opens the reporter once per request and puts it on the request context for `StepsFrom`. A nil reporter is a no op, so service code reports without checking.
 
+4.1. Every stream answers the `X-Frame-Limit` response header, the longest line in bytes a reader must accept, sent once before the first frame because a frame is one `data:` line and the result frame carries the whole envelope. A route declares its own with `FrameLimitMiddleware(bytes)`, `0` for unbounded; a route that declares nothing announces `FrameLimit`, 16 MiB. `stream.Scanner` sizes a reader from the header and falls back to `FrameLimit` when the header is missing; `stream.Read` and the stdio bridge to `/mcp` read through it, and `/mcp` announces the limit the called operation declared on its own event stream. `POST /state/export` declares `0`, as its result frame holds every state line with its blobs.
+
 5. The caller kind is the `User-Agent` product token and comment, `sauth/1.4.2 (mcp)` or `sauth/1.4.2`, read with `ctx.Request().UserAgent()`. There is no custom header, and the caller kind changes no response.
