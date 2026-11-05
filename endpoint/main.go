@@ -2,13 +2,16 @@ package endpoint
 
 import (
 	"context"
+	"errors"
 	"net/http"
 
 	"github.com/labstack/echo/v4"
+	"github.com/nimling/nimbody/cli"
 	"github.com/nimling/nimbody/mcp"
 	"github.com/nimling/nimbody/respond"
 	"github.com/nimling/nimbody/state"
 	"github.com/nimling/nimbody/terraform/registry"
+	"github.com/spf13/cobra"
 )
 
 const (
@@ -23,6 +26,7 @@ type Set struct {
 	Health    func(ctx context.Context) error
 	MCP       *mcp.Server
 	MCPAccess []echo.MiddlewareFunc
+	CLI       *cobra.Command
 	State     *state.Context
 	Groups    []state.Definition
 	Terraform *registry.Registry
@@ -38,7 +42,7 @@ type Health struct {
 	Healthy bool `json:"healthy"`
 }
 
-func Mount(e *echo.Echo, set Set) {
+func Mount(e *echo.Echo, set Set) error {
 	status := Status{Service: set.Service, Version: set.Version, Endpoints: []string{"/api", StatusPath}}
 
 	var operations []mcp.Operation
@@ -55,7 +59,25 @@ func Mount(e *echo.Echo, set Set) {
 	}
 
 	if set.MCP != nil {
+		if set.CLI != nil {
+			set.MCP.Operations = append(set.MCP.Operations, cli.GetOperations(set.CLI)...)
+		}
 		set.MCP.Operations = append(set.MCP.Operations, operations...)
+		names := map[string]bool{}
+		for _, operation := range set.MCP.Operations {
+			if names[operation.Name] {
+				return errors.New(mcp.MountPath + " serves two tools called " + operation.Name)
+			}
+			names[operation.Name] = true
+		}
+		for _, page := range set.MCP.Pages {
+			for _, tool := range page.Tools {
+				if names[tool.Name] {
+					return errors.New(mcp.MountPath + " serves two tools called " + tool.Name)
+				}
+				names[tool.Name] = true
+			}
+		}
 		set.MCP.Mount(e, set.MCPAccess...)
 		status.Endpoints = append(status.Endpoints, mcp.MountPath)
 	}
@@ -84,4 +106,5 @@ func Mount(e *echo.Echo, set Set) {
 		}
 		return respond.JSON(ctx, http.StatusOK, Health{Healthy: true}, 1)
 	})
+	return nil
 }

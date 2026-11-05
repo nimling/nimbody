@@ -8,13 +8,17 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"os"
 	"reflect"
+	"sort"
 	"strings"
 	"sync"
 
+	"github.com/labstack/echo/v4"
 	"github.com/nimling/nimbody/mcp"
+	"github.com/nimling/nimbody/shape"
 	"github.com/nimling/nimbody/stream"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
@@ -64,8 +68,29 @@ func Access(cmd *cobra.Command) string {
 	}
 }
 
+var TerminalFlags = map[string]bool{
+	"endpoint": true, "app": true, "client-id": true, "config": true, "env": true, "global": true, "yes": true, "plan": true,
+	"json": true, "raw": true, "plain": true, "format": true,
+}
+
+type command struct {
+	cmd         *cobra.Command
+	tool        mcp.Tool
+	flags       []mcp.Flag
+	description string
+	access      string
+}
+
 func Tools(root *cobra.Command, executable string) []mcp.Tool {
 	var tools []mcp.Tool
+	for _, found := range commands(root, executable) {
+		tools = append(tools, found.tool)
+	}
+	return tools
+}
+
+func commands(root *cobra.Command, executable string) []command {
+	var found []command
 	var walk func(cmd *cobra.Command, path []string)
 	walk = func(cmd *cobra.Command, path []string) {
 		if cmd.Hidden || (len(path) > 0 && Tooling[path[0]]) {
@@ -105,8 +130,8 @@ func Tools(root *cobra.Command, executable string) []mcp.Tool {
 		if typed {
 			flags = append(positionals(cmd, names), flags...)
 		}
-		description := mcp.Describe(cmd.CommandPath()+": "+cmd.Short+"\nusage: "+cmd.UseLine(), cmd.Example)
-		tool := mcp.Command(executable, path, description, flags)
+		description := cmd.CommandPath() + ": " + cmd.Short + "\nusage: " + cmd.UseLine()
+		tool := mcp.Command(executable, path, mcp.Describe(description, cmd.Example), flags)
 		if typed {
 			tool.InputSchema = mcp.GetInputSchema(flags)
 		}
@@ -116,10 +141,298 @@ func Tools(root *cobra.Command, executable string) []mcp.Tool {
 		tool = mcp.Annotate(tool, access)
 		tool.Page = cmd.Annotations[AnnotationMCPPage]
 		tool.Image = cmd.Annotations[AnnotationMCPImage]
-		tools = append(tools, tool)
+		found = append(found, command{cmd: cmd, tool: tool, flags: flags, description: description, access: access})
 	}
 	walk(root, nil)
-	return tools
+	return found
+}
+
+func GetOperations(root *cobra.Command) []mcp.Operation {
+	var operations []mcp.Operation
+	for _, found := range commands(root, "") {
+		var served route
+		if json.Unmarshal([]byte(found.cmd.Annotations[AnnotationRoute]), &served) != nil {
+			continue
+		}
+		method := served.Method
+		if method == "" {
+			method = http.MethodPost
+		}
+		name, verb, flags := root.Name(), found.cmd.Name(), found.flags
+		operation := mcp.Define(mcp.Spec{Name: found.tool.Name, Description: found.description, Method: method, Path: mcp.MountPath, Access: found.access, Page: found.tool.Page, Example: found.cmd.Example},
+			func(ctx echo.Context, arguments json.RawMessage) (any, error) {
+				return served.call(ctx, name, verb, flags, arguments)
+			})
+		operation.InputSchema = servedSchema(found.tool.InputSchema, flags)
+		operation.OutputSchema = found.tool.OutputSchema
+		operations = append(operations, operation)
+	}
+	return operations
+}
+
+func servedSchema(local map[string]any, flags []mcp.Flag) map[string]any {
+	terminal := map[string]bool{}
+	for _, flag := range flags {
+		if !flag.Positional && TerminalFlags[flag.Name] {
+			terminal[flag.Name] = true
+		}
+	}
+	keep := func(properties map[string]any) map[string]any {
+		kept := map[string]any{}
+		for name, property := range properties {
+			if !terminal[name] {
+				kept[name] = property
+			}
+		}
+		return kept
+	}
+	schema := map[string]any{}
+	for key, value := range local {
+		schema[key] = value
+	}
+	properties, _ := local["properties"].(map[string]any)
+	properties = keep(properties)
+	if nested, legacy := properties["flags"].(map[string]any); legacy && nested["type"] == "object" {
+		inner := map[string]any{}
+		for key, value := range nested {
+			inner[key] = value
+		}
+		declared, _ := nested["properties"].(map[string]any)
+		inner["properties"] = keep(declared)
+		properties["flags"] = inner
+	}
+	schema["properties"] = properties
+	if required, ok := local["required"].([]string); ok {
+		var kept []string
+		for _, name := range required {
+			if !terminal[name] {
+				kept = append(kept, name)
+			}
+		}
+		delete(schema, "required")
+		if len(kept) > 0 {
+			schema["required"] = kept
+		}
+	}
+	return schema
+}
+
+func refuse(message string) error {
+	return echo.NewHTTPError(http.StatusBadRequest, message)
+}
+
+func empty(value any) bool {
+	switch value := value.(type) {
+	case nil:
+		return true
+	case bool:
+		return !value
+	case string:
+		return value == ""
+	case float64:
+		return value == 0
+	case []any:
+		return len(value) == 0
+	}
+	return false
+}
+
+func texts(value any) []string {
+	switch value := value.(type) {
+	case []any:
+		items := make([]string, 0, len(value))
+		for _, item := range value {
+			items = append(items, fmt.Sprint(item))
+		}
+		return items
+	case nil:
+		return nil
+	}
+	return []string{fmt.Sprint(value)}
+}
+
+func (r route) call(ctx echo.Context, name, verb string, flags []mcp.Flag, arguments json.RawMessage) (any, error) {
+	values := map[string]any{}
+	if len(arguments) > 0 {
+		if err := json.Unmarshal(arguments, &values); err != nil {
+			return nil, refuse(err.Error())
+		}
+	}
+	declared := map[string]bool{}
+	for _, flag := range flags {
+		declared[flag.Name] = true
+	}
+	var args []string
+	_, hasArgs := values["args"]
+	_, hasFlags := values["flags"]
+	if !declared["args"] && !declared["flags"] && (hasArgs || hasFlags) {
+		var legacy mcp.Arguments
+		if err := json.Unmarshal(arguments, &legacy); err != nil {
+			return nil, refuse(err.Error())
+		}
+		values, args = legacy.Flags, legacy.Args
+		if values == nil {
+			values = map[string]any{}
+		}
+	} else {
+		missing := ""
+		for _, flag := range flags {
+			if !flag.Positional {
+				continue
+			}
+			value := values[flag.Name]
+			delete(values, flag.Name)
+			switch {
+			case empty(value) && missing == "":
+				missing = flag.Name
+			case empty(value):
+			case missing != "":
+				return nil, refuse(flag.Name + " follows " + missing + ", which is missing")
+			default:
+				args = append(args, texts(value)...)
+			}
+		}
+	}
+
+	var output Output
+	var sets []string
+	var data string
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		value := values[key]
+		_, shaping := shape.Schema()[key]
+		body := r.Body || r.Upload
+		switch {
+		case empty(value) || shaping:
+		case TerminalFlags[key]:
+			return nil, refuse(key + " is read by the " + name + " cli only")
+		case key == "set" && body:
+			sets = texts(value)
+		case key == "data" && body:
+			text, isText := value.(string)
+			if !isText {
+				encoded, _ := json.Marshal(value)
+				text = string(encoded)
+			}
+			data = text
+		case key == "limit":
+			limit, isNumber := value.(float64)
+			if !isNumber {
+				return nil, refuse("limit is a number of rows")
+			}
+			output.Limit = int(limit)
+		case key == "cursor":
+			output.Cursor = fmt.Sprint(value)
+		case key == "query":
+			for _, entry := range texts(value) {
+				if parameter, _, found := strings.Cut(entry, "="); !found || parameter == "" {
+					return nil, refuse("query entries look like key=value, got " + entry)
+				}
+			}
+			output.Query = texts(value)
+		case declared[key]:
+			return nil, refuse(key + " is read by the " + name + " cli only, a tool on the service takes the body as set or data and reads no file or stream")
+		default:
+			return nil, refuse(name + " " + verb + " takes no input " + key)
+		}
+	}
+	for _, entry := range sets {
+		if _, value, _ := strings.Cut(entry, "="); strings.HasPrefix(value, "@") {
+			return nil, refuse("set key=@path reads a file the " + name + " cli holds, pass the value itself")
+		}
+	}
+	payload, contentType, err := (&Body{Data: data, Sets: sets}).Get(nil)
+	if err != nil {
+		return nil, refuse(err.Error())
+	}
+
+	method, path := r.Method, ""
+	if len(r.Paths) == 0 {
+		if len(args) != 2 {
+			return nil, refuse(verb + " takes a method and a path")
+		}
+		method, path = strings.ToUpper(args[0]), args[1]
+		if _, known := apiMethods[method]; !known {
+			return nil, refuse(verb + " takes GET, HEAD, POST, PUT, PATCH or DELETE, got " + args[0])
+		}
+		if !strings.HasPrefix(path, "/") {
+			return nil, refuse("the path starts with a slash, for example /api/status")
+		}
+		if target, _, _ := strings.Cut(path, "?"); target == mcp.MountPath || strings.HasPrefix(target, mcp.MountPath+"/") {
+			return nil, refuse(verb + " does not reach " + mcp.MountPath + " from a tool")
+		}
+	} else {
+		fill := map[string]func() (string, error){}
+		for _, filled := range r.Fill {
+			fill[filled] = func() (string, error) {
+				return "", Rejected(name+" "+verb+" needs "+filled+", which the "+name+" cli fills from its config", "")
+			}
+		}
+		if path, err = (Verb{Name: verb, Paths: r.Paths}).path(args, fill); err != nil {
+			return nil, refuse(err.Error())
+		}
+	}
+	return answer(ctx, method, path, output.GetQuery(), contentType, payload)
+}
+
+func answer(ctx echo.Context, method, path string, query url.Values, contentType string, body []byte) (any, error) {
+	target := path
+	if len(query) > 0 {
+		separator := "?"
+		if strings.Contains(path, "?") {
+			separator = "&"
+		}
+		target += separator + query.Encode()
+	}
+	caller := ctx.Request()
+	req, err := http.NewRequestWithContext(caller.Context(), method, target, bytes.NewReader(body))
+	if err != nil {
+		return nil, refuse(err.Error())
+	}
+	req.Header = caller.Header.Clone()
+	for _, header := range []string{echo.HeaderContentLength, echo.HeaderContentType, mcp.HeaderProtocol, "Mcp-Session-Id"} {
+		req.Header.Del(header)
+	}
+	req.Header.Set(echo.HeaderAccept, echo.MIMEApplicationJSON)
+	if len(body) > 0 && contentType != "" {
+		req.Header.Set(echo.HeaderContentType, contentType)
+	}
+	req.Host, req.RemoteAddr = caller.Host, caller.RemoteAddr
+	recorder := httptest.NewRecorder()
+	ctx.Echo().ServeHTTP(recorder, req)
+	raw := recorder.Body.Bytes()
+	if recorder.Code >= http.StatusMultipleChoices {
+		detail := strings.TrimSpace(string(raw))
+		var failed clientEnvelope
+		if json.Unmarshal(raw, &failed) == nil && failed.Error != nil && failed.Error.Message != "" {
+			detail = failed.Error.Message
+		}
+		if detail == "" {
+			detail = http.StatusText(recorder.Code)
+		}
+		return nil, echo.NewHTTPError(recorder.Code, detail)
+	}
+	if len(bytes.TrimSpace(raw)) == 0 {
+		return nil, nil
+	}
+	var wrapped envelope
+	if json.Unmarshal(raw, &wrapped) == nil && wrapped.RequestID != nil {
+		var data any
+		_ = json.Unmarshal(wrapped.Data, &data)
+		if rows, isList := data.([]any); isList && wrapped.Pagination != nil {
+			return mcp.List[any]{Rows: rows, Total: wrapped.Pagination.Total}, nil
+		}
+		return data, nil
+	}
+	var value any
+	if json.Unmarshal(raw, &value) != nil {
+		return string(raw), nil
+	}
+	return value, nil
 }
 
 func annotation(cmd *cobra.Command, key string) string {

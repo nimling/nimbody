@@ -164,7 +164,7 @@ func APICommand(send Send, output *Output) *cobra.Command {
 		Use:         "api <method> <path>",
 		Short:       "Send a request to any api path the resource commands do not model",
 		Example:     "api GET /api/status\napi POST /api/articles --set title=Orion --set tags='[\"news\"]'",
-		Annotations: map[string]string{AnnotationMCP: mcp.AccessWrite},
+		Annotations: map[string]string{AnnotationMCP: mcp.AccessWrite, AnnotationRoute: route{Body: true, Upload: true}.annotation()},
 		Args: func(cmd *cobra.Command, args []string) error {
 			if err := cobra.ExactArgs(2)(cmd, args); err != nil {
 				return err

@@ -1,14 +1,31 @@
 package cli
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 
 	"github.com/nimling/nimbody/mcp"
 	"github.com/spf13/cobra"
 )
+
+const AnnotationRoute = "route"
+
+type route struct {
+	Method string   `json:"method,omitempty"`
+	Paths  []string `json:"paths,omitempty"`
+	Body   bool     `json:"body,omitempty"`
+	Upload bool     `json:"upload,omitempty"`
+	Fill   []string `json:"fill,omitempty"`
+}
+
+func (r route) annotation() string {
+	encoded, _ := json.Marshal(r)
+	return string(encoded)
+}
 
 type Verb struct {
 	Name    string
@@ -107,12 +124,17 @@ func (t Table) verb(verb Verb, path []string) *cobra.Command {
 			access = mcp.AccessDestructive
 		}
 	}
+	var filled []string
+	for name := range t.Fill {
+		filled = append(filled, name)
+	}
+	sort.Strings(filled)
 	cmd := &cobra.Command{
 		Use:         verb.use(t.Fill),
 		Short:       verb.Short,
 		Example:     verb.Example,
 		Args:        cobra.RangeArgs(least, most),
-		Annotations: map[string]string{AnnotationMCP: access},
+		Annotations: map[string]string{AnnotationMCP: access, AnnotationRoute: route{Method: verb.Method, Paths: verb.Paths, Body: verb.Body, Upload: verb.Upload, Fill: filled}.annotation()},
 		RunE: func(cmd *cobra.Command, args []string) error {
 			target, err := verb.path(args, t.Fill)
 			if err != nil {
