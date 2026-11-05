@@ -318,3 +318,49 @@ func TestConfigCommandsWriteTheFiles(t *testing.T) {
 	err = configTree(t).execute("config", "set", "colour=red")
 	assert.Equal(t, cli.ExitRejected, cli.ExitCode(err))
 }
+
+func TestConfigPlanStopsEveryConfigWrite(t *testing.T) {
+	home, repo := configHome(t)
+	writeLocal(t, repo, "use: tst\n")
+	homePath := filepath.Join(home, ".demo", cli.ConfigFile)
+	before, _ := os.ReadFile(homePath)
+	localPath := filepath.Join(repo, ".demo", cli.ConfigFile)
+	localBefore, _ := os.ReadFile(localPath)
+	for _, args := range [][]string{
+		{"config", "set", "--plan", "--to", "prd", "client_secret=abcdefgh", "endpoint=https://new.example.com"},
+		{"config", "set", "--plan", "--local", "app_slug=other"},
+		{"config", "use", "--plan", "prd"},
+		{"config", "init", "--plan", "prd"},
+		{"config", "local", "--plan", "off"},
+	} {
+		run := configTree(t)
+		err := run.execute(args...)
+		assert.Equal(t, cli.ExitOK, cli.ExitCode(err), args)
+		assert.Contains(t, run.stderr.String(), "plan: ", args)
+		assert.NotContains(t, run.stderr.String(), "abcdefgh", "a secret in a plan is masked")
+	}
+	after, _ := os.ReadFile(homePath)
+	assert.Equal(t, string(before), string(after))
+	localAfter, _ := os.ReadFile(localPath)
+	assert.Equal(t, string(localBefore), string(localAfter))
+	_, err := os.Stat(filepath.Join(home, "work", "repo", "sub", ".demo"))
+	assert.True(t, os.IsNotExist(err), "init --plan creates nothing")
+
+	run := configTree(t)
+	assert.NoError(t, run.execute("config", "set", "--to", "prd", "app_slug=other"))
+	assert.Contains(t, run.stderr.String(), "wrote prd in")
+}
+
+func TestConfigSetExampleUsesTo(t *testing.T) {
+	set, _, _ := configTree(t).root.Find([]string{"config", "set"})
+	assert.Contains(t, set.Example, "config set --to prd")
+}
+
+func TestRootRefusesASecretFlag(t *testing.T) {
+	settings := &cli.Settings{Name: "demo", Prefix: "DEMO_", Keys: []cli.Setting{{Key: "client_secret", Env: "DEMO_CLIENT_SECRET", Flag: "client-secret", Secret: true}}}
+	assert.PanicsWithValue(t, "demo: client_secret is a secret and a secret is never a flag, it comes from DEMO_CLIENT_SECRET or the home config; drop Flag from its Setting", func() {
+		cli.Root(&cobra.Command{Use: "demo"}, settings, &cli.Output{})
+	})
+	settings.Keys[0].Flag = ""
+	assert.NotPanics(t, func() { cli.Root(&cobra.Command{Use: "demo"}, settings, &cli.Output{}) })
+}

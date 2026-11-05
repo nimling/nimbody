@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/nimling/nimbody/respond"
+	"github.com/nimling/nimbody/shape"
 	"github.com/nimling/nimbody/stream"
 )
 
@@ -34,9 +35,11 @@ const (
 )
 
 type Flag struct {
-	Name  string
-	Kind  string
-	Usage string
+	Name       string
+	Kind       string
+	Usage      string
+	Positional bool
+	Required   bool
 }
 
 type Arguments struct {
@@ -77,6 +80,7 @@ type Run struct {
 type Server struct {
 	Name                string
 	Version             string
+	Instructions        string
 	Tools               []Tool
 	Pages               []Page
 	Operations          []Operation
@@ -114,9 +118,10 @@ type callResult struct {
 
 func Command(executable string, path []string, description string, flags []Flag) Tool {
 	properties := map[string]any{}
-	kinds := map[string]string{}
 	for _, flag := range flags {
-		kinds[flag.Name] = flag.Kind
+		if flag.Positional {
+			continue
+		}
 		switch {
 		case flag.Kind == "bool":
 			properties[flag.Name] = map[string]any{"type": "boolean", "description": flag.Usage}
@@ -138,7 +143,7 @@ func Command(executable string, path []string, description string, flags []Flag)
 			"additionalProperties": false,
 		},
 		Run: func(ctx context.Context, arguments json.RawMessage, onStep func(respond.Step)) (string, bool) {
-			argv, err := Argv(path, kinds, arguments)
+			argv, err := argvOf(path, flags, arguments)
 			if err != nil {
 				return err.Error(), true
 			}
@@ -147,24 +152,132 @@ func Command(executable string, path []string, description string, flags []Flag)
 	}
 }
 
+func GetInputSchema(flags []Flag) map[string]any {
+	properties := map[string]any{}
+	var required []string
+	for _, flag := range flags {
+		property := map[string]any{"type": jsonKind(flag.Kind)}
+		if many(flag.Kind) {
+			property["type"] = "array"
+			property["items"] = map[string]any{"type": jsonKind(strings.TrimSuffix(strings.TrimSuffix(flag.Kind, "Slice"), "Array"))}
+		}
+		if flag.Usage != "" {
+			property["description"] = flag.Usage
+		}
+		properties[flag.Name] = property
+		if flag.Required {
+			required = append(required, flag.Name)
+		}
+	}
+	schema := map[string]any{"type": "object", "properties": properties, "additionalProperties": false}
+	if len(required) > 0 {
+		sort.Strings(required)
+		schema["required"] = required
+	}
+	return schema
+}
+
+func many(kind string) bool {
+	return strings.HasSuffix(kind, "Slice") || strings.HasSuffix(kind, "Array")
+}
+
+func jsonKind(kind string) string {
+	switch kind {
+	case "bool", "boolean":
+		return "boolean"
+	case "int", "int8", "int16", "int32", "int64", "uint", "uint8", "uint16", "uint32", "uint64", "count", "integer":
+		return "integer"
+	case "float32", "float64", "number":
+		return "number"
+	}
+	return "string"
+}
+
 func Argv(path []string, kinds map[string]string, raw json.RawMessage) ([]string, error) {
-	var arguments Arguments
+	flags := make([]Flag, 0, len(kinds))
+	for name, kind := range kinds {
+		flags = append(flags, Flag{Name: name, Kind: kind})
+	}
+	return argvOf(path, flags, raw)
+}
+
+func argvOf(path []string, flags []Flag, raw json.RawMessage) ([]string, error) {
+	values := map[string]any{}
 	if len(raw) > 0 {
-		if err := json.Unmarshal(raw, &arguments); err != nil {
+		if err := json.Unmarshal(raw, &values); err != nil {
 			return nil, err
 		}
 	}
+	declared := map[string]Flag{}
+	for _, flag := range flags {
+		declared[flag.Name] = flag
+	}
+	_, argsDeclared := declared["args"]
+	_, flagsDeclared := declared["flags"]
+	_, hasArgs := values["args"]
+	_, hasFlags := values["flags"]
+	if !argsDeclared && !flagsDeclared && (hasArgs || hasFlags) {
+		var arguments Arguments
+		if err := json.Unmarshal(raw, &arguments); err != nil {
+			return nil, err
+		}
+		values = arguments.Flags
+		for name, flag := range declared {
+			if flag.Positional {
+				delete(declared, name)
+			}
+		}
+		argv, err := flagArgv(path, declared, values, "flag --")
+		if err != nil {
+			return nil, err
+		}
+		return append(argv, arguments.Args...), nil
+	}
+	argv, err := flagArgv(path, declared, values, "input ")
+	if err != nil {
+		return nil, err
+	}
+	var positional []string
+	dash := false
+	for _, flag := range flags {
+		if !flag.Positional {
+			continue
+		}
+		switch value := values[flag.Name].(type) {
+		case nil:
+		case []any:
+			for _, item := range value {
+				positional = append(positional, fmt.Sprint(item))
+			}
+		default:
+			positional = append(positional, fmt.Sprint(value))
+		}
+	}
+	for _, value := range positional {
+		dash = dash || strings.HasPrefix(value, "-")
+	}
+	if dash {
+		argv = append(argv, "--")
+	}
+	return append(argv, positional...), nil
+}
+
+func flagArgv(path []string, declared map[string]Flag, values map[string]any, unknown string) ([]string, error) {
 	argv := append([]string{}, path...)
-	names := make([]string, 0, len(arguments.Flags))
-	for name := range arguments.Flags {
+	names := make([]string, 0, len(values))
+	for name := range values {
 		names = append(names, name)
 	}
 	sort.Strings(names)
 	for _, name := range names {
-		if _, known := kinds[name]; !known {
-			return nil, fmt.Errorf("%s takes no flag --%s", strings.Join(path, " "), name)
+		flag, known := declared[name]
+		if !known {
+			return nil, fmt.Errorf("%s takes no %s%s", strings.Join(path, " "), unknown, name)
 		}
-		switch value := arguments.Flags[name].(type) {
+		if flag.Positional {
+			continue
+		}
+		switch value := values[name].(type) {
 		case bool:
 			argv = append(argv, fmt.Sprintf("--%s=%t", name, value))
 		case []any:
@@ -176,7 +289,7 @@ func Argv(path []string, kinds map[string]string, raw json.RawMessage) ([]string
 			argv = append(argv, fmt.Sprintf("--%s=%v", name, value))
 		}
 	}
-	return append(argv, arguments.Args...), nil
+	return argv, nil
 }
 
 func Exec(ctx context.Context, executable string, argv []string, onStep func(respond.Step)) (string, bool) {
@@ -257,7 +370,7 @@ func (s *Server) pages() []Page {
 func (s *Server) tools() []Tool {
 	tools := make([]Tool, 0, len(s.Tools)+1)
 	for _, tool := range s.Tools {
-		tool.Meta = map[string]any{"ui": map[string]any{"resourceUri": s.pageURI(tool.Page)}}
+		tool.Meta = withMeta(tool.Meta, "ui", map[string]any{"resourceUri": s.pageURI(tool.Page)})
 		tools = append(tools, tool)
 	}
 	for _, page := range s.Pages {
@@ -391,7 +504,7 @@ func (s *Server) Serve(ctx context.Context, in io.Reader, out io.Writer) error {
 			}
 			result, failed := tool.Run(ctx, c.Arguments, onStep)
 			s.end(failed)
-			reply(req.ID, map[string]any{"result": callResult{Content: shown(result, failed, tool.Image), IsError: failed}})
+			reply(req.ID, map[string]any{"result": callResult{Content: shown(result, failed, tool.Image), StructuredContent: structuredOf(tool, result, failed, c.Arguments), IsError: failed}})
 		}(req, c, tool)
 	}
 	pending.Wait()
@@ -416,11 +529,15 @@ func (s *Server) answer(req request, tools []Tool, pages []Page) map[string]any 
 		if params.ProtocolVersion == "" {
 			params.ProtocolVersion = ProtocolVersion
 		}
-		return map[string]any{"result": map[string]any{
+		result := map[string]any{
 			"protocolVersion": params.ProtocolVersion,
 			"capabilities":    map[string]any{"tools": map[string]any{}, "resources": map[string]any{}},
 			"serverInfo":      map[string]any{"name": s.Name, "version": s.Version},
-		}}
+		}
+		if s.Instructions != "" {
+			result["instructions"] = s.Instructions
+		}
+		return map[string]any{"result": result}
 	case "ping":
 		return map[string]any{"result": map[string]any{}}
 	case "tools/list":
@@ -489,10 +606,55 @@ func Annotate(tool Tool, access string) Tool {
 		tool.Annotations = map[string]any{"readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": true}
 	case AccessDestructive:
 		tool.Annotations = map[string]any{"readOnlyHint": false, "destructiveHint": true, "idempotentHint": true, "openWorldHint": true}
+		tool.Meta = withMeta(tool.Meta, MetaUserInteraction, true)
 		tool.Description += confirmNote
 	default:
 		tool.Annotations = map[string]any{"readOnlyHint": false, "destructiveHint": false, "idempotentHint": false, "openWorldHint": true}
 		tool.Description += confirmNote
 	}
 	return tool
+}
+
+const MetaUserInteraction = "anthropic/requiresUserInteraction"
+
+func withMeta(meta map[string]any, key string, value any) map[string]any {
+	merged := make(map[string]any, len(meta)+1)
+	for name, existing := range meta {
+		merged[name] = existing
+	}
+	merged[key] = value
+	return merged
+}
+
+func structuredOf(tool Tool, result string, failed bool, arguments json.RawMessage) any {
+	if failed || tool.OutputSchema == nil {
+		return nil
+	}
+	var values map[string]any
+	_ = json.Unmarshal(arguments, &values)
+	if nested, ok := values["flags"].(map[string]any); ok {
+		values = nested
+	}
+	for name := range values {
+		if _, shaping := shape.Schema()[name]; shaping || name == "raw" || name == "plain" || name == "format" {
+			return nil
+		}
+	}
+	var data any
+	if json.NewDecoder(strings.NewReader(result)).Decode(&data) != nil {
+		return nil
+	}
+	return structured{Data: data}
+}
+
+const DescriptionLimit = 4096
+
+func Describe(description, example string) string {
+	if example != "" {
+		description += "\nexample: " + example
+	}
+	if runes := []rune(description); len(runes) > DescriptionLimit-len(confirmNote) {
+		description = string(runes[:DescriptionLimit-len(confirmNote)-1]) + "…"
+	}
+	return description
 }

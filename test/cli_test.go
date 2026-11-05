@@ -3,15 +3,20 @@ package test
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"testing/fstest"
 
+	"github.com/labstack/echo/v4"
 	"github.com/nimling/nimbody/cli"
 	"github.com/nimling/nimbody/mcp"
+	"github.com/nimling/nimbody/respond"
 	"github.com/spf13/cobra"
 	"github.com/stretchr/testify/assert"
 )
@@ -266,4 +271,312 @@ func TestCLIToolsTakeTheImageKeyACommandNames(t *testing.T) {
 	}
 	assert.Equal(t, "path", byName["shot"].Image)
 	assert.Equal(t, "", byName["get"].Image)
+}
+
+type toolArticle struct {
+	ID    string `json:"id"`
+	Title string `json:"title"`
+}
+
+func typedTree() *cobra.Command {
+	settings := &cli.Settings{Name: "demo", Prefix: "DEMO_", Keys: []cli.Setting{{Key: "client_secret", Env: "DEMO_CLIENT_SECRET", Flag: "client-secret", Secret: true}}}
+	root := &cobra.Command{Use: "demo", Short: "Operate the demo api"}
+	settings.Flags(root)
+	root.PersistentFlags().String("client-secret", "", "the client secret")
+	run := func(cmd *cobra.Command, args []string) error { return nil }
+	article := &cobra.Command{Use: "article", Short: "Articles"}
+	get := cli.PutOutput[[]toolArticle](&cobra.Command{Use: "get <id> [more...]", Short: "Read articles", RunE: run})
+	get.Flags().Int("limit", 0, "rows per page")
+	get.Flags().StringSlice("tag", nil, "tags to match")
+	get.Flags().Bool("draft", false, "drafts only")
+	get.Flags().String("owner", "", "owner to match")
+	_ = get.MarkFlagRequired("owner")
+	article.AddCommand(get)
+	root.AddCommand(article)
+	return root
+}
+
+func TestCLIToolsLegacyInputIsTheDefaultAndSkipsSecrets(t *testing.T) {
+	tools := cli.Tools(typedTree(), "/bin/demo")
+	schema := tools[0].InputSchema["properties"].(map[string]any)
+	assert.Contains(t, schema, "args")
+	flags := schema["flags"].(map[string]any)["properties"].(map[string]any)
+	assert.Contains(t, flags, "limit")
+	assert.NotContains(t, flags, "client-secret", "a secret setting is never a tool argument")
+	assert.NotNil(t, tools[0].OutputSchema)
+}
+
+func TestCLIToolsTypedInputPerFlagAndPositional(t *testing.T) {
+	root := typedTree()
+	root.Annotations[cli.AnnotationMCPInput] = cli.InputTyped
+	tool := cli.Tools(root, "/bin/demo")[0]
+	properties := tool.InputSchema["properties"].(map[string]any)
+	assert.NotContains(t, properties, "args")
+	assert.NotContains(t, properties, "flags")
+	assert.NotContains(t, properties, "client-secret")
+	assert.Equal(t, "string", properties["article_id"].(map[string]any)["type"], "an id positional is named for what it holds")
+	assert.Equal(t, "array", properties["more"].(map[string]any)["type"])
+	assert.Equal(t, "integer", properties["limit"].(map[string]any)["type"])
+	assert.Equal(t, "boolean", properties["draft"].(map[string]any)["type"])
+	assert.Equal(t, map[string]any{"type": "string"}, properties["tag"].(map[string]any)["items"])
+	assert.Equal(t, []string{"article_id", "owner"}, tool.InputSchema["required"])
+	assert.Equal(t, false, tool.InputSchema["additionalProperties"])
+	data := tool.OutputSchema["properties"].(map[string]any)["data"].(map[string]any)
+	assert.Equal(t, []any{"array", "null"}, data["type"])
+}
+
+func TestCLIToolsTypedRunMapsBackToArgv(t *testing.T) {
+	root := typedTree()
+	root.Annotations[cli.AnnotationMCPInput] = cli.InputTyped
+	tool := cli.Tools(root, "/bin/echo")[0]
+	text, failed := tool.Run(context.Background(), []byte(`{"article_id":"-42","more":["a","b"],"limit":5,"draft":true,"tag":["x","y"]}`), nil)
+	assert.False(t, failed)
+	assert.Equal(t, "article get --draft=true --limit=5 --tag=x --tag=y -- -42 a b\n", text)
+	text, failed = tool.Run(context.Background(), []byte(`{"args":["7"],"flags":{"limit":2}}`), nil)
+	assert.False(t, failed, "a host holding the old tool list still calls with args and flags")
+	assert.Equal(t, "article get --limit=2 7\n", text)
+	text, failed = tool.Run(context.Background(), []byte(`{"client-secret":"x"}`), nil)
+	assert.True(t, failed)
+	assert.Equal(t, "article get takes no input client-secret", text)
+}
+
+func TestCLIServeSendsInstructionsAndStructuredContent(t *testing.T) {
+	root := typedTree()
+	assert.Contains(t, cli.GetInstructions(root, "demo"), "The demo tools: Operate the demo api.")
+	root.Annotations[cli.AnnotationMCPInstructions] = "Use demo for articles."
+	assert.Equal(t, "Use demo for articles.", cli.GetInstructions(root, "demo"))
+
+	answer := func(text string) func(context.Context, json.RawMessage, func(respond.Step)) (string, bool) {
+		return func(context.Context, json.RawMessage, func(respond.Step)) (string, bool) { return text, false }
+	}
+	schema := map[string]any{"type": "object"}
+	server := &mcp.Server{Name: "demo", Version: "v1", Instructions: "Use demo for articles.", Tools: []mcp.Tool{
+		{Name: "article_get", OutputSchema: schema, Run: answer("[{\"id\":\"a\"}]\n1 of 3 rows\n")},
+		{Name: "article_plain", Run: answer(`[{"id":"a"}]`)},
+	}}
+	replies := mcpSession(t, server,
+		`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}`,
+		`{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"article_get","arguments":{}}}`,
+		`{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"article_get","arguments":{"jq":".[0]"}}}`,
+		`{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"article_plain","arguments":{}}}`,
+	)
+	byID := map[float64]map[string]any{}
+	for _, reply := range replies {
+		byID[reply["id"].(float64)] = reply["result"].(map[string]any)
+	}
+	assert.Equal(t, "Use demo for articles.", byID[1]["instructions"])
+	assert.Equal(t, map[string]any{"data": []any{map[string]any{"id": "a"}}}, byID[2]["structuredContent"])
+	assert.Nil(t, byID[3]["structuredContent"], "a shaped result no longer matches the output schema")
+	assert.Nil(t, byID[4]["structuredContent"], "no declared output, no structured content")
+}
+
+func TestCLIToolsDestructiveNeedsUserInteraction(t *testing.T) {
+	byName := map[string]mcp.Tool{}
+	for _, tool := range cli.Tools(cliTree(), "/bin/demo") {
+		byName[tool.Name] = tool
+	}
+	assert.Equal(t, true, byName["article_delete"].Meta[mcp.MetaUserInteraction])
+	assert.Nil(t, byName["article_get"].Meta[mcp.MetaUserInteraction])
+
+	server := &mcp.Server{Name: "demo", Version: "v1", Tools: []mcp.Tool{byName["article_delete"]}}
+	replies := mcpSession(t, server, `{"jsonrpc":"2.0","id":1,"method":"tools/list"}`)
+	listed := replies[0]["result"].(map[string]any)["tools"].([]any)[0].(map[string]any)["_meta"].(map[string]any)
+	assert.Equal(t, true, listed[mcp.MetaUserInteraction])
+	assert.Equal(t, "ui://demo/run", listed["ui"].(map[string]any)["resourceUri"])
+}
+
+func TestCLIOperationExampleReachesCommandAndTool(t *testing.T) {
+	operation := mcp.Define(mcp.Spec{Name: "article_get", Description: "Read one article", Method: "GET", Path: "/articles/:article_id", Access: mcp.AccessRead, Example: "demo article get 42"},
+		func(ctx echo.Context, in struct {
+			ArticleID string `param:"article_id" json:"article_id"`
+		}) (toolArticle, error) {
+			return toolArticle{}, nil
+		})
+	assert.Equal(t, "demo article get 42", cli.OperationCommand(operation, nil).Example)
+	assert.Contains(t, operation.Tool().Description, "example: demo article get 42")
+	assert.LessOrEqual(t, len([]rune(mcp.Describe(strings.Repeat("x", 5000), ""))), mcp.DescriptionLimit)
+}
+
+type sent struct {
+	method, path, contentType string
+	query                     url.Values
+	body                      []byte
+}
+
+func recordSend(into *sent) cli.Send {
+	return func(cmd *cobra.Command, method, path string, query url.Values, contentType string, body []byte) ([]byte, error) {
+		*into = sent{method: method, path: path, query: query, contentType: contentType, body: body}
+		return []byte(`{"data":{"id":"1"},"request_id":"r"}`), nil
+	}
+}
+
+func TestCLIBodyFlagsNestDecodeAndRefuseBoth(t *testing.T) {
+	body := cli.Body{Data: `{"title":"Orion"}`, Sets: []string{"owner.email=a@x.no", "tags=[\"news\"]", "count=3"}}
+	payload, contentType, err := body.Get(nil)
+	assert.NoError(t, err)
+	assert.Equal(t, cli.ContentTypeJSON, contentType)
+	assert.JSONEq(t, `{"title":"Orion","owner":{"email":"a@x.no"},"tags":["news"],"count":3}`, string(payload))
+
+	payload, _, err = (&cli.Body{File: "-"}).Get(strings.NewReader(`{"a":1}`))
+	assert.NoError(t, err)
+	assert.JSONEq(t, `{"a":1}`, string(payload))
+
+	_, _, err = (&cli.Body{Data: "{}", File: "x.json"}).Get(nil)
+	assert.Equal(t, cli.ExitRejected, cli.ExitCode(err))
+	_, _, err = (&cli.Body{Sets: []string{"nokey"}}).Get(nil)
+	assert.Equal(t, cli.ExitRejected, cli.ExitCode(err))
+
+	file := filepath.Join(t.TempDir(), "logo.png")
+	assert.NoError(t, os.WriteFile(file, []byte("png"), 0o600))
+	payload, contentType, err = (&cli.Body{Upload: file, Sets: []string{"name=logo"}}).Get(nil)
+	assert.NoError(t, err)
+	assert.True(t, strings.HasPrefix(contentType, "multipart/form-data; boundary="))
+	assert.Contains(t, string(payload), `name="name"`)
+	assert.Contains(t, string(payload), `filename="logo.png"`)
+}
+
+func TestCLIAPICommandReachesAnyPath(t *testing.T) {
+	var got sent
+	root := &cobra.Command{Use: "demo", SilenceErrors: true, SilenceUsage: true}
+	root.AddCommand(cli.APICommand(recordSend(&got), &cli.Output{}))
+	root.SetOut(&bytes.Buffer{})
+	root.SetArgs([]string{"api", "post", "/api/articles", "--set", "title=Orion"})
+	assert.NoError(t, root.Execute())
+	assert.Equal(t, sent{method: "POST", path: "/api/articles", contentType: cli.ContentTypeJSON, query: url.Values{}, body: []byte(`{"title":"Orion"}`)}, got)
+
+	api, _, _ := root.Find([]string{"api"})
+	root.SetArgs([]string{"api", "GET", "/api/articles"})
+	assert.NoError(t, root.Execute())
+	assert.Equal(t, mcp.AccessRead, cli.Access(api), "a GET through api is a read, so a protected config does not ask")
+
+	root.SetArgs([]string{"api", "FETCH", "/x"})
+	assert.Equal(t, cli.ExitRejected, cli.ExitCode(root.Execute()))
+	root.SetArgs([]string{"api", "GET", "x"})
+	assert.Equal(t, cli.ExitRejected, cli.ExitCode(root.Execute()))
+}
+
+func TestCLIResourceTableBuildsVerbsExamplesAndShortcuts(t *testing.T) {
+	var got sent
+	table := cli.Table{Name: "demo", Send: recordSend(&got), Output: &cli.Output{}, Fill: map[string]func() (string, error){"app": func() (string, error) { return "my-app", nil }}, Resources: []cli.Resource{{
+		Name: "app", Short: "Apps",
+		Verbs: []cli.Verb{
+			{Name: "get", Short: "Read apps", Method: http.MethodGet, Paths: []string{"/api/app", "/api/app/{id}"}},
+			{Name: "delete", Short: "Remove an app", Method: http.MethodDelete, Paths: []string{"", "/api/app/{id}"}},
+		},
+		Children: []cli.Resource{{Name: "client", Short: "Clients of the app", Verbs: []cli.Verb{
+			{Name: "create", Short: "Add a client", Method: http.MethodPost, Paths: []string{"/api/app/{app}/client"}, Body: true},
+			{Name: "rotate", Short: "Rotate a secret", Method: http.MethodPost, Paths: []string{"", "/api/app/{app}/client/{id}/rotate"}, Example: "demo app client rotate 7"},
+		}}},
+	}}}
+	root := &cobra.Command{Use: "demo"}
+	table.Mount(root)
+	root.SetOut(&bytes.Buffer{})
+	root.SetErr(&bytes.Buffer{})
+
+	get, _, _ := root.Find([]string{"app", "get"})
+	assert.Equal(t, "get [id]", get.Use)
+	assert.Equal(t, "demo app get\ndemo app get <id>", get.Example)
+	remove, _, _ := root.Find([]string{"app", "delete"})
+	assert.Equal(t, "delete <id>", remove.Use)
+	assert.Equal(t, mcp.AccessDestructive, cli.Access(remove))
+	create, _, _ := root.Find([]string{"app", "client", "create"})
+	assert.Equal(t, "create", create.Use, "a filled placeholder is no positional")
+	assert.Contains(t, create.Example, "demo app client create --set name=Orion")
+	rotate, _, _ := root.Find([]string{"app", "client", "rotate"})
+	assert.Equal(t, "demo app client rotate 7", rotate.Example)
+
+	root.SetArgs([]string{"app", "client", "create", "--set", "name=ci"})
+	assert.NoError(t, root.Execute())
+	assert.Equal(t, "/api/app/my-app/client", got.path)
+	assert.JSONEq(t, `{"name":"ci"}`, string(got.body))
+
+	root.SetArgs([]string{"client", "rotate", "a b"})
+	assert.NoError(t, root.Execute(), "a child name used once is a hidden top level shortcut")
+	assert.Equal(t, "/api/app/my-app/client/a%20b/rotate", got.path)
+
+	root.SetArgs([]string{"app", "delete"})
+	assert.Equal(t, cli.ExitRejected, cli.ExitCode(root.Execute()))
+
+	for _, tool := range cli.Tools(root, "/bin/demo") {
+		assert.Contains(t, tool.Description, "example: demo ", tool.Name)
+	}
+}
+
+func TestCLICompletionAutoInstallsUnderTheDataDir(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_DATA_HOME", filepath.Join(home, "data"))
+	t.Setenv("SHELL", "/bin/zsh")
+	root := &cobra.Command{Use: "demo", SilenceErrors: true, SilenceUsage: true}
+	root.AddCommand(cli.CompletionCommand(root, "---\nname: demo\n---\n"))
+	var stdout, stderr bytes.Buffer
+	root.SetOut(&stdout)
+	root.SetErr(&stderr)
+	for range 2 {
+		root.SetArgs([]string{"completion", "--auto", "--skill"})
+		assert.NoError(t, root.Execute())
+	}
+	_, err := os.Stat(filepath.Join(home, "data", "demo", "completions", "_demo"))
+	assert.NoError(t, err)
+	rc, _ := os.ReadFile(filepath.Join(home, ".zshrc"))
+	assert.Equal(t, 1, strings.Count(string(rc), "# >>> demo completion >>>"), "a second run keeps one managed block")
+	_, err = os.Stat(filepath.Join(home, ".claude", "skills", "demo", "SKILL.md"))
+	assert.NoError(t, err)
+	assert.Empty(t, stdout.String())
+
+	root = &cobra.Command{Use: "demo", SilenceErrors: true, SilenceUsage: true}
+	root.AddCommand(cli.CompletionCommand(root, ""))
+	root.SetOut(&stdout)
+	root.SetArgs([]string{"completion", "bash"})
+	assert.NoError(t, root.Execute())
+	assert.Contains(t, stdout.String(), "bash completion")
+	root.SetArgs([]string{"completion"})
+	assert.Equal(t, cli.ExitRejected, cli.ExitCode(root.Execute()))
+}
+
+func TestCLIVersionPrintsTheBuildAndTheServer(t *testing.T) {
+	previous := cli.Version
+	t.Cleanup(func() { cli.Version = previous })
+	cli.Version = "v1.2.3"
+	root := &cobra.Command{Use: "demo"}
+	root.AddCommand(cli.VersionCommand(func(context.Context) (string, error) { return "v1.3.0", nil }))
+	var out bytes.Buffer
+	root.SetOut(&out)
+	root.SetArgs([]string{"version"})
+	assert.NoError(t, root.Execute())
+	assert.JSONEq(t, `{"version":"v1.2.3","server":"v1.3.0"}`, out.String())
+
+	newAuthService(t, false)
+	settings := credentialSettings(t, nil)
+	server, err := (&cli.Client{LoginPath: "/api/auth/login", TokenPath: "/api/auth/cli/token", RevokePath: "/api/auth/cli/revoke", IdentityPath: "/api/me", AppHeader: "X-App-Slug", Settings: settings}).GetServerVersion(context.Background())
+	assert.NoError(t, err)
+	assert.Equal(t, "v9.9.9", server)
+}
+
+func TestCLINotifierChecksOncePerDayAndCanBeTurnedOff(t *testing.T) {
+	previous := cli.Version
+	t.Cleanup(func() { cli.Version = previous })
+	cli.Version = "v1.2.3"
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("NIMBODY_MCP", "")
+	asked := 0
+	notifier := &cli.Notifier{Settings: &cli.Settings{Name: "demo", Prefix: "DEMO_"}, Hint: "Run 'go install example.test/demo@latest'.", Latest: func(context.Context) (string, error) {
+		asked++
+		return "v1.4.0", nil
+	}}
+	note, err := notifier.Check(context.Background())
+	assert.NoError(t, err)
+	assert.Contains(t, note, "a newer demo is out, v1.4.0, this is v1.2.3. Run 'go install example.test/demo@latest'.")
+	assert.Contains(t, note, "DEMO_NO_UPDATE_NOTIFIER=1")
+	_, _ = notifier.Check(context.Background())
+	assert.Equal(t, 1, asked, "the answer is cached for a day")
+
+	t.Setenv("DEMO_NO_UPDATE_NOTIFIER", "1")
+	note, _ = notifier.Check(context.Background())
+	assert.Empty(t, note)
+
+	assert.True(t, cli.Newer("v1.10.0", "v1.9.9"))
+	assert.True(t, cli.Newer("v1.2.3", "v1.2.3-tst"))
+	assert.False(t, cli.Newer("v1.2.3-tst", "v1.2.3"))
+	assert.False(t, cli.Newer("dev", "v1.0.0"))
 }
