@@ -27,7 +27,7 @@ const skill = "---\nname: demo\ndescription: Operates the demo articles api with
 
 var output = &cli.Output{}
 
-var client = &cli.Client{Settings: settings, Product: "Demo", Version: func() string { return "v0.0.0" }, Output: output}
+var client = &cli.Client{Settings: settings, Product: "Demo", Version: cli.GetVersion, Output: output}
 
 func main() {
 	_ = godotenv.Load(".env")
@@ -53,7 +53,8 @@ func main() {
 	if get, _, err := root.Find([]string{"article", "get"}); err == nil {
 		cli.PutOutput[[]article](get)
 	}
-	root.AddCommand(settings.ConfigCommand(), cli.MCPCommand(root, "demo", client.Version))
+	root.AddCommand(settings.ConfigCommand(), cli.MCPCommand(root, "demo", cli.GetVersion), cli.CompletionCommand(root, skill), cli.VersionCommand(client.GetServerVersion))
 	client.Mount(root)
+	(&cli.Notifier{Settings: settings, Latest: client.GetServerVersion, Hint: "Install the version the server runs."}).Mount(root)
 	os.Exit(cli.Execute(root))
 }

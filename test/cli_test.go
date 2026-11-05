@@ -437,7 +437,7 @@ func TestCLIBodyFlagsNestDecodeAndRefuseBoth(t *testing.T) {
 
 func TestCLIAPICommandReachesAnyPath(t *testing.T) {
 	var got sent
-	root := &cobra.Command{Use: "demo"}
+	root := &cobra.Command{Use: "demo", SilenceErrors: true, SilenceUsage: true}
 	root.AddCommand(cli.APICommand(recordSend(&got), &cli.Output{}))
 	root.SetOut(&bytes.Buffer{})
 	root.SetArgs([]string{"api", "post", "/api/articles", "--set", "title=Orion"})
@@ -500,4 +500,83 @@ func TestCLIResourceTableBuildsVerbsExamplesAndShortcuts(t *testing.T) {
 	for _, tool := range cli.Tools(root, "/bin/demo") {
 		assert.Contains(t, tool.Description, "example: demo ", tool.Name)
 	}
+}
+
+func TestCLICompletionAutoInstallsUnderTheDataDir(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_DATA_HOME", filepath.Join(home, "data"))
+	t.Setenv("SHELL", "/bin/zsh")
+	root := &cobra.Command{Use: "demo", SilenceErrors: true, SilenceUsage: true}
+	root.AddCommand(cli.CompletionCommand(root, "---\nname: demo\n---\n"))
+	var stdout, stderr bytes.Buffer
+	root.SetOut(&stdout)
+	root.SetErr(&stderr)
+	for range 2 {
+		root.SetArgs([]string{"completion", "--auto", "--skill"})
+		assert.NoError(t, root.Execute())
+	}
+	_, err := os.Stat(filepath.Join(home, "data", "demo", "completions", "_demo"))
+	assert.NoError(t, err)
+	rc, _ := os.ReadFile(filepath.Join(home, ".zshrc"))
+	assert.Equal(t, 1, strings.Count(string(rc), "# >>> demo completion >>>"), "a second run keeps one managed block")
+	_, err = os.Stat(filepath.Join(home, ".claude", "skills", "demo", "SKILL.md"))
+	assert.NoError(t, err)
+	assert.Empty(t, stdout.String())
+
+	root = &cobra.Command{Use: "demo", SilenceErrors: true, SilenceUsage: true}
+	root.AddCommand(cli.CompletionCommand(root, ""))
+	root.SetOut(&stdout)
+	root.SetArgs([]string{"completion", "bash"})
+	assert.NoError(t, root.Execute())
+	assert.Contains(t, stdout.String(), "bash completion")
+	root.SetArgs([]string{"completion"})
+	assert.Equal(t, cli.ExitRejected, cli.ExitCode(root.Execute()))
+}
+
+func TestCLIVersionPrintsTheBuildAndTheServer(t *testing.T) {
+	previous := cli.Version
+	t.Cleanup(func() { cli.Version = previous })
+	cli.Version = "v1.2.3"
+	root := &cobra.Command{Use: "demo"}
+	root.AddCommand(cli.VersionCommand(func(context.Context) (string, error) { return "v1.3.0", nil }))
+	var out bytes.Buffer
+	root.SetOut(&out)
+	root.SetArgs([]string{"version"})
+	assert.NoError(t, root.Execute())
+	assert.JSONEq(t, `{"version":"v1.2.3","server":"v1.3.0"}`, out.String())
+
+	newAuthService(t, false)
+	settings := credentialSettings(t, nil)
+	server, err := (&cli.Client{Settings: settings}).GetServerVersion(context.Background())
+	assert.NoError(t, err)
+	assert.Equal(t, "v9.9.9", server)
+}
+
+func TestCLINotifierChecksOncePerDayAndCanBeTurnedOff(t *testing.T) {
+	previous := cli.Version
+	t.Cleanup(func() { cli.Version = previous })
+	cli.Version = "v1.2.3"
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("NIMBODY_MCP", "")
+	asked := 0
+	notifier := &cli.Notifier{Settings: &cli.Settings{Name: "demo", Prefix: "DEMO_"}, Hint: "Run 'go install example.test/demo@latest'.", Latest: func(context.Context) (string, error) {
+		asked++
+		return "v1.4.0", nil
+	}}
+	note, err := notifier.Check(context.Background())
+	assert.NoError(t, err)
+	assert.Contains(t, note, "a newer demo is out, v1.4.0, this is v1.2.3. Run 'go install example.test/demo@latest'.")
+	assert.Contains(t, note, "DEMO_NO_UPDATE_NOTIFIER=1")
+	_, _ = notifier.Check(context.Background())
+	assert.Equal(t, 1, asked, "the answer is cached for a day")
+
+	t.Setenv("DEMO_NO_UPDATE_NOTIFIER", "1")
+	note, _ = notifier.Check(context.Background())
+	assert.Empty(t, note)
+
+	assert.True(t, cli.Newer("v1.10.0", "v1.9.9"))
+	assert.True(t, cli.Newer("v1.2.3", "v1.2.3-tst"))
+	assert.False(t, cli.Newer("v1.2.3-tst", "v1.2.3"))
+	assert.False(t, cli.Newer("dev", "v1.0.0"))
 }

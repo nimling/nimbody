@@ -66,7 +66,14 @@ type Client struct {
 	reused   bool
 	rejected string
 	probe    sync.Once
-	serves   bool
+	probed   error
+	service  serviceStatus
+}
+
+type serviceStatus struct {
+	Service   string   `json:"service"`
+	Version   string   `json:"version"`
+	Endpoints []string `json:"endpoints"`
 }
 
 type Token struct {
@@ -346,8 +353,9 @@ func (c *Client) failure(method, path string, status int, body []byte) error {
 	return &Error{Code: ExitFailure, Message: message}
 }
 
-func (c *Client) ServesMCP(ctx context.Context) bool {
+func (c *Client) status(ctx context.Context) (serviceStatus, error) {
 	c.probe.Do(func() {
+		c.probed = errors.New("no endpoint in config " + c.Settings.Loaded.Config)
 		if c.Endpoint() == "" {
 			return
 		}
@@ -355,25 +363,44 @@ func (c *Client) ServesMCP(ctx context.Context) bool {
 		defer cancel()
 		req, err := http.NewRequestWithContext(probe, http.MethodGet, c.Endpoint()+PathStatus, nil)
 		if err != nil {
+			c.probed = err
 			return
 		}
 		req.Header.Set("Accept", "application/json")
 		req.Header.Set("User-Agent", c.UserAgent())
 		res, err := c.http().Do(req)
 		if err != nil {
+			c.probed = err
 			return
 		}
 		defer res.Body.Close()
-		var status struct {
-			Data struct {
-				Endpoints []string `json:"endpoints"`
-			} `json:"data"`
+		var wrapped struct {
+			Data serviceStatus `json:"data"`
 		}
-		if res.StatusCode == http.StatusOK && json.NewDecoder(res.Body).Decode(&status) == nil {
-			c.serves = slices.Contains(status.Data.Endpoints, mcp.MountPath)
+		if res.StatusCode != http.StatusOK {
+			c.probed = errors.New("GET " + PathStatus + ": " + res.Status)
+			return
 		}
+		if err := json.NewDecoder(res.Body).Decode(&wrapped); err != nil {
+			c.probed = err
+			return
+		}
+		c.service, c.probed = wrapped.Data, nil
 	})
-	return c.serves
+	return c.service, c.probed
+}
+
+func (c *Client) ServesMCP(ctx context.Context) bool {
+	status, err := c.status(ctx)
+	return err == nil && slices.Contains(status.Endpoints, mcp.MountPath)
+}
+
+func (c *Client) GetServerVersion(ctx context.Context) (string, error) {
+	status, err := c.status(ctx)
+	if err != nil {
+		return "", err
+	}
+	return status.Version, nil
 }
 
 func (c *Client) Remote(ctx context.Context) (string, string, error) {

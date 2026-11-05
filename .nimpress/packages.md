@@ -42,6 +42,8 @@ The shared cli layer the `cli` skill describes.
 
 6. `Root(root, settings, output)` is how a cli starts: it mounts `Settings` and `Output`, typed mcp input, and loads and guards before the cli's own `PersistentPreRunE`. `HelpCommand` is `help`, the bundled SKILL.md on stdout, and `HelpFunc` puts the banner above the root's help; both show the banner on a terminal only. `config get` and `config list` honour `--json`.
 
+7. `CompletionCommand` is `completion`, with `--auto` installing under the XDG data dir and one managed rc block. `Version` is the one ldflags symbol every cli sets, `GetVersion` its value, and `VersionCommand` prints it with the server's version, `Client.GetServerVersion` from `/status`. `Notifier` notes a newer version on stderr after a command, once a day at most, on a terminal only, off with `<PREFIX>NO_UPDATE_NOTIFIER`.
+
 ## state
 
 One path for a service to export and import its data, so a dataset is seeded, dumped, snapshotted, moved and restored through the api, the cli and mcp. nimbody owns the routing, the file format, the ordering, the key mapping, the dry run, the hashes and the step stream; the service owns its data and its access.

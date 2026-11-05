@@ -38,6 +38,10 @@
 34. `cli`: `Root` refuses a `Setting` that is `Secret` and names a `Flag`, at start, since a secret is never a flag; `Settings.Flags` alone still takes one, so a cli that has not moved to `Root` keeps its flag.
 35. `cli`: `--plan` stops `config set`, `config use`, `config init` and `config local` too: each prints the write it would make, a secret masked, and exits 0 without touching a file.
 36. `cli`: the `config set` example writes a named config with `--to`.
+37. `cli`: `CompletionCommand(root, skill)` is the shared `completion [shell]`: it prints the script for one shell, or with `--auto` detects the shell from `$SHELL`, writes the script under the XDG data dir, `$XDG_DATA_HOME/<cli>/completions` or `~/.local/share/<cli>/completions`, and keeps one managed block in `~/.zshrc` or `~/.bashrc`; fish gets its own completions directory. `--skill` installs the bundled skill in the same step. It turns off cobra's default completion command. `GetDataDir` answers the data dir.
+38. `cli`: `cli.Version` is the one ldflags symbol, `-X github.com/nimling/nimbody/cli.Version=v1.2.3`; `GetVersion` answers it, or the module version a `go install …@version` build carries, or `dev`.
+39. `cli`: `VersionCommand(server)` prints `{version, server}`, the server's from the function given, `Client.GetServerVersion` reading `GET /status` for an api cli and nil for a tool cli; an unreachable server is a warning on stderr, never a failure.
+40. `cli`: `Notifier` is the update notifier. `Mount` checks `Latest` at most once per `Every`, a day by default, cached in `~/.<cli>/update.json`, and prints a note on stderr after the command when a newer version is out, only on a terminal and never under mcp or for a `dev` build. `<PREFIX>NO_UPDATE_NOTIFIER` turns it off. `Newer` compares two versions, a release above its prerelease.
 
 ## v1.0.0
 
