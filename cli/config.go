@@ -311,6 +311,13 @@ func (s *Settings) Get(key string) string {
 	return os.Getenv(s.Prefix + strings.ToUpper(key))
 }
 
+func (s *Settings) Put(key, value string) {
+	if s.values == nil {
+		s.values = map[string]string{}
+	}
+	s.values[key] = value
+}
+
 func flagChanged(cmd *cobra.Command, name string) bool {
 	if name == "" {
 		return false

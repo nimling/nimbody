@@ -31,9 +31,11 @@ const (
 	KeyAppSlug      = "app_slug"
 	KeyClientID     = "client_id"
 	KeyClientSecret = "client_secret"
+	KeyToken        = "token"
 
 	PathStatus = "/status"
 	PathHealth = "/status/health"
+	PathState  = "/api/state"
 
 	FlagStream  = "stream"
 	StreamUsage = "send Accept: text/event-stream and print every frame as it arrives until the stream ends"
@@ -102,7 +104,7 @@ func (c *Client) Endpoint() string {
 }
 
 func (c *Client) EnvToken() string {
-	return firstSet(os.Getenv(c.Settings.Prefix+"TOKEN"), os.Getenv(c.Settings.Prefix+"ACCESS_TOKEN"))
+	return firstSet(c.Settings.Get(KeyToken), os.Getenv(c.Settings.Prefix+"ACCESS_TOKEN"))
 }
 
 func (c *Client) Mode() string {

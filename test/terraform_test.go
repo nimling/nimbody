@@ -1,81 +1,46 @@
 package test
 
 import (
+	"archive/zip"
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"io"
 	"math/big"
 	"net/http"
 	"net/http/httptest"
-	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strings"
 	"testing"
 
 	"github.com/hashicorp/terraform-plugin-go/tfprotov6"
 	"github.com/hashicorp/terraform-plugin-go/tftypes"
-	"github.com/labstack/echo/v4"
 	"github.com/nimling/nimbody/cli"
+	"github.com/nimling/nimbody/state"
 	"github.com/nimling/nimbody/terraform"
 	"github.com/spf13/cobra"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
-const envTestCLI = "NIMBODY_TEST_CLI"
-
-func TestMain(m *testing.M) {
-	if endpoint := os.Getenv(envTestCLI); endpoint != "" {
-		os.Exit(cli.Execute(testCLI(endpoint)))
-	}
-	os.Exit(m.Run())
+func demoProvider(m *memory) terraform.Provider {
+	settings := &cli.Settings{Name: "demo", Prefix: "DEMO_"}
+	client := &cli.Client{Settings: settings, LoginPath: "/api/auth/login", TokenPath: "/api/auth/cli/token", RevokePath: "/api/auth/cli/revoke", IdentityPath: "/api/me", AppHeader: "X-App-Slug"}
+	return terraform.Provider{Name: "demo", Version: func() string { return "v1.2.3" }, Client: client, Document: state.GetDocument("demo", "v1.2.3", stateGroups(m, connectionGroup(m))...)}
 }
 
-func testCLI(endpoint string) *cobra.Command {
-	root := &cobra.Command{Use: "demo"}
-	send := func(cmd *cobra.Command, method, path string, query url.Values, contentType string, body []byte) ([]byte, error) {
-		target := endpoint + "/api" + path
-		if len(query) > 0 {
-			target += "?" + query.Encode()
-		}
-		req, err := http.NewRequestWithContext(cmd.Context(), method, target, bytes.NewReader(body))
-		if err != nil {
-			return nil, err
-		}
-		req.Header.Set(echo.HeaderAuthorization, "Bearer owner")
-		if contentType != "" {
-			req.Header.Set("Content-Type", contentType)
-		}
-		res, err := http.DefaultClient.Do(req)
-		if err != nil {
-			return nil, err
-		}
-		defer res.Body.Close()
-		answer, err := io.ReadAll(res.Body)
-		if err != nil {
-			return nil, err
-		}
-		if res.StatusCode >= http.StatusBadRequest {
-			return nil, cli.Rejected(string(answer), "")
-		}
-		return answer, nil
-	}
-	root.AddCommand(cli.StateCommand(send, nil))
-	return root
-}
-
-func providerHost(t *testing.T) (*memory, tfprotov6.ProviderServer) {
+func providerHost(t *testing.T) (*memory, tfprotov6.ProviderServer, string) {
+	t.Setenv("HOME", t.TempDir())
 	m := newMemory("a")
 	e, _ := stateService(m, connectionGroup(m))
 	host := httptest.NewServer(e)
 	t.Cleanup(host.Close)
-	t.Setenv(envTestCLI, host.URL)
-	executable, err := os.Executable()
-	require.NoError(t, err)
-	p := terraform.Provider{Name: "demo", Version: func() string { return "v1.2.3" }, Executable: executable}
-	return m, p.Server()
+	return m, demoProvider(m).Server(), host.URL
 }
 
 func object(typ tftypes.Type, values map[string]tftypes.Value) tftypes.Value {
@@ -166,13 +131,13 @@ func (r terraformRun) destroy(name string, prior tftypes.Value) {
 }
 
 func startProvider(t *testing.T) (*memory, terraformRun, *tfprotov6.GetProviderSchemaResponse) {
-	m, server := providerHost(t)
+	m, server, endpoint := providerHost(t)
 	ctx := context.Background()
 	schema, err := server.GetProviderSchema(ctx, &tfprotov6.GetProviderSchemaRequest{})
 	require.NoError(t, err)
 	noErrors(t, schema.Diagnostics)
 	providerType := schema.Provider.ValueType()
-	configured, err := server.ConfigureProvider(ctx, &tfprotov6.ConfigureProviderRequest{Config: encoded(t, providerType, object(providerType, nil))})
+	configured, err := server.ConfigureProvider(ctx, &tfprotov6.ConfigureProviderRequest{Config: encoded(t, providerType, object(providerType, map[string]tftypes.Value{"endpoint": text(endpoint), "token": text("owner")}))})
 	require.NoError(t, err)
 	noErrors(t, configured.Diagnostics)
 	run := terraformRun{t: t, ctx: ctx, server: server, types: map[string]tftypes.Type{}}
@@ -323,4 +288,194 @@ func TestTerraformInstall(t *testing.T) {
 	assert.Equal(t, cli.ExitOK, cli.Execute(root))
 	assert.True(t, served, "the binary serves the provider when terraform starts it")
 	assert.Empty(t, cli.Tools(root, "/bin/demo"), "the terraform commands are tooling, not mcp tools")
+}
+
+func providerSchemaOf(t *testing.T, p terraform.Provider) *tfprotov6.GetProviderSchemaResponse {
+	schema, err := p.Server().GetProviderSchema(context.Background(), &tfprotov6.GetProviderSchemaRequest{})
+	require.NoError(t, err)
+	noErrors(t, schema.Diagnostics)
+	return schema
+}
+
+func TestTerraformSchemaOfflineEqualsLive(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	m := newMemory("a")
+	offline := demoProvider(m)
+	assert.Empty(t, offline.Client.Endpoint(), "the offline provider has no endpoint to reach")
+	fromCode := providerSchemaOf(t, offline)
+
+	e, _ := stateService(m, connectionGroup(m))
+	rec := call(e, http.MethodGet, "/api/state", "", "", nil)
+	require.Equal(t, http.StatusOK, rec.Code)
+	var wrapped struct {
+		Data state.Document `json:"data"`
+	}
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &wrapped))
+	coded, err := json.Marshal(offline.Document)
+	require.NoError(t, err)
+	served, err := json.Marshal(wrapped.Data)
+	require.NoError(t, err)
+	assert.JSONEq(t, string(served), string(coded), "the document in code is the document the service answers")
+
+	live := offline
+	live.Document = wrapped.Data
+	fromService := providerSchemaOf(t, live)
+	assert.Equal(t, fromService.ResourceSchemas, fromCode.ResourceSchemas)
+	assert.Equal(t, fromService.Provider, fromCode.Provider)
+	assert.Len(t, fromCode.ResourceSchemas, 3)
+}
+
+func TestTerraformSchemaCommand(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	root := &cobra.Command{Use: "demo", SilenceUsage: true, SilenceErrors: true}
+	terraform.Register(root, demoProvider(newMemory("a")))
+	t.Cleanup(func() { cli.Provider = nil })
+	file := filepath.Join(t.TempDir(), "schema.json")
+	root.SetArgs([]string{"terraform", "schema", "-o", file})
+	require.NoError(t, root.Execute())
+	body, err := os.ReadFile(file)
+	require.NoError(t, err)
+
+	type attribute struct {
+		Type       json.RawMessage `json:"type"`
+		NestedType *struct {
+			NestingMode string                     `json:"nesting_mode"`
+			Attributes  map[string]json.RawMessage `json:"attributes"`
+		} `json:"nested_type"`
+		Required  bool `json:"required"`
+		Optional  bool `json:"optional"`
+		Computed  bool `json:"computed"`
+		Sensitive bool `json:"sensitive"`
+		WriteOnly bool `json:"write_only"`
+	}
+	type block struct {
+		Block struct {
+			Attributes map[string]attribute `json:"attributes"`
+		} `json:"block"`
+	}
+	var schemas struct {
+		FormatVersion string `json:"format_version"`
+		Schemas       map[string]struct {
+			Provider  block            `json:"provider"`
+			Resources map[string]block `json:"resource_schemas"`
+		} `json:"provider_schemas"`
+	}
+	require.NoError(t, json.Unmarshal(body, &schemas))
+	assert.Equal(t, "1.0", schemas.FormatVersion)
+	demo, ok := schemas.Schemas["registry.terraform.io/samna/demo"]
+	require.True(t, ok, "keyed by the provider source, as terraform providers schema -json keys it")
+	names := []string{}
+	for name := range demo.Resources {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	assert.Equal(t, []string{"demo_connection", "demo_location", "demo_room"}, names)
+
+	room := demo.Resources["demo_room"].Block.Attributes
+	assert.JSONEq(t, `"string"`, string(room["code"].Type))
+	assert.True(t, room["code"].WriteOnly && room["code"].Sensitive)
+	assert.True(t, room["key"].Required)
+	assert.JSONEq(t, `"number"`, string(room["seats"].Type))
+	assert.True(t, demo.Resources["demo_location"].Block.Attributes["region"].Computed)
+	config := demo.Resources["demo_connection"].Block.Attributes["config"]
+	require.NotNil(t, config.NestedType)
+	assert.Equal(t, "single", config.NestedType.NestingMode)
+	assert.Contains(t, config.NestedType.Attributes, "client_secret")
+
+	provider := demo.Provider.Block.Attributes
+	for _, name := range []string{"endpoint", "client_id", "client_secret", "token", "app_slug"} {
+		assert.True(t, provider[name].Optional, name)
+	}
+	assert.True(t, provider["client_secret"].Sensitive && provider["token"].Sensitive)
+}
+
+func TestTerraformProviderFromTheEnvironment(t *testing.T) {
+	m, server, endpoint := providerHost(t)
+	ctx := context.Background()
+	providerType := providerSchemaOf(t, demoProvider(m)).Provider.ValueType()
+	types := providerSchemaOf(t, demoProvider(m)).ResourceSchemas
+
+	read, err := server.ReadResource(ctx, &tfprotov6.ReadResourceRequest{TypeName: "demo_location", CurrentState: encoded(t, types["demo_location"].ValueType(), object(types["demo_location"].ValueType(), map[string]tftypes.Value{"key": text("hq")}))})
+	require.NoError(t, err)
+	require.NotEmpty(t, read.Diagnostics)
+	assert.Contains(t, read.Diagnostics[0].Summary, "not configured")
+
+	missing, err := server.ConfigureProvider(ctx, &tfprotov6.ConfigureProviderRequest{Config: encoded(t, providerType, object(providerType, nil))})
+	require.NoError(t, err)
+	require.NotEmpty(t, missing.Diagnostics)
+	assert.Contains(t, missing.Diagnostics[0].Detail, "DEMO_ENDPOINT")
+
+	t.Setenv("DEMO_ENDPOINT", endpoint)
+	t.Setenv("DEMO_TOKEN", "stranger")
+	configured, err := server.ConfigureProvider(ctx, &tfprotov6.ConfigureProviderRequest{Config: encoded(t, providerType, object(providerType, nil))})
+	require.NoError(t, err)
+	noErrors(t, configured.Diagnostics)
+	refused, err := server.ReadResource(ctx, &tfprotov6.ReadResourceRequest{TypeName: "demo_location", CurrentState: read.NewState})
+	require.NoError(t, err)
+	require.NotEmpty(t, refused.Diagnostics, "the service chain refuses the token from the environment")
+	assert.Contains(t, refused.Diagnostics[0].Detail, "403")
+
+	t.Setenv("DEMO_TOKEN", "owner")
+	_, err = server.ConfigureProvider(ctx, &tfprotov6.ConfigureProviderRequest{Config: encoded(t, providerType, object(providerType, nil))})
+	require.NoError(t, err)
+	m.add("location", "loc-1", map[string]any{"name": "Head office", "region": "north"})
+	locationType := types["demo_location"].ValueType()
+	found, err := server.ReadResource(ctx, &tfprotov6.ReadResourceRequest{TypeName: "demo_location", CurrentState: encoded(t, locationType, object(locationType, map[string]tftypes.Value{"key": text("loc-1")}))})
+	require.NoError(t, err)
+	noErrors(t, found.Diagnostics)
+	assert.Equal(t, "Head office", stringOf(at(decodedValue(t, locationType, found.NewState), "name")))
+}
+
+func TestTerraformPackage(t *testing.T) {
+	dir := t.TempDir()
+	build := filepath.Join(dir, "build")
+	require.NoError(t, os.MkdirAll(build, 0o755))
+	for _, platform := range []string{"linux_amd64", "darwin_arm64"} {
+		require.NoError(t, os.WriteFile(filepath.Join(build, "demo_"+platform), []byte("provider "+platform), 0o755))
+	}
+	module := filepath.Join(dir, "deploy", "terraform", "demo", "azurerm")
+	require.NoError(t, os.MkdirAll(filepath.Join(module, ".terraform"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(module, "main.tf"), []byte(`resource "demo_location" "hq" {}`+"\n"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(module, "terraform.tfstate"), []byte("{}"), 0o644))
+
+	dist := filepath.Join(dir, "dist")
+	root := &cobra.Command{Use: "demo", SilenceUsage: true, SilenceErrors: true}
+	terraform.Register(root, terraform.Provider{Name: "demo", Version: func() string { return "v1.2.3" }})
+	t.Cleanup(func() { cli.Provider = nil })
+	var out bytes.Buffer
+	root.SetOut(&out)
+	root.SetErr(io.Discard)
+	root.SetArgs([]string{"terraform", "package", "--dir", dist, "--modules", filepath.Join(dir, "deploy", "terraform"),
+		"linux_amd64=" + filepath.Join(build, "demo_linux_amd64"), "darwin_arm64=" + filepath.Join(build, "demo_darwin_arm64")})
+	require.NoError(t, root.Execute())
+
+	files := terraform.GetFiles("demo", "1.2.3", "", "")
+	assert.Equal(t, "terraform-provider-demo_1.2.3_manifest.json", files.Manifest)
+	manifest, err := os.ReadFile(filepath.Join(dist, files.Manifest))
+	require.NoError(t, err)
+	assert.JSONEq(t, `{"version":1,"metadata":{"protocol_versions":["6.0"]}}`, string(manifest))
+
+	sums, err := os.ReadFile(filepath.Join(dist, files.Sums))
+	require.NoError(t, err)
+	var listed []string
+	for _, line := range strings.Split(strings.TrimSpace(string(sums)), "\n") {
+		hash, name, ok := strings.Cut(line, "  ")
+		require.True(t, ok, line)
+		body, err := os.ReadFile(filepath.Join(dist, name))
+		require.NoError(t, err)
+		sum := sha256.Sum256(body)
+		assert.Equal(t, hex.EncodeToString(sum[:]), hash, name)
+		listed = append(listed, name)
+	}
+	assert.Equal(t, []string{"terraform-provider-demo_1.2.3_darwin_arm64.zip", "terraform-provider-demo_1.2.3_linux_amd64.zip", "terraform-provider-demo_1.2.3_manifest.json"}, listed, "the public registry reads the manifest from the signed sums")
+
+	archive, err := zip.OpenReader(filepath.Join(dist, terraform.GetFiles("demo", "1.2.3", "linux", "amd64").Archive))
+	require.NoError(t, err)
+	defer archive.Close()
+	require.Len(t, archive.File, 1)
+	assert.Equal(t, "terraform-provider-demo_v1.2.3", archive.File[0].Name)
+	assert.Contains(t, out.String(), terraform.GetModuleArchive("demo", "azurerm", "1.2.3"))
+
+	root.SetArgs([]string{"terraform", "package", "--dir", dist, "linux"})
+	assert.Error(t, root.Execute(), "a build is named <os>_<arch>=<binary>")
 }

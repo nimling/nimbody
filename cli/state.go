@@ -29,7 +29,7 @@ func StateCommand(send Send, output *Output) *cobra.Command {
 		Args:        cobra.NoArgs,
 		Annotations: map[string]string{AnnotationMCP: mcp.AccessRead},
 		RunE: func(cmd *cobra.Command, args []string) error {
-			body, err := send(cmd, http.MethodGet, "/state", nil, "", nil)
+			body, err := send(cmd, http.MethodGet, PathState, nil, "", nil)
 			if err != nil {
 				return err
 			}
@@ -79,14 +79,14 @@ func stateExport(send Send, output *Output) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			body, err := send(cmd, http.MethodPost, "/state/export", nil, "application/json", payload)
+			body, err := send(cmd, http.MethodPost, PathState+"/export", nil, "application/json", payload)
 			if err != nil {
 				return err
 			}
 			if store {
 				return output.Print(cmd.OutOrStdout(), cmd.ErrOrStderr(), body)
 			}
-			lines := stateLines(body)
+			lines := GetStateLines(body)
 			read, err := state.Read(bytes.NewReader(lines))
 			if err != nil {
 				return &Error{Code: ExitFailure, Message: "the export is not state lines", Cause: err}
@@ -160,7 +160,7 @@ func stateImport(send Send, output *Output) *cobra.Command {
 				if err != nil {
 					return err
 				}
-				body, err = send(cmd, http.MethodPost, "/state/import", query, state.MIMENDJSON, lines)
+				body, err = send(cmd, http.MethodPost, PathState+"/import", query, state.MIMENDJSON, lines)
 				if err != nil {
 					return err
 				}
@@ -169,7 +169,7 @@ func stateImport(send Send, output *Output) *cobra.Command {
 				if err != nil {
 					return err
 				}
-				body, err = send(cmd, http.MethodPost, "/state/import", nil, "application/json", payload)
+				body, err = send(cmd, http.MethodPost, PathState+"/import", nil, "application/json", payload)
 				if err != nil {
 					return err
 				}
@@ -212,7 +212,7 @@ func readState(in io.Reader, file string) ([]byte, error) {
 	return body, nil
 }
 
-func stateLines(body []byte) []byte {
+func GetStateLines(body []byte) []byte {
 	var wrapped struct {
 		Data      []json.RawMessage `json:"data"`
 		RequestID *string           `json:"request_id"`
