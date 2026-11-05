@@ -54,7 +54,7 @@ type Operation struct {
 	InputSchema  map[string]any
 	OutputSchema map[string]any
 	Route        echo.HandlerFunc
-	call         func(ctx echo.Context, arguments json.RawMessage) (any, int, error)
+	call         func(ctx echo.Context, arguments json.RawMessage) (structured, int, error)
 }
 
 type List[T any] struct {
@@ -73,6 +73,31 @@ type lister interface {
 	rows() (any, int)
 }
 
+type Answer[T any] struct {
+	Data   T
+	Status int
+	Count  *int
+}
+
+func (a Answer[T]) answered() (any, int, *int) {
+	return a.Data, a.Status, a.Count
+}
+
+type answerer interface {
+	answered() (any, int, *int)
+}
+
+func counted(out any) (any, int) {
+	if listed, ok := out.(lister); ok {
+		return listed.rows()
+	}
+	value := reflect.ValueOf(out)
+	if value.Kind() == reflect.Slice || value.Kind() == reflect.Array {
+		return out, value.Len()
+	}
+	return out, 1
+}
+
 type bounder interface {
 	Bound(ctx echo.Context, target any) error
 }
@@ -86,21 +111,6 @@ var (
 )
 
 func Define[In any, Out any](spec Spec, service func(ctx echo.Context, in In) (Out, error)) Operation {
-	run := func(ctx echo.Context, in In) (any, int, error) {
-		out, err := service(ctx, in)
-		if err != nil {
-			return nil, 0, err
-		}
-		if listed, ok := any(out).(lister); ok {
-			rows, total := listed.rows()
-			return rows, total, nil
-		}
-		value := reflect.ValueOf(out)
-		if value.Kind() == reflect.Slice || value.Kind() == reflect.Array {
-			return out, value.Len(), nil
-		}
-		return out, 1, nil
-	}
 	status := spec.Status
 	switch {
 	case status != 0:
@@ -108,6 +118,26 @@ func Define[In any, Out any](spec Spec, service func(ctx echo.Context, in In) (O
 		status = http.StatusCreated
 	default:
 		status = http.StatusOK
+	}
+	run := func(ctx echo.Context, in In) (structured, int, int, error) {
+		out, err := service(ctx, in)
+		if err != nil {
+			return structured{}, 0, 0, err
+		}
+		answer, answered := any(out).(answerer)
+		if !answered {
+			value, count := counted(out)
+			return structured{Data: value}, count, status, nil
+		}
+		data, chosen, override := answer.answered()
+		value, count := counted(data)
+		if chosen == 0 {
+			chosen = status
+		}
+		if override != nil {
+			count = *override
+		}
+		return structured{Data: value, Status: chosen, Count: &count}, count, chosen, nil
 	}
 	inputs := inputsOf(reflect.TypeFor[In](), nil)
 	for i, input := range inputs {
@@ -131,30 +161,31 @@ func Define[In any, Out any](spec Spec, service func(ctx echo.Context, in In) (O
 			if err := bind(ctx, &in, inputs); err != nil {
 				return refuse(ctx, spec.Name, invalid(spec, err))
 			}
-			value, count, err := run(ctx, in)
+			value, count, chosen, err := run(ctx, in)
 			switch {
 			case err != nil:
 				return refuse(ctx, spec.Name, err)
-			case status == http.StatusNoContent && !respond.Streaming(ctx):
-				return ctx.NoContent(status)
-			case status == http.StatusNoContent:
-				return respond.NoContent(ctx, status)
+			case chosen == http.StatusNoContent && !respond.Streaming(ctx):
+				return ctx.NoContent(chosen)
+			case chosen == http.StatusNoContent:
+				return respond.NoContent(ctx, chosen)
 			}
-			return respond.JSON(ctx, status, value, count)
+			return respond.JSON(ctx, chosen, value.Data, count)
 		},
-		call: func(ctx echo.Context, arguments json.RawMessage) (any, int, error) {
+		call: func(ctx echo.Context, arguments json.RawMessage) (structured, int, error) {
 			var in In
 			if len(arguments) > 0 {
 				if err := json.Unmarshal(arguments, &in); err != nil {
-					return nil, 0, invalid(spec, err)
+					return structured{}, 0, invalid(spec, err)
 				}
 			}
 			if input, found := undecoded(inputs); found {
 				reflect.ValueOf(&in).Elem().FieldByIndex(input.index).SetZero()
 			} else if err := recorded(ctx, &in, inputs, arguments); err != nil {
-				return nil, 0, invalid(spec, err)
+				return structured{}, 0, invalid(spec, err)
 			}
-			return run(ctx, in)
+			value, count, _, err := run(ctx, in)
+			return value, count, err
 		},
 	}
 	return operation
@@ -485,14 +516,22 @@ func fieldTypes(t reflect.Type) map[string]reflect.Type {
 }
 
 func GetOutputSchema(t reflect.Type) map[string]any {
+	properties := map[string]any{}
+	if t.Kind() == reflect.Struct && t.Implements(reflect.TypeFor[answerer]()) {
+		field, _ := t.FieldByName("Data")
+		t = field.Type
+		properties["status"] = map[string]any{"type": "integer"}
+		properties["count"] = map[string]any{"type": "integer"}
+	}
 	data := schemaOf(t, map[reflect.Type]bool{})
 	if t.Implements(reflect.TypeFor[lister]()) {
 		rows, _ := reflect.Zero(t).Interface().(lister).rows()
 		data = schemaOf(reflect.TypeOf(rows), map[reflect.Type]bool{})
 	}
+	properties["data"] = data
 	return map[string]any{
 		"type":       "object",
-		"properties": map[string]any{"data": data},
+		"properties": properties,
 		"required":   []string{"data"},
 	}
 }

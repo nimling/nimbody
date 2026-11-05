@@ -35,7 +35,9 @@ type paging struct {
 }
 
 type structured struct {
-	Data any `json:"data"`
+	Data   any  `json:"data"`
+	Status int  `json:"status,omitempty"`
+	Count  *int `json:"count,omitempty"`
 }
 
 func base(ctx echo.Context) string {
@@ -252,7 +254,7 @@ func (s *Server) invoke(ctx echo.Context, operation Operation, arguments json.Ra
 		return callResult{Content: []content{{Type: "text", Text: "the server failed on " + operation.Name}}, IsError: true}
 	}
 
-	decoded, err := shape.Decode(value)
+	decoded, err := shape.Decode(value.Data)
 	if err != nil {
 		return callResult{Content: []content{{Type: "text", Text: err.Error()}}, IsError: true}
 	}
@@ -281,10 +283,10 @@ func (s *Server) invoke(ctx echo.Context, operation Operation, arguments json.Ra
 		}
 		out.WriteString(line + ", or narrow with fields or limit\n")
 	}
-	return callResult{Content: []content{{Type: "text", Text: out.String()}}, StructuredContent: structured{Data: value}}
+	return callResult{Content: []content{{Type: "text", Text: out.String()}}, StructuredContent: value}
 }
 
-func (s *Server) dispatch(ctx echo.Context, operation Operation, arguments json.RawMessage, values map[string]any, page paging, onStep func(respond.Step)) (any, int, error) {
+func (s *Server) dispatch(ctx echo.Context, operation Operation, arguments json.RawMessage, values map[string]any, page paging, onStep func(respond.Step)) (structured, int, error) {
 	given := map[string]string{}
 	var names, params []string
 	query := url.Values{}
@@ -340,7 +342,7 @@ func (s *Server) dispatch(ctx echo.Context, operation Operation, arguments json.
 	}
 	route, err := operation.pick(given)
 	if err != nil {
-		return nil, 0, err
+		return structured{}, 0, err
 	}
 	path := route
 	for name, value := range given {
@@ -396,7 +398,7 @@ func (s *Server) dispatch(ctx echo.Context, operation Operation, arguments json.
 		}
 	}()
 
-	var value any
+	var value structured
 	var total int
 	reached := false
 	handler := func(inner echo.Context) error {
@@ -409,9 +411,9 @@ func (s *Server) dispatch(ctx echo.Context, operation Operation, arguments json.
 	}
 	if failed := handler(ctx); !reached {
 		if failed != nil {
-			return nil, 0, failed
+			return structured{}, 0, failed
 		}
-		return nil, 0, recorder.rejection()
+		return structured{}, 0, recorder.rejection()
 	}
 	return value, total, err
 }

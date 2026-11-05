@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -811,4 +812,114 @@ func TestOperationCommandSendsTheRawBodyAsGiven(t *testing.T) {
 		cmd.SetArgs(args)
 		assert.Error(t, cmd.Execute(), args)
 	}
+}
+
+type syncRun struct {
+	ID      string   `json:"id"`
+	Mappers []string `json:"mappers"`
+}
+
+func answerService() (*echo.Echo, []mcp.Operation) {
+	post := mcp.Define(mcp.Spec{Name: "mapper_create", Description: "Add a mapper, or answer the one with the same name", Method: http.MethodPost, Path: "/mappers", Access: mcp.AccessWrite},
+		func(ctx echo.Context, in articleCreate) (mcp.Answer[article], error) {
+			if in.Title == "existing" {
+				return mcp.Answer[article]{Data: article{ID: "old", Title: in.Title}, Status: http.StatusOK}, nil
+			}
+			return mcp.Answer[article]{Data: article{ID: "new", Title: in.Title}}, nil
+		})
+	sync := mcp.Define(mcp.Spec{Name: "node_sync", Description: "Sync a node", Method: http.MethodPost, Path: "/nodes/:node_id/sync", Status: http.StatusOK, Access: mcp.AccessWrite},
+		func(ctx echo.Context, in struct {
+			NodeID string `param:"node_id" json:"node_id"`
+		}) (mcp.Answer[syncRun], error) {
+			run := syncRun{ID: in.NodeID, Mappers: []string{"m1", "m2", "m3"}}
+			count := len(run.Mappers)
+			return mcp.Answer[syncRun]{Data: run, Count: &count}, nil
+		})
+	test := mcp.Define(mcp.Spec{Name: "node_test", Description: "Test a node", Method: http.MethodPost, Path: "/nodes/:node_id/test", Status: http.StatusOK, Access: mcp.AccessWrite},
+		func(ctx echo.Context, in struct {
+			NodeID string `param:"node_id" json:"node_id"`
+		}) (mcp.Answer[[]string], error) {
+			one := 1
+			return mcp.Answer[[]string]{Data: []string{"a", "b", "c"}, Count: &one}, nil
+		})
+	objects := mcp.Define(mcp.Spec{Name: "provider_object_get", Description: "Read provider objects", Method: http.MethodGet, Path: "/providers/:provider_id/objects", Access: mcp.AccessRead},
+		func(ctx echo.Context, in struct {
+			ProviderID string `param:"provider_id" json:"provider_id"`
+		}) (mcp.Answer[[]article], error) {
+			none := 0
+			return mcp.Answer[[]article]{Data: []article{{ID: "a"}, {ID: "b"}}, Count: &none}, nil
+		})
+	operations := []mcp.Operation{post, sync, test, objects}
+	e := echo.New()
+	mcp.Route(e.Group("/api"), operations...)
+	server := &mcp.Server{Name: "demo", Version: "v1", Operations: operations, AuthorizationServer: "https://auth.example.test"}
+	server.Mount(e)
+	return e, operations
+}
+
+func TestDefineStatusIsTheServicesPerCall(t *testing.T) {
+	e, _ := answerService()
+	for title, want := range map[string]int{"fresh": http.StatusCreated, "existing": http.StatusOK} {
+		rec := serveRoute(e, http.MethodPost, "/api/mappers", nil, `{"title":"`+title+`"}`)
+		assert.Equal(t, want, rec.Code, title)
+		envelope := routeEnvelope(t, rec)
+		assert.Equal(t, title, envelope["data"].(map[string]any)["title"], title)
+		assert.Equal(t, float64(1), envelope["count"], title)
+
+		streamed := serveRoute(e, http.MethodPost, "/api/mappers", map[string]string{echo.HeaderAccept: respond.MIMEEventStream}, `{"title":"`+title+`"}`)
+		assert.Equal(t, http.StatusOK, streamed.Code, title)
+		assert.Contains(t, streamed.Body.String(), `"status":`+strconv.Itoa(want), title)
+
+		called := callTool(t, e, "mapper_create", `{"title":"`+title+`"}`)
+		assert.Nil(t, called["isError"], title)
+		content := called["structuredContent"].(map[string]any)
+		assert.Equal(t, float64(want), content["status"], title)
+		assert.Equal(t, float64(1), content["count"], title)
+		assert.Equal(t, title, content["data"].(map[string]any)["title"], title)
+	}
+
+	var chain int
+	plain, _ := routeService(&chain)
+	called := callTool(t, plain, "source_test", `{"source_id":"7","app_slug":"portal"}`)
+	assert.NotContains(t, called["structuredContent"], "status")
+	assert.NotContains(t, called["structuredContent"], "count")
+}
+
+func TestDefineCountIsTheServicesOnBothTransports(t *testing.T) {
+	e, operations := answerService()
+	for name, want := range map[string]struct {
+		method string
+		path   string
+		count  float64
+		rows   int
+	}{
+		"node_sync":           {http.MethodPost, "/api/nodes/n1/sync", 3, -1},
+		"node_test":           {http.MethodPost, "/api/nodes/n1/test", 1, 3},
+		"provider_object_get": {http.MethodGet, "/api/providers/p1/objects", 0, 2},
+	} {
+		rec := serveRoute(e, want.method, want.path, nil, "")
+		assert.Equal(t, http.StatusOK, rec.Code, name)
+		envelope := routeEnvelope(t, rec)
+		assert.Equal(t, want.count, envelope["count"], name)
+		if want.rows >= 0 {
+			assert.Len(t, envelope["data"], want.rows, name)
+		}
+
+		called := callTool(t, e, name, `{"node_id":"n1","provider_id":"p1"}`)
+		assert.Nil(t, called["isError"], name)
+		content := called["structuredContent"].(map[string]any)
+		assert.Equal(t, float64(http.StatusOK), content["status"], name)
+		assert.Equal(t, want.count, content["count"], name)
+		if want.rows >= 0 {
+			assert.Len(t, content["data"], want.rows, name)
+		}
+	}
+	assert.Equal(t, []any{"m1", "m2", "m3"}, routeEnvelope(t, serveRoute(e, http.MethodPost, "/api/nodes/n1/sync", nil, ""))["data"].(map[string]any)["mappers"])
+
+	properties := operations[1].OutputSchema["properties"].(map[string]any)
+	assert.Equal(t, map[string]any{"type": "integer"}, properties["status"])
+	assert.Equal(t, map[string]any{"type": "integer"}, properties["count"])
+	assert.Contains(t, properties["data"].(map[string]any)["properties"], "mappers")
+	assert.Equal(t, []string{"data"}, operations[1].OutputSchema["required"])
+	assert.Equal(t, []string{"array", "null"}, operations[3].OutputSchema["properties"].(map[string]any)["data"].(map[string]any)["type"])
 }
