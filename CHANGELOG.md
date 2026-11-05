@@ -14,6 +14,7 @@
 10. `terraform`: `<cli> terraform package` writes the release files, a zip per platform, the `SHA256SUMS` to sign and a tar.gz per module in `deploy/terraform/<module>/<system>/`; the provider namespace defaults to `samna`.
 11. `endpoint`: `Mount` with a `Set` mounts the common endpoint set, `/status`, `/status/health`, `/state`, `/mcp` and the Terraform registry, beside the service's own `/api`.
 12. Module: `golang.org/x/crypto` is a direct requirement, for the test of the signed sums under `test/` only.
+13. `cli`: `config set --config <name> key=value` creates a named config that does not exist yet, as the refusal's hint says; `Load` no longer refuses the unknown name for that one command, and every other command still refuses it with the same message and hint.
 
 ## v1.0.0
 
