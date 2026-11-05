@@ -31,16 +31,8 @@ const (
 	KeyClientID     = "client_id"
 	KeyClientSecret = "client_secret"
 
-	PathLogin     = "/api/auth/login"
-	PathCliLogin  = "/api/auth/cli/login"
-	PathCliToken  = "/api/auth/cli/token"
-	PathCliRevoke = "/api/auth/cli/revoke"
-	PathToken     = "/api/auth/oauth/token"
-	PathIdentity  = "/api/me"
-	PathStatus    = "/status"
-	PathHealth    = "/status/health"
-
-	HeaderAppSlug = "SAuth-App-Slug"
+	PathStatus = "/status"
+	PathHealth = "/status/health"
 
 	tokenSkew = 30 * time.Second
 )
@@ -50,8 +42,10 @@ type Client struct {
 	Product      string
 	Version      func() string
 	LoginPath    string
-	Exchange     string
+	TokenPath    string
+	RevokePath   string
 	IdentityPath string
+	Exchange     string
 	HealthPath   string
 	AppHeader    string
 	HTTP         *http.Client
@@ -168,7 +162,7 @@ func (c *Client) refresh(ctx context.Context) (Token, error) {
 		return Token{}, c.unauthenticated()
 	}
 	var tokens cliTokens
-	if err := c.postForm(ctx, c.Endpoint(), PathCliToken, url.Values{"grant_type": {"refresh_token"}, "refresh_token": {c.cred.RefreshToken}}, &tokens); err != nil {
+	if err := c.postForm(ctx, c.Endpoint(), c.TokenPath, url.Values{"grant_type": {"refresh_token"}, "refresh_token": {c.cred.RefreshToken}}, &tokens); err != nil {
 		return Token{}, Unauthenticated(err.Error(), "Run '"+c.name()+" login' again.")
 	}
 	if tokens.RefreshToken != "" {
@@ -260,8 +254,8 @@ func (c *Client) UserAgent() string {
 
 func (c *Client) headers(req *http.Request) {
 	req.Header.Set("User-Agent", c.UserAgent())
-	if slug := c.Settings.Get(KeyAppSlug); slug != "" {
-		req.Header.Set(firstSet(c.AppHeader, HeaderAppSlug), slug)
+	if slug := c.Settings.Get(KeyAppSlug); slug != "" && c.AppHeader != "" {
+		req.Header.Set(c.AppHeader, slug)
 	}
 }
 
@@ -415,9 +409,40 @@ func (c *Client) Remote(ctx context.Context) (string, string, error) {
 	return c.Endpoint() + mcp.MountPath, token.AccessToken, nil
 }
 
-func (c *Client) Mount(root *cobra.Command) {
+func (c *Client) Mount(root *cobra.Command) error {
+	if err := c.Validate(); err != nil {
+		return err
+	}
 	root.AddCommand(c.LoginCommand(), c.LogoutCommand(), c.StatusCommand(), c.TokenCommand(), APICommand(c.Send, c.output()))
 	if Bridge == nil {
 		Bridge = c.Remote
 	}
+	return nil
+}
+
+func (c *Client) Validate() error {
+	if c.Settings == nil {
+		return errors.New("cli.Client needs Settings")
+	}
+	var missing []string
+	for _, field := range []struct{ name, value string }{
+		{"LoginPath", c.LoginPath},
+		{"TokenPath", c.TokenPath},
+		{"RevokePath", c.RevokePath},
+		{"IdentityPath", c.IdentityPath},
+		{"AppHeader", c.AppHeader},
+	} {
+		if field.value == "" {
+			missing = append(missing, field.name)
+		}
+	}
+	if len(missing) > 0 {
+		return errors.New("cli.Client needs " + strings.Join(missing, ", ") + ": the cli names its own login, token, revoke and identity paths and its app header")
+	}
+	for _, path := range []string{c.LoginPath, c.TokenPath, c.RevokePath, c.IdentityPath, firstSet(c.Exchange, "/")} {
+		if !strings.HasPrefix(path, "/") {
+			return errors.New("cli.Client paths start with a slash, got " + path)
+		}
+	}
+	return nil
 }

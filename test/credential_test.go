@@ -204,7 +204,9 @@ func clientTree(settings *cli.Settings, client *cli.Client) (*cobra.Command, *by
 	root.PersistentFlags().Bool("json", false, "json")
 	root.PersistentPreRunE = func(cmd *cobra.Command, args []string) error { return settings.Load(cmd) }
 	previous := cli.Bridge
-	client.Mount(root)
+	if err := client.Mount(root); err != nil {
+		panic(err)
+	}
 	cli.Bridge = previous
 	var stdout, stderr bytes.Buffer
 	root.SetOut(&stdout)
@@ -215,7 +217,7 @@ func clientTree(settings *cli.Settings, client *cli.Client) (*cobra.Command, *by
 func TestLoginPastedCodeStoresARefreshableLogin(t *testing.T) {
 	service := newAuthService(t, false)
 	settings := credentialSettings(t, nil)
-	client := &cli.Client{Settings: settings, Version: func() string { return "v1.2.3" }}
+	client := &cli.Client{LoginPath: "/api/auth/login", TokenPath: "/api/auth/cli/token", RevokePath: "/api/auth/cli/revoke", IdentityPath: "/api/me", AppHeader: "X-App-Slug", Settings: settings, Version: func() string { return "v1.2.3" }}
 	root, stdout, stderr := clientTree(settings, client)
 	root.SetIn(strings.NewReader("abc\n"))
 	root.SetArgs([]string{"login", "--no-browser"})
@@ -232,7 +234,7 @@ func TestLoginPastedCodeStoresARefreshableLogin(t *testing.T) {
 	cred.AccessExpiresAt = time.Now().Add(-time.Minute)
 	_, err = settings.PutCredential(cred)
 	require.NoError(t, err)
-	fresh := &cli.Client{Settings: settings, Version: func() string { return "v1.2.3" }}
+	fresh := &cli.Client{LoginPath: "/api/auth/login", TokenPath: "/api/auth/cli/token", RevokePath: "/api/auth/cli/revoke", IdentityPath: "/api/me", AppHeader: "X-App-Slug", Settings: settings, Version: func() string { return "v1.2.3" }}
 	_, err = fresh.Send(nil, http.MethodGet, "/api/things", nil, "", nil)
 	require.NoError(t, err)
 	assert.Equal(t, int32(1), service.refreshes.Load())
@@ -240,7 +242,7 @@ func TestLoginPastedCodeStoresARefreshableLogin(t *testing.T) {
 	cred, _ = settings.GetCredential(service.server.URL, "")
 	assert.Equal(t, "refresh-2", cred.RefreshToken, "the rotated refresh token is stored")
 
-	root, stdout, _ = clientTree(settings, &cli.Client{Settings: settings})
+	root, stdout, _ = clientTree(settings, &cli.Client{LoginPath: "/api/auth/login", TokenPath: "/api/auth/cli/token", RevokePath: "/api/auth/cli/revoke", IdentityPath: "/api/me", AppHeader: "X-App-Slug", Settings: settings})
 	root.SetArgs([]string{"status", "--json"})
 	require.NoError(t, root.Execute())
 	var status cli.Status
@@ -249,7 +251,7 @@ func TestLoginPastedCodeStoresARefreshableLogin(t *testing.T) {
 	assert.Equal(t, "u-1", status.Subject)
 	assert.JSONEq(t, `{"healthy":true}`, string(status.Health))
 
-	root, _, stderr = clientTree(settings, &cli.Client{Settings: settings})
+	root, _, stderr = clientTree(settings, &cli.Client{LoginPath: "/api/auth/login", TokenPath: "/api/auth/cli/token", RevokePath: "/api/auth/cli/revoke", IdentityPath: "/api/me", AppHeader: "X-App-Slug", Settings: settings})
 	root.SetArgs([]string{"logout"})
 	require.NoError(t, root.Execute())
 	assert.Contains(t, stderr.String(), "ended the session at")
@@ -274,7 +276,7 @@ func TestLoginLoopbackTakesTheCodeBack(t *testing.T) {
 		}()
 		return nil
 	}
-	root, _, stderr := clientTree(settings, &cli.Client{Settings: settings})
+	root, _, stderr := clientTree(settings, &cli.Client{LoginPath: "/api/auth/login", TokenPath: "/api/auth/cli/token", RevokePath: "/api/auth/cli/revoke", IdentityPath: "/api/me", AppHeader: "X-App-Slug", Settings: settings})
 	root.SetArgs([]string{"login"})
 	require.NoError(t, root.Execute(), stderr.String())
 	_, err := settings.GetCredential(service.server.URL, "")
@@ -285,13 +287,13 @@ func TestClientTokenFromTheEnvironmentForCI(t *testing.T) {
 	service := newAuthService(t, false)
 	settings := credentialSettings(t, nil)
 	t.Setenv("DEMO_ACCESS_TOKEN", "from-ci")
-	client := &cli.Client{Settings: settings}
+	client := &cli.Client{LoginPath: "/api/auth/login", TokenPath: "/api/auth/cli/token", RevokePath: "/api/auth/cli/revoke", IdentityPath: "/api/me", AppHeader: "X-App-Slug", Settings: settings}
 	assert.Equal(t, cli.AuthToken, client.Mode())
 	_, err := client.Send(nil, http.MethodGet, "/api/things", nil, "", nil)
 	require.NoError(t, err)
 	assert.True(t, strings.HasPrefix(service.seen.Load().(string), "Bearer from-ci "))
 	t.Setenv("DEMO_TOKEN", "preferred")
-	assert.Equal(t, "preferred", (&cli.Client{Settings: settings}).EnvToken())
+	assert.Equal(t, "preferred", (&cli.Client{LoginPath: "/api/auth/login", TokenPath: "/api/auth/cli/token", RevokePath: "/api/auth/cli/revoke", IdentityPath: "/api/me", AppHeader: "X-App-Slug", Settings: settings}).EnvToken())
 }
 
 func TestClientMachinePairIsBasicToTheService(t *testing.T) {
@@ -299,7 +301,7 @@ func TestClientMachinePairIsBasicToTheService(t *testing.T) {
 	settings := credentialSettings(t, nil)
 	t.Setenv("DEMO_CLIENT_ID", "machine")
 	t.Setenv("DEMO_CLIENT_SECRET", "s3cret")
-	client := &cli.Client{Settings: settings}
+	client := &cli.Client{LoginPath: "/api/auth/login", TokenPath: "/api/auth/cli/token", RevokePath: "/api/auth/cli/revoke", IdentityPath: "/api/me", AppHeader: "X-App-Slug", Settings: settings}
 	assert.Equal(t, cli.AuthClient, client.Mode())
 	_, err := client.Send(nil, http.MethodGet, "/api/things", nil, "", nil)
 	require.NoError(t, err)
@@ -323,7 +325,7 @@ func TestClientProphetExchangeIsSharedAcrossRuns(t *testing.T) {
 		group.Add(1)
 		go func() {
 			defer group.Done()
-			client := &cli.Client{Settings: settings, Exchange: cli.PathToken}
+			client := &cli.Client{LoginPath: "/api/auth/login", TokenPath: "/api/auth/cli/token", RevokePath: "/api/auth/cli/revoke", IdentityPath: "/api/me", AppHeader: "X-App-Slug", Settings: settings, Exchange: "/api/auth/oauth/token"}
 			_, err := client.Send(nil, http.MethodGet, "/api/things", nil, "", nil)
 			assert.NoError(t, err)
 		}()
@@ -337,11 +339,11 @@ func TestClientProphetExchangeIsSharedAcrossRuns(t *testing.T) {
 	cached.AccessToken = "stale"
 	_, err = settings.PutCredential(cached)
 	require.NoError(t, err)
-	_, err = (&cli.Client{Settings: settings, Exchange: cli.PathToken}).Send(nil, http.MethodGet, "/api/things", nil, "", nil)
+	_, err = (&cli.Client{LoginPath: "/api/auth/login", TokenPath: "/api/auth/cli/token", RevokePath: "/api/auth/cli/revoke", IdentityPath: "/api/me", AppHeader: "X-App-Slug", Settings: settings, Exchange: "/api/auth/oauth/token"}).Send(nil, http.MethodGet, "/api/things", nil, "", nil)
 	require.NoError(t, err, "a cached token the service refuses is exchanged again once")
 	assert.Equal(t, int32(2), service.exchanges.Load())
 
-	endpoint, token, err := (&cli.Client{Settings: settings, Exchange: cli.PathToken}).Remote(context.Background())
+	endpoint, token, err := (&cli.Client{LoginPath: "/api/auth/login", TokenPath: "/api/auth/cli/token", RevokePath: "/api/auth/cli/revoke", IdentityPath: "/api/me", AppHeader: "X-App-Slug", Settings: settings, Exchange: "/api/auth/oauth/token"}).Remote(context.Background())
 	require.NoError(t, err)
 	assert.Equal(t, service.server.URL+"/mcp", endpoint)
 	assert.Equal(t, "exchanged", token)
@@ -351,12 +353,12 @@ func TestClientRemoteBridgesOnlyWhenTheServiceServesMCP(t *testing.T) {
 	newAuthService(t, false)
 	settings := credentialSettings(t, nil)
 	t.Setenv("DEMO_TOKEN", "from-ci")
-	endpoint, _, err := (&cli.Client{Settings: settings}).Remote(context.Background())
+	endpoint, _, err := (&cli.Client{LoginPath: "/api/auth/login", TokenPath: "/api/auth/cli/token", RevokePath: "/api/auth/cli/revoke", IdentityPath: "/api/me", AppHeader: "X-App-Slug", Settings: settings}).Remote(context.Background())
 	assert.NoError(t, err)
 	assert.Empty(t, endpoint, "no /mcp on the service, the tools stay local")
 
 	service := newAuthService(t, true)
-	endpoint, token, err := (&cli.Client{Settings: settings}).Remote(context.Background())
+	endpoint, token, err := (&cli.Client{LoginPath: "/api/auth/login", TokenPath: "/api/auth/cli/token", RevokePath: "/api/auth/cli/revoke", IdentityPath: "/api/me", AppHeader: "X-App-Slug", Settings: settings}).Remote(context.Background())
 	assert.NoError(t, err)
 	assert.Equal(t, service.server.URL+"/mcp", endpoint)
 	assert.Equal(t, "from-ci", token)
@@ -365,7 +367,14 @@ func TestClientRemoteBridgesOnlyWhenTheServiceServesMCP(t *testing.T) {
 func TestClientWithoutCredentialIsNotAuthenticated(t *testing.T) {
 	newAuthService(t, false)
 	settings := credentialSettings(t, nil)
-	_, err := (&cli.Client{Settings: settings}).Send(nil, http.MethodGet, "/api/things", nil, "", nil)
+	_, err := (&cli.Client{LoginPath: "/api/auth/login", TokenPath: "/api/auth/cli/token", RevokePath: "/api/auth/cli/revoke", IdentityPath: "/api/me", AppHeader: "X-App-Slug", Settings: settings}).Send(nil, http.MethodGet, "/api/things", nil, "", nil)
 	assert.Equal(t, cli.ExitUnauthenticated, cli.ExitCode(err))
 	assert.Contains(t, err.(*cli.Error).Hint, "demo login")
+}
+
+func TestClientMountNamesTheMissingPaths(t *testing.T) {
+	err := (&cli.Client{Settings: &cli.Settings{Name: "demo"}, LoginPath: "/login"}).Mount(&cobra.Command{Use: "demo"})
+	assert.EqualError(t, err, "cli.Client needs TokenPath, RevokePath, IdentityPath, AppHeader: the cli names its own login, token, revoke and identity paths and its app header")
+	err = (&cli.Client{Settings: &cli.Settings{Name: "demo"}, LoginPath: "login", TokenPath: "/t", RevokePath: "/r", IdentityPath: "/me", AppHeader: "X-App"}).Mount(&cobra.Command{Use: "demo"})
+	assert.EqualError(t, err, "cli.Client paths start with a slash, got login")
 }

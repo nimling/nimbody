@@ -93,7 +93,7 @@ func (c *Client) GetLoginURL(challenge, redirect, state string) string {
 		query.Set("cli_redirect", redirect)
 		query.Set("cli_state", state)
 	}
-	return c.Endpoint() + firstSet(c.LoginPath, PathLogin) + "?" + query.Encode()
+	return c.Endpoint() + c.LoginPath + "?" + query.Encode()
 }
 
 func (c *Client) page(title, message string, failed bool) []byte {
@@ -230,6 +230,9 @@ func (c *Client) LoginCommand() *cobra.Command {
 		Example: c.name() + " login --no-browser",
 		Args:    cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if err := c.Validate(); err != nil {
+				return err
+			}
 			if c.Endpoint() == "" {
 				return Unauthenticated("no endpoint in config "+c.Settings.Loaded.Config, "Run '"+c.name()+" config set endpoint=https://...'.")
 			}
@@ -242,7 +245,7 @@ func (c *Client) LoginCommand() *cobra.Command {
 				return err
 			}
 			var tokens cliTokens
-			if err := c.postForm(cmd.Context(), c.Endpoint(), PathCliToken, url.Values{"grant_type": {"authorization_code"}, "code": {code}, "code_verifier": {verifier}}, &tokens); err != nil {
+			if err := c.postForm(cmd.Context(), c.Endpoint(), c.TokenPath, url.Values{"grant_type": {"authorization_code"}, "code": {code}, "code_verifier": {verifier}}, &tokens); err != nil {
 				return Unauthenticated(err.Error(), "Run '"+c.name()+" login' again.")
 			}
 			c.resolved, c.mode, c.token = true, AuthLogin, ""
@@ -251,7 +254,7 @@ func (c *Client) LoginCommand() *cobra.Command {
 				return err
 			}
 			errOut := cmd.ErrOrStderr()
-			if body, err := c.Send(cmd, http.MethodGet, firstSet(c.IdentityPath, PathIdentity), nil, "", nil); err == nil {
+			if body, err := c.Send(cmd, http.MethodGet, c.IdentityPath, nil, "", nil); err == nil {
 				var who identity
 				var wrapped struct {
 					Data json.RawMessage `json:"data"`
@@ -309,7 +312,7 @@ func (c *Client) LogoutCommand() *cobra.Command {
 			errOut := cmd.ErrOrStderr()
 			for _, cred := range creds {
 				ctx, cancel := context.WithTimeout(cmd.Context(), logoutTimeout)
-				err := c.postForm(ctx, cred.Endpoint, PathCliRevoke, url.Values{"token": {cred.RefreshToken}, "token_type_hint": {"refresh_token"}}, nil)
+				err := c.postForm(ctx, cred.Endpoint, c.RevokePath, url.Values{"token": {cred.RefreshToken}, "token_type_hint": {"refresh_token"}}, nil)
 				cancel()
 				if err != nil {
 					fmt.Fprintln(errOut, StyleFor(errOut).Warn("the session at "+cred.Endpoint+" was not ended: "+err.Error()))
@@ -367,7 +370,7 @@ func (c *Client) StatusCommand() *cobra.Command {
 			}
 			report.Health = envelopeData(health)
 			if report.Auth != AuthClient {
-				if who, err := c.Send(cmd, http.MethodGet, firstSet(c.IdentityPath, PathIdentity), nil, "", nil); err == nil {
+				if who, err := c.Send(cmd, http.MethodGet, c.IdentityPath, nil, "", nil); err == nil {
 					report.Identity = envelopeData(who)
 				}
 			}

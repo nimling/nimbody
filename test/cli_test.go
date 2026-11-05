@@ -548,7 +548,7 @@ func TestCLIVersionPrintsTheBuildAndTheServer(t *testing.T) {
 
 	newAuthService(t, false)
 	settings := credentialSettings(t, nil)
-	server, err := (&cli.Client{Settings: settings}).GetServerVersion(context.Background())
+	server, err := (&cli.Client{LoginPath: "/api/auth/login", TokenPath: "/api/auth/cli/token", RevokePath: "/api/auth/cli/revoke", IdentityPath: "/api/me", AppHeader: "X-App-Slug", Settings: settings}).GetServerVersion(context.Background())
 	assert.NoError(t, err)
 	assert.Equal(t, "v9.9.9", server)
 }
