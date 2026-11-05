@@ -42,6 +42,7 @@
 38. `cli`: `cli.Version` is the one ldflags symbol, `-X github.com/nimling/nimbody/cli.Version=v1.2.3`; `GetVersion` answers it, or the module version a `go install …@version` build carries, or `dev`.
 39. `cli`: `VersionCommand(server)` prints `{version, server}`, the server's from the function given, `Client.GetServerVersion` reading `GET /status` for an api cli and nil for a tool cli; an unreachable server is a warning on stderr, never a failure.
 40. `cli`: `Notifier` is the update notifier. `Mount` checks `Latest` at most once per `Every`, a day by default, cached in `~/.<cli>/update.json`, and prints a note on stderr after the command when a newer version is out, only on a terminal and never under mcp or for a `dev` build. `<PREFIX>NO_UPDATE_NOTIFIER` turns it off. `Newer` compares two versions, a release above its prerelease.
+41. `cli`: `--set key=@path` reads the value from a file, then decodes it as json when it parses, as every other `--set` value; in a multipart upload the file's content becomes the form field. An unreadable file is rejected.
 
 ## v1.0.0
 
