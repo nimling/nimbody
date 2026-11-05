@@ -9,24 +9,23 @@ import (
 	"github.com/nimling/nimbody/mcp"
 	"github.com/nimling/nimbody/respond"
 	"github.com/nimling/nimbody/state"
-	"github.com/nimling/nimbody/terraform/registry"
 )
 
 const (
+	APIPath    = "/api"
 	StatusPath = "/status"
 	HealthPath = "/status/health"
-	StatePath  = "/state"
 )
 
 type Set struct {
-	Service   string
-	Version   string
-	Health    func(ctx context.Context) error
-	MCP       *mcp.Server
-	MCPAccess []echo.MiddlewareFunc
-	State     *state.Context
-	Groups    []state.Definition
-	Terraform *registry.Registry
+	Service       string
+	Version       string
+	Health        func(ctx context.Context) error
+	MCP           *mcp.Server
+	MCPAccess     []echo.MiddlewareFunc
+	APIMiddleware []echo.MiddlewareFunc
+	State         *state.Context
+	Groups        []state.Definition
 }
 
 type Status struct {
@@ -40,7 +39,7 @@ type Health struct {
 }
 
 func Mount(e *echo.Echo, set Set) error {
-	status := Status{Service: set.Service, Version: set.Version, Endpoints: []string{"/api", StatusPath}}
+	status := Status{Service: set.Service, Version: set.Version, Endpoints: []string{APIPath, StatusPath}}
 
 	var operations []mcp.Operation
 	if set.State != nil {
@@ -51,8 +50,9 @@ func Mount(e *echo.Echo, set Set) error {
 		if host.Version == "" {
 			host.Version = set.Version
 		}
-		operations = state.Register(e.Group(""), host, set.Groups...)
-		status.Endpoints = append(status.Endpoints, StatePath)
+		operations = state.Register(host, set.APIMiddleware, set.Groups...)
+		mcp.Route(e.Group(APIPath), operations...)
+		status.Endpoints = append(status.Endpoints, APIPath+state.Path)
 	}
 
 	if set.MCP != nil {
@@ -75,18 +75,6 @@ func Mount(e *echo.Echo, set Set) error {
 		}
 		set.MCP.Mount(e, set.MCPAccess...)
 		status.Endpoints = append(status.Endpoints, mcp.MountPath)
-	}
-
-	if set.Terraform != nil {
-		r := *set.Terraform
-		if r.Version == "" {
-			r.Version = set.Version
-		}
-		registry.Mount(e, r)
-		status.Endpoints = append(status.Endpoints, registry.DiscoveryPath, registry.ProvidersPath, registry.ModulesPath)
-		if r.State != nil {
-			status.Endpoints = append(status.Endpoints, registry.StatePath)
-		}
 	}
 
 	e.GET(StatusPath, func(ctx echo.Context) error {

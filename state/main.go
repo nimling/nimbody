@@ -17,6 +17,8 @@ import (
 
 const FormatVersion = "2"
 
+const Path = "/state"
+
 const MIMENDJSON = "application/x-ndjson"
 
 const (
@@ -49,7 +51,6 @@ type Context struct {
 	echo.Context
 	Service     string
 	Version     string
-	Access      echo.MiddlewareFunc
 	Headers     []mcp.Header
 	Transaction func(ctx context.Context, run func(ctx context.Context) error) error
 	Keys        Resolver
@@ -318,7 +319,7 @@ type service struct {
 	byName map[string]group
 }
 
-func Register(router *echo.Group, host Context, definitions ...Definition) []mcp.Operation {
+func newService(host Context, definitions []Definition) *service {
 	s := &service{host: host, byName: map[string]group{}}
 	var declared []group
 	for _, definition := range definitions {
@@ -330,44 +331,47 @@ func Register(router *echo.Group, host Context, definitions ...Definition) []mcp
 		declared = append(declared, defined)
 	}
 	s.groups = ordered(declared, s.byName)
+	return s
+}
 
-	var middleware []echo.MiddlewareFunc
-	if host.Access != nil {
-		middleware = append(middleware, host.Access)
-	}
-	router.GET("/state", s.getDocument, middleware...)
+func GetDocument(service, version string, definitions ...Definition) Document {
+	return newService(Context{Service: service, Version: version}, definitions).document()
+}
+
+func Register(host Context, middleware []echo.MiddlewareFunc, definitions ...Definition) []mcp.Operation {
+	s := newService(host, definitions)
+	chain := append([]echo.MiddlewareFunc{}, middleware...)
 	export := append([]echo.MiddlewareFunc{respond.FrameLimitMiddleware(0)}, middleware...)
-	router.POST("/state/export", s.postExport, export...)
-	router.POST("/state/import", s.postImport, middleware...)
 
-	return []mcp.Operation{
-		mcp.Define(mcp.Spec{Name: "state", Description: "The state schema: every group with its create body schema, dependencies, references, filters, field flags and the format version", Method: http.MethodGet, Path: "/state", Access: mcp.AccessRead, Headers: host.Headers, Middleware: middleware},
-			func(ctx echo.Context, in struct{}) (Document, error) {
-				return s.document(), nil
-			}),
-		mcp.Define(mcp.Spec{Name: "state_export", Description: "Export records by group, filter and keys as state lines, or store the export as an asset and answer its id", Method: http.MethodPost, Path: "/state/export", Access: mcp.AccessRead, Headers: host.Headers, Middleware: export},
-			func(ctx echo.Context, in ExportRequest) (any, error) {
-				file, err := s.export(s.context(ctx), in)
-				if err != nil {
-					return nil, err
-				}
-				if in.Store {
-					return s.store(ctx, file)
-				}
-				return file.Lines()
-			}),
-		mcp.Define(mcp.Spec{Name: "state_import", Description: "Import a stored export by asset id: upsert, create or sync, with deletes by key and a dry run that lists every outcome", Method: http.MethodPost, Path: "/state/import", Access: mcp.AccessDestructive, Headers: host.Headers, Middleware: middleware},
-			func(ctx echo.Context, in ImportRequest) (ImportResponse, error) {
-				if in.AssetID == "" {
-					return ImportResponse{}, echo.NewHTTPError(http.StatusBadRequest, "an import over mcp takes asset_id")
-				}
-				file, err := s.load(ctx, in.AssetID)
-				if err != nil {
-					return ImportResponse{}, err
-				}
-				return s.importFile(s.context(ctx), in, file)
-			}),
-	}
+	schema := mcp.Define(mcp.Spec{Name: "state", Description: "The state schema: every group with its create body schema, dependencies, references, filters, field flags and the format version", Method: http.MethodGet, Path: Path, Access: mcp.AccessRead, Headers: host.Headers, Middleware: chain},
+		func(ctx echo.Context, in struct{}) (Document, error) {
+			return s.document(), nil
+		})
+	exported := mcp.Define(mcp.Spec{Name: "state_export", Description: "Export records by group, filter and keys as state lines, or store the export as an asset and answer its id", Method: http.MethodPost, Path: Path + "/export", Access: mcp.AccessRead, Headers: host.Headers, Middleware: export},
+		func(ctx echo.Context, in ExportRequest) (any, error) {
+			file, err := s.export(s.context(ctx), in)
+			if err != nil {
+				return nil, err
+			}
+			if in.Store {
+				return s.store(ctx, file)
+			}
+			return file.Lines()
+		})
+	exported.Route = s.postExport
+	imported := mcp.Define(mcp.Spec{Name: "state_import", Description: "Import a stored export by asset id: upsert, create or sync, with deletes by key and a dry run that lists every outcome", Method: http.MethodPost, Path: Path + "/import", Access: mcp.AccessDestructive, Headers: host.Headers, Middleware: chain},
+		func(ctx echo.Context, in ImportRequest) (ImportResponse, error) {
+			if in.AssetID == "" {
+				return ImportResponse{}, echo.NewHTTPError(http.StatusBadRequest, "an import over mcp takes asset_id")
+			}
+			file, err := s.load(ctx, in.AssetID)
+			if err != nil {
+				return ImportResponse{}, err
+			}
+			return s.importFile(s.context(ctx), in, file)
+		})
+	imported.Route = s.postImport
+	return []mcp.Operation{schema, exported, imported}
 }
 
 func ordered(declared []group, byName map[string]group) []group {
@@ -424,10 +428,6 @@ func (s *service) document() Document {
 		doc.Groups = append(doc.Groups, entry)
 	}
 	return doc
-}
-
-func (s *service) getDocument(ctx echo.Context) error {
-	return respond.JSON(ctx, http.StatusOK, s.document(), 1)
 }
 
 func (s *service) postExport(ctx echo.Context) error {
