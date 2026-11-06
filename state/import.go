@@ -82,6 +82,24 @@ func (s *service) importFile(c *Context, in ImportRequest, file File) (ImportRes
 		}
 	}
 
+	if mode == ModeSync {
+		if err := s.prune(r, in, file, incoming, removals); err != nil {
+			return ImportResponse{}, err
+		}
+	}
+	for i := len(s.groups) - 1; i >= 0; i-- {
+		g := s.groups[i]
+		if len(removals[g.name]) == 0 {
+			continue
+		}
+		step := "delete:" + g.name
+		c.Steps.Start(step, "delete "+g.name, "")
+		for _, item := range removals[g.name] {
+			r.report(step, "delete "+g.name+" "+item.key, s.deleteRecord(r, g, item))
+		}
+		c.Steps.Done(step, nil)
+	}
+
 	blobs := map[string]map[string][]Blob{}
 	for _, blob := range file.Blobs {
 		if blobs[blob.Group] == nil {
@@ -110,23 +128,6 @@ func (s *service) importFile(c *Context, in ImportRequest, file File) (ImportRes
 		c.Steps.Done(step, nil)
 	}
 
-	if mode == ModeSync {
-		if err := s.prune(r, in, file, incoming, removals); err != nil {
-			return ImportResponse{}, err
-		}
-	}
-	for i := len(s.groups) - 1; i >= 0; i-- {
-		g := s.groups[i]
-		if len(removals[g.name]) == 0 {
-			continue
-		}
-		step := "delete:" + g.name
-		c.Steps.Start(step, "delete "+g.name, "")
-		for _, item := range removals[g.name] {
-			r.report(step, "delete "+g.name+" "+item.key, s.deleteRecord(r, g, item))
-		}
-		c.Steps.Done(step, nil)
-	}
 	return r.out, nil
 }
 
