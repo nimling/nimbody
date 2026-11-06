@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"sort"
 	"strings"
 
 	"github.com/labstack/echo/v4"
@@ -312,13 +313,14 @@ func (g group) secrets(data map[string]any) []string {
 }
 
 type service struct {
-	host   Context
-	groups []group
-	byName map[string]group
+	host     Context
+	groups   []group
+	byName   map[string]group
+	sessions sessions
 }
 
 func Register(router *echo.Group, host Context, definitions ...Definition) []mcp.Operation {
-	s := &service{host: host, byName: map[string]group{}}
+	s := &service{host: host, byName: map[string]group{}, sessions: sessions{items: map[string]*staged{}}}
 	var declared []group
 	for _, definition := range definitions {
 		defined := definition.definition()
@@ -338,6 +340,10 @@ func Register(router *echo.Group, host Context, definitions ...Definition) []mcp
 	export := append([]echo.MiddlewareFunc{respond.FrameLimitMiddleware(0)}, middleware...)
 	router.POST("/state/export", s.postExport, export...)
 	router.POST("/state/import", s.postImport, middleware...)
+	router.POST("/state/import/session", s.postImportSession, middleware...)
+	router.PUT("/state/import/session/:id/part/:part", s.putImportSessionPart, middleware...)
+	router.POST("/state/import/session/:id/commit", s.postImportSessionCommit, middleware...)
+	router.DELETE("/state/import/session/:id", s.deleteImportSession, middleware...)
 
 	return []mcp.Operation{
 		mcp.Define(mcp.Spec{Name: "state", Description: "The state schema: every group with its create body schema, dependencies, references, filters, field flags and the format version", Method: http.MethodGet, Path: "/state", Access: mcp.AccessRead, Middleware: middleware},
@@ -387,6 +393,11 @@ func ordered(declared []group, byName map[string]group) []group {
 				panic("state: group " + g.name + " depends on " + name + ", which is not registered")
 			}
 			visit(dependency, append(path, g.name))
+		}
+		for _, name := range sortedRefTargets(g) {
+			if dependency, ok := byName[name]; ok && name != g.name && state[name] == 0 && !reachesAny(byName, name, append(path, g.name)) {
+				visit(dependency, append(path, g.name))
+			}
 		}
 		state[g.name] = 2
 		out = append(out, g)
@@ -559,4 +570,42 @@ func message(err error) string {
 		}
 	}
 	return err.Error()
+}
+
+func sortedRefTargets(g group) []string {
+	seen := map[string]bool{}
+	out := make([]string, 0, len(g.refs))
+	for _, target := range g.refs {
+		if !seen[target] {
+			seen[target] = true
+			out = append(out, target)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+func dependsOnReaches(byName map[string]group, from, to string, seen map[string]bool) bool {
+	if from == to {
+		return true
+	}
+	if seen[from] {
+		return false
+	}
+	seen[from] = true
+	for _, name := range byName[from].dependsOn {
+		if dependsOnReaches(byName, name, to, seen) {
+			return true
+		}
+	}
+	return false
+}
+
+func reachesAny(byName map[string]group, from string, targets []string) bool {
+	for _, target := range targets {
+		if dependsOnReaches(byName, from, target, map[string]bool{}) {
+			return true
+		}
+	}
+	return false
 }

@@ -617,12 +617,12 @@ func TestStateCommand(t *testing.T) {
 	out, errOut, err = run("state", "import", file, "--dry-run")
 	assert.NoError(t, err)
 	assert.Contains(t, out, `"outcome": "created"`)
-	assert.Equal(t, "upsert dry run, nothing written: 3 created\n", errOut)
+	assert.Equal(t, "location: 2 created\nroom: 1 created\nupsert dry run, nothing written: 3 created\n", errOut)
 	assert.Equal(t, 0, target.writes)
 
 	_, errOut, err = run("state", "import", file, "--mode", "create")
 	assert.NoError(t, err)
-	assert.Equal(t, "create: 3 created\n", errOut)
+	assert.Equal(t, "location: 2 created\nroom: 1 created\ncreate: 3 created\n", errOut)
 
 	_, _, err = run("state", "import", file, "--delete", "room:room-1")
 	assert.Error(t, err)
@@ -754,4 +754,134 @@ func TestStateFieldFlagsByPointer(t *testing.T) {
 
 	withSecret := strings.Replace(unhashed.String(), `"client_id":"public-id"`, `"client_id":"public-id","refresh_token":"new"`, 1)
 	assert.Equal(t, state.OutcomeUpdated, outcomes(importState(t, e, "", []byte(withSecret)))["connection:conn-1"], "a secret sent for the record's own type is always written")
+}
+
+type areaBody struct {
+	Name     string `json:"name"`
+	ParentID string `json:"parent_id,omitempty"`
+}
+
+func areaService(m *memory) *echo.Echo {
+	area := memoryGroup[areaBody](m, "area")
+	area.Schema = map[string]any{"type": "object", "properties": map[string]any{
+		"name":      map[string]any{"type": "string"},
+		"parent_id": map[string]any{"type": "string"},
+	}}
+	area.Refs = map[string]string{"parent_id": "area"}
+	e, _ := stateService(m, area)
+	return e
+}
+
+const areaFile = `{"format":"2","service":"demo","version":"v1.2.3","scope":[{"group":"area"}],"groups":[]}
+{"group":"area","key":"a-lift","data":{"name":"Lift"},"refs":{"parent_id":"m-slope"}}
+{"group":"area","key":"b-run","data":{"name":"Run"},"refs":{"parent_id":"m-slope"}}
+{"group":"area","key":"m-slope","data":{"name":"Slope"},"refs":{"parent_id":"z-mountain"}}
+{"group":"area","key":"z-mountain","data":{"name":"Mountain"}}
+`
+
+func TestStateImportPlacesAPointedLineFirst(t *testing.T) {
+	m := newMemory("b")
+	e := areaService(m)
+	out := importState(t, e, "", []byte(areaFile))
+	assert.Equal(t, map[string]int{state.OutcomeCreated: 4}, out.Counts, "a child named before its parent in the file still lands after it")
+	ids := map[string]string{}
+	for _, result := range out.Results {
+		ids[result.Key] = result.ID
+	}
+	parents := map[string]any{}
+	for _, row := range m.rows["area"] {
+		parents[row.external] = row.data["parent_id"]
+	}
+	assert.Equal(t, ids["m-slope"], parents["a-lift"])
+	assert.Equal(t, ids["z-mountain"], parents["m-slope"])
+}
+
+func TestStateImportSessionCommitsEveryPartInOneRun(t *testing.T) {
+	m := newMemory("b")
+	e := areaService(m)
+
+	rec := call(e, http.MethodPost, "/api/state/import/session", echo.MIMEApplicationJSON, "", []byte(`{}`))
+	require.Equal(t, http.StatusCreated, rec.Code, rec.Body.String())
+	var started struct {
+		Data state.Session `json:"data"`
+	}
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &started))
+	require.NotEmpty(t, started.Data.ID)
+	path := "/api/state/import/session/" + started.Data.ID
+
+	lines := strings.SplitAfter(areaFile, "\n")
+	parts := []string{lines[0] + lines[1] + lines[2], lines[3], lines[4]}
+	for i := len(parts) - 1; i >= 0; i-- {
+		rec := call(e, http.MethodPut, path+"/part/"+strconv.Itoa(i+1), state.MIMENDJSON, "", []byte(parts[i]))
+		require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+	}
+	assert.Equal(t, 0, m.count("area"), "nothing is written before the commit")
+
+	rec = call(e, http.MethodPut, path+"/part/9", state.MIMENDJSON, "", []byte("not json\n"))
+	assert.Equal(t, http.StatusBadRequest, rec.Code, "a part holds whole state lines")
+
+	rec = call(e, http.MethodPost, path+"/commit", echo.MIMEApplicationJSON, "", []byte(`{"dry_run":true}`))
+	assert.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+	assert.Equal(t, 0, m.count("area"), "a dry run commit writes nothing and keeps the session")
+
+	rec = call(e, http.MethodPost, path+"/commit", echo.MIMEApplicationJSON, "", []byte(`{}`))
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+	var committed struct {
+		Data state.ImportResponse `json:"data"`
+	}
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &committed))
+	assert.Equal(t, map[string]int{state.OutcomeCreated: 4}, committed.Data.Counts, "parts uploaded in any order commit as one file, parents first")
+	assert.Equal(t, 4, m.count("area"))
+
+	rec = call(e, http.MethodPost, path+"/commit", echo.MIMEApplicationJSON, "", []byte(`{}`))
+	assert.Equal(t, http.StatusNotFound, rec.Code, "a committed session is gone")
+}
+
+func TestStateImportSessionRefusesAGap(t *testing.T) {
+	e := areaService(newMemory("b"))
+	rec := call(e, http.MethodPost, "/api/state/import/session", echo.MIMEApplicationJSON, "", nil)
+	require.Equal(t, http.StatusCreated, rec.Code)
+	var started struct {
+		Data state.Session `json:"data"`
+	}
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &started))
+	path := "/api/state/import/session/" + started.Data.ID
+	rec = call(e, http.MethodPut, path+"/part/2", state.MIMENDJSON, "", []byte(areaFile))
+	require.Equal(t, http.StatusOK, rec.Code)
+	rec = call(e, http.MethodPost, path+"/commit", echo.MIMEApplicationJSON, "", nil)
+	assert.Equal(t, http.StatusConflict, rec.Code, rec.Body.String())
+	rec = call(e, http.MethodDelete, path, "", "", nil)
+	assert.Equal(t, http.StatusOK, rec.Code)
+}
+
+func TestStateCommandStagesALargeFile(t *testing.T) {
+	m := newMemory("b")
+	e := areaService(m)
+	var calls []string
+	send := func(cmd *cobra.Command, method, path string, query url.Values, contentType string, body []byte) ([]byte, error) {
+		calls = append(calls, method+" "+path)
+		rec := call(e, method, "/api"+path, contentType, "", body)
+		if rec.Code >= http.StatusBadRequest {
+			return nil, cli.Rejected(rec.Body.String(), "")
+		}
+		return rec.Body.Bytes(), nil
+	}
+	file := filepath.Join(t.TempDir(), "areas.ndjson")
+	padding := strings.Repeat(" ", 600<<10)
+	require.NoError(t, os.WriteFile(file, []byte(strings.ReplaceAll(areaFile, "\n{", padding+"\n{")), 0o600))
+
+	root := &cobra.Command{Use: "demo"}
+	root.AddCommand(cli.StateCommand(send, &cli.Output{JSON: true}))
+	var stdout, stderr bytes.Buffer
+	root.SetOut(&stdout)
+	root.SetErr(&stderr)
+	root.SetArgs([]string{"state", "import", file, "--chunk", "1"})
+	require.NoError(t, root.Execute(), stderr.String())
+
+	assert.Equal(t, 4, m.count("area"))
+	assert.Equal(t, "POST /state/import/session", calls[0], "a file over the chunk size opens a session")
+	assert.True(t, strings.HasPrefix(calls[1], "PUT /state/import/session/") && strings.HasSuffix(calls[1], "/part/1"), calls[1])
+	assert.True(t, strings.HasSuffix(calls[len(calls)-1], "/commit"), "and commits it")
+	assert.Greater(t, len(calls), 3, "with more than one part")
+	assert.Contains(t, stderr.String(), "area: 4 created\n")
 }
