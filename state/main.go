@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"sort"
 	"strings"
 
 	"github.com/labstack/echo/v4"
@@ -314,13 +315,14 @@ func (g group) secrets(data map[string]any) []string {
 }
 
 type service struct {
-	host   Context
-	groups []group
-	byName map[string]group
+	host     Context
+	groups   []group
+	byName   map[string]group
+	sessions sessions
 }
 
 func newService(host Context, definitions []Definition) *service {
-	s := &service{host: host, byName: map[string]group{}}
+	s := &service{host: host, byName: map[string]group{}, sessions: sessions{items: map[string]*staged{}}}
 	var declared []group
 	for _, definition := range definitions {
 		defined := definition.definition()
@@ -371,7 +373,11 @@ func Register(host Context, middleware []echo.MiddlewareFunc, definitions ...Def
 			return s.importFile(s.context(ctx), in, file)
 		})
 	imported.Route = s.postImport
-	return []mcp.Operation{schema, exported, imported}
+	session := mcp.Define(mcp.Spec{Name: "state_import_session", Description: "Open an import session that takes a large file in parts before one commit imports them as one file", Method: http.MethodPost, Path: Path + "/import/session", Access: mcp.AccessWrite, Headers: host.Headers, Middleware: chain}, s.openImportSession)
+	part := mcp.Define(mcp.Spec{Name: "state_import_part", Description: "Stage one numbered part of state lines in an import session; parts are numbered from 1 and may arrive in any order", Method: http.MethodPut, Path: Path + "/import/session/:id/part/:part", Access: mcp.AccessWrite, Headers: host.Headers, Middleware: chain}, s.putImportSessionPart)
+	commit := mcp.Define(mcp.Spec{Name: "state_import_commit", Description: "Import every staged part of a session as one file: upsert, create or sync, with deletes by key and a dry run that lists every outcome and keeps the session", Method: http.MethodPost, Path: Path + "/import/session/:id/commit", Status: http.StatusOK, Access: mcp.AccessDestructive, Headers: host.Headers, Middleware: chain}, s.commitImportSession)
+	abandon := mcp.Define(mcp.Spec{Name: "state_import_session_delete", Description: "Drop an import session and its staged parts", Method: http.MethodDelete, Path: Path + "/import/session/:id", Status: http.StatusOK, Access: mcp.AccessWrite, Headers: host.Headers, Middleware: chain}, s.deleteImportSession)
+	return []mcp.Operation{schema, exported, imported, session, part, commit, abandon}
 }
 
 func ordered(declared []group, byName map[string]group) []group {
@@ -392,6 +398,11 @@ func ordered(declared []group, byName map[string]group) []group {
 				panic("state: group " + g.name + " depends on " + name + ", which is not registered")
 			}
 			visit(dependency, append(path, g.name))
+		}
+		for _, name := range sortedRefTargets(g) {
+			if dependency, ok := byName[name]; ok && name != g.name && state[name] == 0 && !reachesAny(byName, name, append(path, g.name)) {
+				visit(dependency, append(path, g.name))
+			}
 		}
 		state[g.name] = 2
 		out = append(out, g)
@@ -560,4 +571,42 @@ func message(err error) string {
 		}
 	}
 	return err.Error()
+}
+
+func sortedRefTargets(g group) []string {
+	seen := map[string]bool{}
+	out := make([]string, 0, len(g.refs))
+	for _, target := range g.refs {
+		if !seen[target] {
+			seen[target] = true
+			out = append(out, target)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+func dependsOnReaches(byName map[string]group, from, to string, seen map[string]bool) bool {
+	if from == to {
+		return true
+	}
+	if seen[from] {
+		return false
+	}
+	seen[from] = true
+	for _, name := range byName[from].dependsOn {
+		if dependsOnReaches(byName, name, to, seen) {
+			return true
+		}
+	}
+	return false
+}
+
+func reachesAny(byName map[string]group, from string, targets []string) bool {
+	for _, target := range targets {
+		if dependsOnReaches(byName, from, target, map[string]bool{}) {
+			return true
+		}
+	}
+	return false
 }

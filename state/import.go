@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"sort"
 
 	"github.com/labstack/echo/v4"
 )
@@ -81,33 +82,6 @@ func (s *service) importFile(c *Context, in ImportRequest, file File) (ImportRes
 		}
 	}
 
-	blobs := map[string]map[string][]Blob{}
-	for _, blob := range file.Blobs {
-		if blobs[blob.Group] == nil {
-			blobs[blob.Group] = map[string][]Blob{}
-		}
-		blobs[blob.Group][blob.Key] = append(blobs[blob.Group][blob.Key], blob)
-	}
-
-	for _, g := range s.groups {
-		lines := incoming[g.name]
-		if len(lines) == 0 {
-			continue
-		}
-		g = g.resolved()
-		step := "import:" + g.name
-		c.Steps.Start(step, "import "+g.name, "")
-		current, err := s.current(r, g, lines)
-		if err != nil {
-			c.Steps.Fail(step, err)
-			return ImportResponse{}, err
-		}
-		for _, line := range lines {
-			r.report(step, "import "+g.name+" "+line.Key, s.importLine(r, g, line, current[line.Key], blobs[g.name][line.Key]))
-		}
-		c.Steps.Done(step, nil)
-	}
-
 	if mode == ModeSync {
 		if err := s.prune(r, in, file, incoming, removals); err != nil {
 			return ImportResponse{}, err
@@ -125,6 +99,35 @@ func (s *service) importFile(c *Context, in ImportRequest, file File) (ImportRes
 		}
 		c.Steps.Done(step, nil)
 	}
+
+	blobs := map[string]map[string][]Blob{}
+	for _, blob := range file.Blobs {
+		if blobs[blob.Group] == nil {
+			blobs[blob.Group] = map[string][]Blob{}
+		}
+		blobs[blob.Group][blob.Key] = append(blobs[blob.Group][blob.Key], blob)
+	}
+
+	for _, g := range s.groups {
+		lines := incoming[g.name]
+		if len(lines) == 0 {
+			continue
+		}
+		g = g.resolved()
+		lines = orderLines(g, lines)
+		step := "import:" + g.name
+		c.Steps.Start(step, "import "+g.name, "")
+		current, err := s.current(r, g, lines)
+		if err != nil {
+			c.Steps.Fail(step, err)
+			return ImportResponse{}, err
+		}
+		for _, line := range lines {
+			r.report(step, "import "+g.name+" "+line.Key, s.importLine(r, g, line, current[line.Key], blobs[g.name][line.Key]))
+		}
+		c.Steps.Done(step, nil)
+	}
+
 	return r.out, nil
 }
 
@@ -489,4 +492,58 @@ func (s *service) deleteRecord(r *run, g group, item removal) Result {
 		return r.refuse(result, err)
 	}
 	return result
+}
+
+func orderLines(g group, lines []Line) []Line {
+	fields := make([]string, 0)
+	for field, target := range g.refs {
+		if target == g.name {
+			fields = append(fields, field)
+		}
+	}
+	if len(fields) == 0 {
+		return lines
+	}
+	sort.Strings(fields)
+	index := make(map[string]int, len(lines))
+	for i, line := range lines {
+		index[line.Key] = i
+	}
+	visited := make([]bool, len(lines))
+	out := make([]Line, 0, len(lines))
+	var visit func(i int)
+	visit = func(i int) {
+		if visited[i] {
+			return
+		}
+		visited[i] = true
+		for _, field := range fields {
+			for _, key := range refKeys(lines[i].Refs[field]) {
+				if j, ok := index[key]; ok {
+					visit(j)
+				}
+			}
+		}
+		out = append(out, lines[i])
+	}
+	for i := range lines {
+		visit(i)
+	}
+	return out
+}
+
+func refKeys(value any) []string {
+	switch keyed := value.(type) {
+	case string:
+		return []string{keyed}
+	case []any:
+		out := make([]string, 0, len(keyed))
+		for _, item := range keyed {
+			if key, ok := item.(string); ok {
+				out = append(out, key)
+			}
+		}
+		return out
+	}
+	return nil
 }

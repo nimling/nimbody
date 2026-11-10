@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/nimling/nimbody/mcp"
@@ -116,6 +117,7 @@ func stateImport(send Send, output *Output) *cobra.Command {
 	var targets, deletes []string
 	var mode, asset string
 	var dryRun bool
+	var chunk int
 	cmd := &cobra.Command{
 		Use:         "import [file]",
 		Short:       "Import state lines from a file, stdin or a stored asset: upsert, create or sync, with deletes by key and a dry run",
@@ -160,7 +162,11 @@ func stateImport(send Send, output *Output) *cobra.Command {
 				if err != nil {
 					return err
 				}
-				body, err = send(cmd, http.MethodPost, PathState+"/import", query, state.MIMENDJSON, lines)
+				if chunk > 0 && len(lines) > chunk<<20 {
+					body, err = stateImportStaged(cmd, send, in, lines, chunk<<20)
+				} else {
+					body, err = send(cmd, http.MethodPost, PathState+"/import", query, state.MIMENDJSON, lines)
+				}
 				if err != nil {
 					return err
 				}
@@ -185,6 +191,9 @@ func stateImport(send Send, output *Output) *cobra.Command {
 			if err := output.PrintValue(cmd.OutOrStdout(), wrapped.Data.Results); err != nil {
 				return err
 			}
+			for _, line := range stateGroupCounts(wrapped.Data) {
+				fmt.Fprintln(cmd.ErrOrStderr(), line)
+			}
 			fmt.Fprintln(cmd.ErrOrStderr(), stateCounts(wrapped.Data))
 			if refused := wrapped.Data.Counts[state.OutcomeRefused]; refused > 0 {
 				return Refused(fmt.Sprintf("%d of %d records refused", refused, len(wrapped.Data.Results)), "Each refused record names its error in the error column.")
@@ -198,6 +207,7 @@ func stateImport(send Send, output *Output) *cobra.Command {
 	flags.StringArrayVar(&deletes, "delete", nil, "delete a record as group:key, repeatable")
 	flags.StringArrayVar(&targets, "target", nil, "import only this group, group:field=value to narrow what a sync deletes, repeatable")
 	flags.StringVar(&asset, "asset", "", "import a stored export by its asset id instead of a file")
+	flags.IntVar(&chunk, "chunk", 4, "upload a file over this many MiB in parts of that size to an import session, committed as one import; 0 sends it in one request")
 	return cmd
 }
 
@@ -271,4 +281,87 @@ func stateCounts(out state.ImportResponse) string {
 		return line + ": nothing to do"
 	}
 	return line + ": " + strings.Join(parts, ", ")
+}
+
+func stateImportStaged(cmd *cobra.Command, send Send, in state.ImportRequest, lines []byte, size int) ([]byte, error) {
+	started, err := send(cmd, http.MethodPost, PathState+"/import/session", nil, "application/json", []byte("{}"))
+	if err != nil {
+		return nil, err
+	}
+	var session struct {
+		Data state.Session `json:"data"`
+	}
+	if err := json.Unmarshal(started, &session); err != nil || session.Data.ID == "" {
+		return nil, &Error{Code: ExitFailure, Message: "the import session answer is not json", Cause: err}
+	}
+	path := PathState + "/import/session/" + session.Data.ID
+	abandon := func(err error) ([]byte, error) {
+		_, _ = send(cmd, http.MethodDelete, path, nil, "", nil)
+		return nil, err
+	}
+	parts := stateParts(lines, size)
+	for i, part := range parts {
+		fmt.Fprintf(cmd.ErrOrStderr(), "upload part %d of %d, %d bytes\n", i+1, len(parts), len(part))
+		if _, err := send(cmd, http.MethodPut, path+"/part/"+strconv.Itoa(i+1), nil, state.MIMENDJSON, part); err != nil {
+			return abandon(err)
+		}
+	}
+	payload, err := json.Marshal(in)
+	if err != nil {
+		return abandon(err)
+	}
+	fmt.Fprintf(cmd.ErrOrStderr(), "commit %d parts\n", len(parts))
+	body, err := send(cmd, http.MethodPost, path+"/commit", nil, "application/json", payload)
+	if err != nil {
+		return abandon(err)
+	}
+	return body, nil
+}
+
+func stateParts(lines []byte, size int) [][]byte {
+	parts := make([][]byte, 0)
+	var current []byte
+	for len(lines) > 0 {
+		end := bytes.IndexByte(lines, '\n')
+		line := lines
+		if end >= 0 {
+			line = lines[:end+1]
+		}
+		lines = lines[len(line):]
+		if len(current) > 0 && len(current)+len(line) > size {
+			parts = append(parts, current)
+			current = nil
+		}
+		current = append(current, line...)
+	}
+	if len(current) > 0 {
+		parts = append(parts, current)
+	}
+	return parts
+}
+
+func stateGroupCounts(out state.ImportResponse) []string {
+	byGroup := map[string]map[string]int{}
+	groups := make([]string, 0)
+	for _, result := range out.Results {
+		if byGroup[result.Group] == nil {
+			byGroup[result.Group] = map[string]int{}
+			groups = append(groups, result.Group)
+		}
+		byGroup[result.Group][result.Outcome]++
+	}
+	lines := make([]string, 0, len(groups))
+	for _, group := range groups {
+		outcomes := make([]string, 0, len(byGroup[group]))
+		for outcome := range byGroup[group] {
+			outcomes = append(outcomes, outcome)
+		}
+		sort.Strings(outcomes)
+		parts := make([]string, 0, len(outcomes))
+		for _, outcome := range outcomes {
+			parts = append(parts, fmt.Sprintf("%d %s", byGroup[group][outcome], outcome))
+		}
+		lines = append(lines, group+": "+strings.Join(parts, ", "))
+	}
+	return lines
 }
