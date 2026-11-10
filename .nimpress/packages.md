@@ -16,7 +16,7 @@ The stdio model context protocol server every cli serves through, with an embedd
 
 1. A `Page` is an MCP App resource `ui://<cli>/<name>` with its CSP domains and its app only tools. A `Tool` whose `Page` names it links its result there instead of the run page.
 
-2. Over streamable HTTP, `Define` is the one operation definition of a service, `Route` its echo routes, and `Server.Mount` mounts its tools at `/mcp` beside `/api`, behind the same auth middleware, with the RFC 9728 protected resource metadata and the 401 `WWW-Authenticate` challenge. A tool runs the service function the route runs, on the request's own context.
+2. Over streamable HTTP, `Define` is the one operation definition of a service, `Route` its echo routes, and `Server.Mount` mounts its tools at `/mcp` beside `/api`, behind the same auth middleware, with the RFC 9728 protected resource metadata and the 401 `WWW-Authenticate` challenge. A tool runs the service function the route runs, on the request's own context. `Spec.Example` is the operation's example, on its tool's description and its cli command.
 
 ## cli
 
@@ -26,11 +26,23 @@ The shared cli layer the `cli` skill describes.
 
 2. `Tools`, `Access` and `MCPCommand` generate annotated mcp tools from the cobra tree. A command annotated `AnnotationMCPPage` links its tool to a page the cli passes to `MCPCommand`.
 
+2.1. A tree annotated `AnnotationMCPInput: InputTyped` gets typed tool input: one property per flag and per positional of the usage line, an `id` positional named for its parent (`article_id`), the required ones listed. Without it a tool takes `{args, flags}`, and a typed tool accepts that shape too. A secret setting's flag, or a flag annotated `AnnotationSecret`, is never an input. The description is the command path, `Short`, the usage line and the `Example`, at most 4096 characters.
+
+2.2. `PutOutput[Out]` declares a command's output struct: its tool carries `outputSchema` `{data: …}` and answers `structuredContent` from the json the command prints, unless the call shapes it. A destructive tool carries `_meta["anthropic/requiresUserInteraction"]`. The server answers `GetInstructions(root, name)` in `initialize`, the root's `AnnotationMCPInstructions` or a few lines from its `Short`.
+
 3. `SkillCommand` serves the skill, and `SkillTreeCommand` a cli with references or several skills. `PluginCommand` has `install` for Claude Code, `desktop` for Claude Desktop and `status` for drift.
 
-4. `Settings` is the config. `Flags` adds `--config`, `--env`, `--global`, `--yes` and `--plan`. `Load` layers the flag, the environment, `--env` files, the local `.<cli>/config.yaml` found walking up and the named config in `~/.<cli>/config.yaml` into the environment; the local config takes over from the named one. `Guard` asks before a write on a `protected` config. `ConfigCommand` is `config get`, `list`, `set`, `use`, `init`, `local` and `path`.
+4. `Settings` is the config. `Flags` adds `--config`, `--env`, `--global`, `--yes` and `--plan`. `Load` layers the flag, the environment, `--env` files, the local `.<cli>/config.yaml` found walking up and the named config in `~/.<cli>/config.yaml` into the environment; the local config takes over from the named one. `Guard` asks before a write on a `protected` config. `ConfigCommand` is `config get`, `list`, `set`, `use`, `init`, `local` and `path`; `--plan` prints the write `set`, `use`, `init` or `local` would make and stops. A secret is never a flag: `Root` refuses a `Setting` that is `Secret` and names a `Flag`.
 
-5. `Output` is the shared renderer with `--json`, `--raw`, `--plain`, `--fields`, `--sort`, `--jq`, `--template`, `--limit` and `--cursor`. `OperationCommand` builds a command from an `mcp.Operation`. `Bridge` and `Relay` make `<cli> mcp` relay stdio to the backend `/mcp` with the stored login.
+4.1. `Settings` holds the credentials too. `GetCredential`, `PutCredential`, `DeleteCredential`, `GetCredentials` and `LockCredential` keep a login per host in `~/.<cli>/<host>.cred` and a machine token per host and client in `<host>_<client>.client`, the tokens in the OS keychain (`Keychain`: `security` on macOS, `secret-tool` on Linux) and only where none answers in the 0600 file. `Get` answers a key's resolved value.
+
+4.2. `Client` is the api client and its login. The credential is `<PREFIX>TOKEN` (or `<PREFIX>ACCESS_TOKEN`) for CI, else the stored login, refreshed before expiry under the cross process lock, else the machine pair sent as Basic auth to the service. The cli names its own `LoginPath`, `TokenPath`, `RevokePath`, `IdentityPath` and `AppHeader`, which `Mount` requires; nimbody holds no default for them. A cli whose service issues tokens sets `Exchange` and exchanges the pair for a token, cached under the same lock, so parallel runs share one. `Send` sends through it with the step stream, the `User-Agent` and the family exit codes. `Mount` adds `login` (PKCE, loopback or `--no-browser`), `logout`, `status` and `token`, and makes `Remote` the default `Bridge`: `<cli> mcp` relays to the service's `/mcp` when `/status` lists it and the credential is a bearer token, and serves the tools locally otherwise.
+
+5. `Output` is the shared renderer with `--json`, `--raw`, `--plain`, `--fields`, `--sort`, `--jq`, `--template`, `--limit` and `--cursor`, and on a `Root` also `--format concise|detailed` and `--query key=value`. `OperationCommand` builds a command from an `mcp.Operation`. `Table` builds the resource commands from `Resource` and `Verb` declarations, with the ids positional in path order, the access from the method, the body flags and an `Example` per command; `Body` is `--set`, `--data`, `--file` and `--upload`, and `APICommand` is `api <method> <path>`. `Bridge` and `Relay` make `<cli> mcp` relay stdio to the backend `/mcp` with the stored login.
+
+6. `Root(root, settings, output)` is how a cli starts: it mounts `Settings` and `Output`, typed mcp input, and loads and guards before the cli's own `PersistentPreRunE`. `HelpCommand` is `help`, the bundled SKILL.md on stdout, and `HelpFunc` puts the banner above the root's help; both show the banner on a terminal only. `config get` and `config list` honour `--json`.
+
+7. `CompletionCommand` is `completion`, with `--auto` installing under the XDG data dir and one managed rc block. `Version` is the one ldflags symbol every cli sets, `GetVersion` its value, and `VersionCommand` prints it with the server's version, `Client.GetServerVersion` from `/status`. `Notifier` notes a newer version on stderr after a command, once a day at most, on a terminal only, off with `<PREFIX>NO_UPDATE_NOTIFIER`.
 
 ## state
 

@@ -1,4 +1,4 @@
-package registry
+package terraform
 
 import (
 	"archive/tar"
@@ -6,6 +6,7 @@ import (
 	"compress/gzip"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"io/fs"
@@ -15,10 +16,13 @@ import (
 	"strings"
 )
 
+const Protocol = "6.0"
+
 type Files struct {
 	Archive    string
 	Sums       string
 	Signature  string
+	Manifest   string
 	Executable string
 }
 
@@ -35,6 +39,15 @@ type Package struct {
 	Modules  string
 }
 
+type Manifest struct {
+	Version  int              `json:"version"`
+	Metadata ManifestMetadata `json:"metadata"`
+}
+
+type ManifestMetadata struct {
+	ProtocolVersions []string `json:"protocol_versions"`
+}
+
 func GetFiles(providerType, version, goos, goarch string) Files {
 	version = strings.TrimPrefix(version, "v")
 	prefix := "terraform-provider-" + providerType + "_" + version
@@ -46,6 +59,7 @@ func GetFiles(providerType, version, goos, goarch string) Files {
 		Archive:    prefix + "_" + goos + "_" + goarch + ".zip",
 		Sums:       prefix + "_SHA256SUMS",
 		Signature:  prefix + "_SHA256SUMS.sig",
+		Manifest:   prefix + "_manifest.json",
 		Executable: executable,
 	}
 }
@@ -59,24 +73,42 @@ func PutPackage(dir string, p Package) ([]string, error) {
 		return nil, err
 	}
 	version := strings.TrimPrefix(p.Version, "v")
+	release := GetFiles(p.Type, version, "", "")
 	var written []string
 	var sums []string
+	sum := func(path, name string) error {
+		hash, err := sumFile(path)
+		if err != nil {
+			return err
+		}
+		sums = append(sums, hash+"  "+name)
+		written = append(written, path)
+		return nil
+	}
 	for _, binary := range p.Binaries {
 		files := GetFiles(p.Type, version, binary.OS, binary.Arch)
 		path := filepath.Join(dir, files.Archive)
 		if err := putZip(path, files.Executable, binary.Path); err != nil {
 			return written, err
 		}
-		sum, err := sumFile(path)
+		if err := sum(path, files.Archive); err != nil {
+			return written, err
+		}
+	}
+	if len(sums) > 0 {
+		manifest, err := json.Marshal(Manifest{Version: 1, Metadata: ManifestMetadata{ProtocolVersions: []string{Protocol}}})
 		if err != nil {
 			return written, err
 		}
-		sums = append(sums, sum+"  "+files.Archive)
-		written = append(written, path)
-	}
-	if len(sums) > 0 {
+		path := filepath.Join(dir, release.Manifest)
+		if err := os.WriteFile(path, append(manifest, '\n'), 0o644); err != nil {
+			return written, err
+		}
+		if err := sum(path, release.Manifest); err != nil {
+			return written, err
+		}
 		sort.Slice(sums, func(i, j int) bool { return sums[i][66:] < sums[j][66:] })
-		path := filepath.Join(dir, GetFiles(p.Type, version, "", "").Sums)
+		path = filepath.Join(dir, release.Sums)
 		if err := os.WriteFile(path, []byte(strings.Join(sums, "\n")+"\n"), 0o644); err != nil {
 			return written, err
 		}

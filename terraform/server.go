@@ -2,50 +2,68 @@ package terraform
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"sort"
+	"strings"
 	"sync"
 
 	"github.com/hashicorp/terraform-plugin-go/tfprotov6"
 	"github.com/hashicorp/terraform-plugin-go/tftypes"
+	"github.com/nimling/nimbody/cli"
 	"github.com/nimling/nimbody/state"
 )
-
-const ConfigAttribute = "config"
 
 type server struct {
 	provider  Provider
 	mu        sync.Mutex
-	cli       command
+	api       *client
 	document  *state.Document
 	resources map[string]resource
 	problems  []*tfprotov6.Diagnostic
 }
 
-var providerSchema = &tfprotov6.Schema{Block: &tfprotov6.SchemaBlock{Attributes: []*tfprotov6.SchemaAttribute{
-	{Name: ConfigAttribute, Type: tftypes.String, Optional: true, Description: "the named cli config to run with, as --config; the cli's own default when unset"},
-}}}
-
 func failed(summary string, err error) []*tfprotov6.Diagnostic {
 	return []*tfprotov6.Diagnostic{{Severity: tfprotov6.DiagnosticSeverityError, Summary: summary, Detail: err.Error()}}
 }
 
-func (s *server) load(ctx context.Context, fresh bool) []*tfprotov6.Diagnostic {
+func (p Provider) env(key string) string {
+	if p.Client == nil || p.Client.Settings == nil {
+		return strings.ToUpper(key)
+	}
+	for _, setting := range p.Client.Settings.Keys {
+		if setting.Key == key && setting.Env != "" {
+			return setting.Env
+		}
+	}
+	return p.Client.Settings.Prefix + strings.ToUpper(key)
+}
+
+func (p Provider) schema() *tfprotov6.Schema {
+	return &tfprotov6.Schema{Block: &tfprotov6.SchemaBlock{Description: "The " + p.Name + " service, reached at its endpoint with a machine client or a token", Attributes: []*tfprotov6.SchemaAttribute{
+		{Name: cli.KeyAppSlug, Type: tftypes.String, Optional: true, Description: "the app slug sent with every request, or " + p.env(cli.KeyAppSlug)},
+		{Name: cli.KeyClientID, Type: tftypes.String, Optional: true, Description: "the machine client id, or " + p.env(cli.KeyClientID)},
+		{Name: cli.KeyClientSecret, Type: tftypes.String, Optional: true, Sensitive: true, Description: "the machine client secret, or " + p.env(cli.KeyClientSecret)},
+		{Name: cli.KeyEndpoint, Type: tftypes.String, Optional: true, Description: "the service base url, or " + p.env(cli.KeyEndpoint)},
+		{Name: cli.KeyToken, Type: tftypes.String, Optional: true, Sensitive: true, Description: "a bearer token, used before the client id and secret, or " + p.env(cli.KeyToken)},
+	}}}
+}
+
+func (s *server) load() (bool, []*tfprotov6.Diagnostic) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.document != nil && !fresh {
-		return s.problems
+	if s.document != nil {
+		return true, s.problems
 	}
-	doc, err := s.cli.GetDocument(ctx)
+	doc, err := wire(s.provider.Document)
 	if err != nil {
-		return failed("the "+s.provider.Name+" state schema cannot be read", err)
+		return false, failed("the "+s.provider.Name+" state schema cannot be read", err)
 	}
 	if doc.Format != state.FormatVersion {
-		return failed("the "+s.provider.Name+" state format does not match", errors.New("the service speaks state format "+doc.Format+" and this provider reads "+state.FormatVersion+"; install the "+s.provider.Name+" release that matches the service"))
+		return false, failed("the "+s.provider.Name+" state format does not match", errors.New("the schema in this provider is state format "+doc.Format+" and this provider reads "+state.FormatVersion+"; build the provider from the state definitions of its service"))
 	}
 	s.document = &doc
 	s.resources = map[string]resource{}
-	s.problems = nil
 	for _, group := range doc.Groups {
 		r, err := resourceOf(group)
 		if err != nil {
@@ -54,26 +72,47 @@ func (s *server) load(ctx context.Context, fresh bool) []*tfprotov6.Diagnostic {
 		}
 		s.resources[s.provider.Name+"_"+group.Name] = r
 	}
-	return s.problems
+	return true, s.problems
 }
 
-func (s *server) resource(ctx context.Context, name string) (resource, command, state.Document, []*tfprotov6.Diagnostic) {
-	problems := s.load(ctx, false)
+func wire(doc state.Document) (state.Document, error) {
+	var out state.Document
+	body, err := json.Marshal(doc)
+	if err != nil {
+		return out, err
+	}
+	return out, json.Unmarshal(body, &out)
+}
+
+func (s *server) resource(name string) (resource, state.Document, []*tfprotov6.Diagnostic) {
+	if loaded, problems := s.load(); !loaded {
+		return resource{}, state.Document{}, problems
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.document == nil {
-		return resource{}, command{}, state.Document{}, problems
-	}
 	r, ok := s.resources[name]
 	if !ok {
-		return resource{}, command{}, state.Document{}, failed("no resource "+name, errors.New("the service has no state group for "+name))
+		return resource{}, state.Document{}, failed("no resource "+name, errors.New("the provider has no state group for "+name))
 	}
-	return r, s.cli, *s.document, nil
+	return r, *s.document, nil
+}
+
+func (s *server) remote(name string) (resource, client, state.Document, []*tfprotov6.Diagnostic) {
+	r, doc, problems := s.resource(name)
+	if problems != nil {
+		return r, client{}, doc, problems
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.api == nil {
+		return r, client{}, doc, failed("the "+s.provider.Name+" provider is not configured", errors.New("terraform calls the service only after it configured the provider"))
+	}
+	return r, *s.api, doc, nil
 }
 
 func (s *server) GetMetadata(ctx context.Context, req *tfprotov6.GetMetadataRequest) (*tfprotov6.GetMetadataResponse, error) {
 	resp := &tfprotov6.GetMetadataResponse{ServerCapabilities: &tfprotov6.ServerCapabilities{}}
-	resp.Diagnostics = s.load(ctx, false)
+	_, resp.Diagnostics = s.load()
 	for _, name := range s.names() {
 		resp.Resources = append(resp.Resources, tfprotov6.ResourceMetadata{TypeName: name})
 	}
@@ -94,12 +133,12 @@ func (s *server) names() []string {
 func (s *server) GetProviderSchema(ctx context.Context, req *tfprotov6.GetProviderSchemaRequest) (*tfprotov6.GetProviderSchemaResponse, error) {
 	resp := &tfprotov6.GetProviderSchemaResponse{
 		ServerCapabilities: &tfprotov6.ServerCapabilities{},
-		Provider:           providerSchema,
+		Provider:           s.provider.schema(),
 		ResourceSchemas:    map[string]*tfprotov6.Schema{},
 		DataSourceSchemas:  map[string]*tfprotov6.Schema{},
 		Functions:          map[string]*tfprotov6.Function{},
 	}
-	resp.Diagnostics = s.load(ctx, false)
+	_, resp.Diagnostics = s.load()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for name, r := range s.resources {
@@ -118,22 +157,41 @@ func (s *server) ValidateProviderConfig(ctx context.Context, req *tfprotov6.Vali
 
 func (s *server) ConfigureProvider(ctx context.Context, req *tfprotov6.ConfigureProviderRequest) (*tfprotov6.ConfigureProviderResponse, error) {
 	resp := &tfprotov6.ConfigureProviderResponse{}
-	if req.Config != nil {
-		config, err := req.Config.Unmarshal(providerSchema.ValueType())
-		if err != nil {
-			resp.Diagnostics = failed("the provider config cannot be read", err)
-			return resp, nil
-		}
-		name, _, err := jsonOf(at(config, tftypes.NewAttributePath().WithAttributeName(ConfigAttribute), tftypes.String))
-		if err != nil {
-			resp.Diagnostics = failed("the provider config cannot be read", err)
-			return resp, nil
-		}
-		s.mu.Lock()
-		s.cli.config, _ = name.(string)
-		s.mu.Unlock()
+	loaded, problems := s.load()
+	if resp.Diagnostics = problems; !loaded {
+		return resp, nil
 	}
-	resp.Diagnostics = s.load(ctx, true)
+	if s.provider.Client == nil || s.provider.Client.Settings == nil {
+		resp.Diagnostics = failed("the "+s.provider.Name+" provider has no client", errors.New("terraform.Provider needs the cli's Client"))
+		return resp, nil
+	}
+	base := s.provider.Client
+	settings := &cli.Settings{Name: base.Settings.Name, Prefix: base.Settings.Prefix, Keys: base.Settings.Keys}
+	if req.Config != nil {
+		config, err := req.Config.Unmarshal(s.provider.schema().ValueType())
+		if err != nil {
+			resp.Diagnostics = failed("the provider config cannot be read", err)
+			return resp, nil
+		}
+		for _, attribute := range s.provider.schema().Block.Attributes {
+			value, _, err := jsonOf(at(config, tftypes.NewAttributePath().WithAttributeName(attribute.Name), tftypes.String))
+			if err != nil {
+				resp.Diagnostics = failed("the provider config cannot be read", err)
+				return resp, nil
+			}
+			if text, _ := value.(string); text != "" {
+				settings.Put(attribute.Name, text)
+			}
+		}
+	}
+	api := &cli.Client{Settings: settings, Product: base.Product, Version: base.Version, LoginPath: base.LoginPath, TokenPath: base.TokenPath, RevokePath: base.RevokePath, IdentityPath: base.IdentityPath, Exchange: base.Exchange, HealthPath: base.HealthPath, AppHeader: base.AppHeader, HTTP: base.HTTP}
+	if api.Endpoint() == "" {
+		resp.Diagnostics = append(resp.Diagnostics, failed("the "+s.provider.Name+" provider has no endpoint", errors.New("set endpoint in the provider block or "+s.provider.env(cli.KeyEndpoint)))...)
+		return resp, nil
+	}
+	s.mu.Lock()
+	s.api = &client{api: api}
+	s.mu.Unlock()
 	return resp, nil
 }
 
@@ -142,13 +200,13 @@ func (s *server) StopProvider(ctx context.Context, req *tfprotov6.StopProviderRe
 }
 
 func (s *server) ValidateResourceConfig(ctx context.Context, req *tfprotov6.ValidateResourceConfigRequest) (*tfprotov6.ValidateResourceConfigResponse, error) {
-	_, _, _, problems := s.resource(ctx, req.TypeName)
+	_, _, problems := s.resource(req.TypeName)
 	return &tfprotov6.ValidateResourceConfigResponse{Diagnostics: problems}, nil
 }
 
 func (s *server) UpgradeResourceState(ctx context.Context, req *tfprotov6.UpgradeResourceStateRequest) (*tfprotov6.UpgradeResourceStateResponse, error) {
 	resp := &tfprotov6.UpgradeResourceStateResponse{}
-	r, _, _, problems := s.resource(ctx, req.TypeName)
+	r, _, problems := s.resource(req.TypeName)
 	if problems != nil {
 		resp.Diagnostics = problems
 		return resp, nil
@@ -185,7 +243,7 @@ func keyOf(value tftypes.Value) string {
 
 func (s *server) ReadResource(ctx context.Context, req *tfprotov6.ReadResourceRequest) (*tfprotov6.ReadResourceResponse, error) {
 	resp := &tfprotov6.ReadResourceResponse{}
-	r, cli, _, problems := s.resource(ctx, req.TypeName)
+	r, api, _, problems := s.remote(req.TypeName)
 	if problems != nil {
 		resp.Diagnostics = problems
 		return resp, nil
@@ -195,7 +253,7 @@ func (s *server) ReadResource(ctx context.Context, req *tfprotov6.ReadResourceRe
 		resp.Diagnostics = failed("the state of "+req.TypeName+" cannot be read", err)
 		return resp, nil
 	}
-	line, found, err := cli.GetRecord(ctx, r.group.Name, keyOf(current))
+	line, found, err := api.GetRecord(ctx, r.group.Name, keyOf(current))
 	if err != nil {
 		resp.Diagnostics = failed("export of "+r.group.Name+" "+keyOf(current)+" failed", err)
 		return resp, nil
@@ -216,7 +274,7 @@ func (s *server) ReadResource(ctx context.Context, req *tfprotov6.ReadResourceRe
 
 func (s *server) PlanResourceChange(ctx context.Context, req *tfprotov6.PlanResourceChangeRequest) (*tfprotov6.PlanResourceChangeResponse, error) {
 	resp := &tfprotov6.PlanResourceChangeResponse{}
-	r, cli, doc, problems := s.resource(ctx, req.TypeName)
+	r, api, doc, problems := s.remote(req.TypeName)
 	if problems != nil {
 		resp.Diagnostics = problems
 		return resp, nil
@@ -274,7 +332,7 @@ func (s *server) PlanResourceChange(ctx context.Context, req *tfprotov6.PlanReso
 		resp.Diagnostics = failed("the plan of "+req.TypeName+" cannot be written as a record", err)
 		return resp, nil
 	}
-	result, err := cli.PostImport(ctx, doc, &line, true)
+	result, err := api.PostImport(ctx, doc, &line, true)
 	switch {
 	case err != nil:
 		resp.Diagnostics = []*tfprotov6.Diagnostic{{Severity: tfprotov6.DiagnosticSeverityWarning, Summary: "the dry run of " + r.group.Name + " " + line.Key + " failed", Detail: err.Error()}}
@@ -286,7 +344,7 @@ func (s *server) PlanResourceChange(ctx context.Context, req *tfprotov6.PlanReso
 
 func (s *server) ApplyResourceChange(ctx context.Context, req *tfprotov6.ApplyResourceChangeRequest) (*tfprotov6.ApplyResourceChangeResponse, error) {
 	resp := &tfprotov6.ApplyResourceChangeResponse{}
-	r, cli, doc, problems := s.resource(ctx, req.TypeName)
+	r, api, doc, problems := s.remote(req.TypeName)
 	if problems != nil {
 		resp.Diagnostics = problems
 		return resp, nil
@@ -302,7 +360,7 @@ func (s *server) ApplyResourceChange(ctx context.Context, req *tfprotov6.ApplyRe
 			resp.Diagnostics = failed("the state of "+req.TypeName+" cannot be read", err)
 			return resp, nil
 		}
-		resp.Diagnostics = s.delete(ctx, cli, doc, r, keyOf(prior))
+		resp.Diagnostics = s.delete(ctx, api, doc, r, keyOf(prior))
 		if resp.Diagnostics == nil {
 			resp.NewState, resp.Diagnostics = dynamic(r.typ, planned)
 		}
@@ -318,7 +376,7 @@ func (s *server) ApplyResourceChange(ctx context.Context, req *tfprotov6.ApplyRe
 		resp.Diagnostics = failed("the plan of "+req.TypeName+" cannot be written as a record", err)
 		return resp, nil
 	}
-	result, err := cli.PostImport(ctx, doc, &line, false)
+	result, err := api.PostImport(ctx, doc, &line, false)
 	if err != nil {
 		resp.Diagnostics = failed("import of "+r.group.Name+" "+line.Key+" failed", err)
 		return resp, nil
@@ -327,7 +385,7 @@ func (s *server) ApplyResourceChange(ctx context.Context, req *tfprotov6.ApplyRe
 		resp.Diagnostics = failed("the service refused "+r.group.Name+" "+line.Key, errors.New(result.Error))
 		return resp, nil
 	}
-	written, found, err := cli.GetRecord(ctx, r.group.Name, line.Key)
+	written, found, err := api.GetRecord(ctx, r.group.Name, line.Key)
 	if err == nil && !found {
 		err = errors.New("the service answers no record for it after the import")
 	}
@@ -354,15 +412,15 @@ func (s *server) ApplyResourceChange(ctx context.Context, req *tfprotov6.ApplyRe
 	return resp, nil
 }
 
-func (s *server) delete(ctx context.Context, cli command, doc state.Document, r resource, key string) []*tfprotov6.Diagnostic {
-	result, err := cli.PostImport(ctx, doc, nil, false, r.group.Name+":"+key)
+func (s *server) delete(ctx context.Context, api client, doc state.Document, r resource, key string) []*tfprotov6.Diagnostic {
+	result, err := api.PostImport(ctx, doc, nil, false, r.group.Name+":"+key)
 	if err != nil {
 		return failed("delete of "+r.group.Name+" "+key+" failed", err)
 	}
 	if result.Outcome != state.OutcomeRefused {
 		return nil
 	}
-	_, found, err := cli.GetRecord(ctx, r.group.Name, key)
+	_, found, err := api.GetRecord(ctx, r.group.Name, key)
 	if err != nil {
 		return failed("export of "+r.group.Name+" "+key+" failed", err)
 	}
@@ -374,7 +432,7 @@ func (s *server) delete(ctx context.Context, cli command, doc state.Document, r 
 
 func (s *server) ImportResourceState(ctx context.Context, req *tfprotov6.ImportResourceStateRequest) (*tfprotov6.ImportResourceStateResponse, error) {
 	resp := &tfprotov6.ImportResourceStateResponse{}
-	r, _, _, problems := s.resource(ctx, req.TypeName)
+	r, _, problems := s.resource(req.TypeName)
 	if problems != nil {
 		resp.Diagnostics = problems
 		return resp, nil

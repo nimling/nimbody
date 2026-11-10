@@ -41,10 +41,25 @@ type Output struct {
 	Limit      int
 	Cursor     string
 	ServerSort bool
+	Format     string
+	Query      []string
 }
 
+const (
+	FormatConcise  = "concise"
+	FormatDetailed = "detailed"
+)
+
 func (o *Output) Flags(root *cobra.Command) {
+	o.flags(root, false)
+}
+
+func (o *Output) flags(root *cobra.Command, formula bool) {
 	flags := root.PersistentFlags()
+	if formula {
+		flags.Var(&choice{value: &o.Format, choices: []string{FormatConcise, FormatDetailed}}, "format", "concise keeps the leading scalar fields, about a third of the tokens, detailed keeps every field")
+		flags.Var(&entries{values: &o.Query}, "query", "query parameter for the server's own filters as key=value, repeatable")
+	}
 	flags.BoolVar(&o.JSON, "json", false, "print the data as json instead of a table")
 	flags.BoolVar(&o.Raw, "raw", false, "print the whole response envelope")
 	flags.BoolVar(&o.Plain, "plain", false, "print tab separated lines")
@@ -63,6 +78,11 @@ func (o Output) GetQuery() url.Values {
 	}
 	if o.Cursor != "" {
 		values.Set("cursor", o.Cursor)
+	}
+	for _, entry := range o.Query {
+		if key, value, found := strings.Cut(entry, "="); found && key != "" {
+			values.Add(key, value)
+		}
 	}
 	if o.ServerSort && o.Sort != "" && o.Cursor == "" {
 		column, order, _ := strings.Cut(o.Sort, ":")
@@ -118,6 +138,12 @@ func (o Output) render(out io.Writer, payload []byte) (any, error) {
 	var decoded any
 	if err := json.Unmarshal(payload, &decoded); err != nil {
 		return nil, printJSON(out, payload)
+	}
+	if o.Format == FormatConcise && len(o.Fields) == 0 {
+		decoded = concise(decoded)
+		if reduced, err := json.Marshal(decoded); err == nil {
+			payload = reduced
+		}
 	}
 	shaper := shape.Shape{Fields: o.Fields, Sort: o.Sort, JQ: o.JQ, Template: o.Template, Colour: Colour(out)}
 	if o.ServerSort {
@@ -397,4 +423,75 @@ func pad(text string, width int) string {
 		return text
 	}
 	return text + strings.Repeat(" ", gap)
+}
+
+func concise(decoded any) any {
+	switch shaped := decoded.(type) {
+	case []any:
+		objects := make([]map[string]any, 0, len(shaped))
+		for _, row := range shaped {
+			if object, ok := row.(map[string]any); ok {
+				objects = append(objects, object)
+			}
+		}
+		if len(objects) < len(shaped) {
+			return shaped
+		}
+		columns := tableColumns(objects)
+		rows := make([]any, 0, len(objects))
+		for _, object := range objects {
+			kept := map[string]any{}
+			for _, column := range columns {
+				if value, ok := object[column]; ok {
+					kept[column] = value
+				}
+			}
+			rows = append(rows, kept)
+		}
+		return rows
+	case map[string]any:
+		kept := map[string]any{}
+		for key, value := range shaped {
+			if scalar(value) && !strings.HasPrefix(key, "sa_") {
+				kept[key] = value
+			}
+		}
+		return kept
+	}
+	return decoded
+}
+
+type choice struct {
+	value   *string
+	choices []string
+}
+
+func (c *choice) String() string { return *c.value }
+
+func (c *choice) Type() string { return "string" }
+
+func (c *choice) Set(value string) error {
+	for _, allowed := range c.choices {
+		if value == allowed {
+			*c.value = value
+			return nil
+		}
+	}
+	return fmt.Errorf("takes %s", strings.Join(c.choices, " or "))
+}
+
+type entries struct {
+	values *[]string
+}
+
+func (e *entries) String() string { return strings.Join(*e.values, ",") }
+
+func (e *entries) Type() string { return "stringArray" }
+
+func (e *entries) Set(value string) error {
+	if key, _, found := strings.Cut(value, "="); !found || key == "" {
+		return fmt.Errorf("entries look like key=value")
+	}
+	*e.values = append(*e.values, value)
+	return nil
 }

@@ -18,6 +18,7 @@ import (
 
 	"github.com/labstack/echo/v4"
 	"github.com/nimling/nimbody/cli"
+	"github.com/nimling/nimbody/endpoint"
 	"github.com/nimling/nimbody/mcp"
 	"github.com/nimling/nimbody/respond"
 	"github.com/nimling/nimbody/state"
@@ -182,7 +183,7 @@ func containsString(list []string, value string) bool {
 	return false
 }
 
-func stateService(m *memory, extra ...state.Definition) (*echo.Echo, []mcp.Operation) {
+func stateGroups(m *memory, extra ...state.Definition) []state.Definition {
 	location := memoryGroup[locationBody](m, "location")
 	location.Schema = map[string]any{"type": "object", "properties": map[string]any{
 		"name":   map[string]any{"type": "string"},
@@ -226,6 +227,10 @@ func stateService(m *memory, extra ...state.Definition) (*echo.Echo, []mcp.Opera
 			return nil
 		},
 	}
+	return append([]state.Definition{room, location}, extra...)
+}
+
+func stateService(m *memory, extra ...state.Definition) (*echo.Echo, []mcp.Operation) {
 	access := func(next echo.HandlerFunc) echo.HandlerFunc {
 		return func(ctx echo.Context) error {
 			if ctx.Request().Header.Get(echo.HeaderAuthorization) != "Bearer owner" {
@@ -237,7 +242,6 @@ func stateService(m *memory, extra ...state.Definition) (*echo.Echo, []mcp.Opera
 	host := state.Context{
 		Service: "demo",
 		Version: "v1.2.3",
-		Access:  access,
 		Keys:    m,
 		Transaction: func(ctx context.Context, run func(ctx context.Context) error) error {
 			return run(ctx)
@@ -260,7 +264,8 @@ func stateService(m *memory, extra ...state.Definition) (*echo.Echo, []mcp.Opera
 		},
 	}
 	e := echo.New()
-	operations := state.Register(e.Group("/api"), host, append([]state.Definition{room, location}, extra...)...)
+	operations := state.Register(host, []echo.MiddlewareFunc{access}, stateGroups(m, extra...)...)
+	mcp.Route(e.Group("/api"), operations...)
 	return e, operations
 }
 
@@ -560,7 +565,7 @@ func TestStateStoreAndImportAnAsset(t *testing.T) {
 	for _, operation := range operations {
 		names = append(names, operation.Name+":"+operation.Access)
 	}
-	assert.Equal(t, []string{"state:read", "state_export:read", "state_import:destructive"}, names)
+	assert.Equal(t, []string{"state:read", "state_export:read", "state_import:destructive", "state_import_session:write", "state_import_part:write", "state_import_commit:destructive", "state_import_session_delete:write"}, names)
 	server := &mcp.Server{Name: "demo", Version: "v1", Operations: operations}
 	server.Mount(e, func(next echo.HandlerFunc) echo.HandlerFunc { return next })
 	reply := call(e, http.MethodPost, "/mcp", echo.MIMEApplicationJSON, echo.MIMEApplicationJSON, []byte(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"state_import","arguments":{"asset_id":"asset-1","dry_run":true}}}`))
@@ -576,7 +581,7 @@ func TestStateCommand(t *testing.T) {
 	e, _ := stateService(target)
 	backend := source
 	send := func(cmd *cobra.Command, method, path string, query url.Values, contentType string, body []byte) ([]byte, error) {
-		target := "/api" + path
+		target := path
 		if len(query) > 0 {
 			target += "?" + query.Encode()
 		}
@@ -675,7 +680,7 @@ func connectionGroup(m *memory) state.Group[connectionBody] {
 
 func connectionService(m *memory) *echo.Echo {
 	e := echo.New()
-	state.Register(e.Group("/api"), state.Context{Service: "demo", Version: "v1.2.3", Keys: m}, connectionGroup(m))
+	mcp.Route(e.Group("/api"), state.Register(state.Context{Service: "demo", Version: "v1.2.3", Keys: m}, nil, connectionGroup(m))...)
 	return e
 }
 
@@ -860,7 +865,7 @@ func TestStateCommandStagesALargeFile(t *testing.T) {
 	var calls []string
 	send := func(cmd *cobra.Command, method, path string, query url.Values, contentType string, body []byte) ([]byte, error) {
 		calls = append(calls, method+" "+path)
-		rec := call(e, method, "/api"+path, contentType, "", body)
+		rec := call(e, method, path, contentType, "", body)
 		if rec.Code >= http.StatusBadRequest {
 			return nil, cli.Rejected(rec.Body.String(), "")
 		}
@@ -879,9 +884,121 @@ func TestStateCommandStagesALargeFile(t *testing.T) {
 	require.NoError(t, root.Execute(), stderr.String())
 
 	assert.Equal(t, 4, m.count("area"))
-	assert.Equal(t, "POST /state/import/session", calls[0], "a file over the chunk size opens a session")
-	assert.True(t, strings.HasPrefix(calls[1], "PUT /state/import/session/") && strings.HasSuffix(calls[1], "/part/1"), calls[1])
+	assert.Equal(t, "POST /api/state/import/session", calls[0], "a file over the chunk size opens a session")
+	assert.True(t, strings.HasPrefix(calls[1], "PUT /api/state/import/session/") && strings.HasSuffix(calls[1], "/part/1"), calls[1])
 	assert.True(t, strings.HasSuffix(calls[len(calls)-1], "/commit"), "and commits it")
 	assert.Greater(t, len(calls), 3, "with more than one part")
 	assert.Contains(t, stderr.String(), "area: 4 created\n")
+}
+
+func TestStateHeadersReachTheAccessOverTheRelay(t *testing.T) {
+	m := seeded()
+	session := func(next echo.HandlerFunc) echo.HandlerFunc {
+		return func(ctx echo.Context) error {
+			if ctx.Request().Header.Get("SAuth-App-Slug") == "" {
+				return ctx.NoContent(http.StatusUnauthorized)
+			}
+			return next(ctx)
+		}
+	}
+	e := echo.New()
+	operations := state.Register(state.Context{Service: "demo", Version: "v1.2.3", Keys: m, Headers: []mcp.Header{{Name: "app_slug", Param: "SAuth-App-Slug", Usage: "the app the session belongs to"}}}, []echo.MiddlewareFunc{session}, memoryGroup[locationBody](m, "location"))
+	mcp.Route(e.Group("/api"), operations...)
+	server := &mcp.Server{Name: "demo", Version: "v1", Operations: operations}
+	server.Mount(e)
+	backend := httptest.NewServer(e)
+	defer backend.Close()
+	remote := func(ctx context.Context) (string, string, error) { return backend.URL + "/mcp", "owner", nil }
+
+	for _, operation := range operations {
+		property := operation.InputSchema["properties"].(map[string]any)["app_slug"]
+		assert.Equal(t, map[string]any{"type": "string", "description": "the app the session belongs to"}, property, operation.Name)
+		required, _ := operation.InputSchema["required"].([]string)
+		assert.NotContains(t, required, "app_slug", operation.Name)
+	}
+	_, plain := stateService(seeded())
+	assert.NotContains(t, plain[1].InputSchema["properties"], "app_slug")
+
+	in := strings.Join([]string{
+		`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"state_export","arguments":{"app_slug":"portal","targets":[{"group":"location"}]}}}`,
+		`{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"state_export","arguments":{"targets":[{"group":"location"}]}}}`,
+		`{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"state","arguments":{"app_slug":"portal"}}}`,
+	}, "\n")
+	var out bytes.Buffer
+	assert.NoError(t, cli.Relay(context.Background(), "demo", remote, strings.NewReader(in), &out))
+	byID := map[float64]map[string]any{}
+	for _, line := range bytes.Split(bytes.TrimSpace(out.Bytes()), []byte("\n")) {
+		var message map[string]any
+		assert.NoError(t, json.Unmarshal(line, &message))
+		if id, ok := message["id"].(float64); ok {
+			byID[id] = message["result"].(map[string]any)
+		}
+	}
+	assert.Nil(t, byID[1]["isError"], fmt.Sprint(byID[1]["content"]))
+	exported, _ := json.Marshal(byID[1]["structuredContent"])
+	assert.Contains(t, string(exported), "Head office")
+	assert.Equal(t, true, byID[2]["isError"])
+	assert.Equal(t, http.StatusText(http.StatusUnauthorized), byID[2]["content"].([]any)[0].(map[string]any)["text"])
+	assert.Nil(t, byID[3]["isError"])
+}
+
+func TestStateUnderAPIRunsTheServiceChain(t *testing.T) {
+	m := seeded()
+	claims := func(next echo.HandlerFunc) echo.HandlerFunc {
+		return func(ctx echo.Context) error {
+			if ctx.Request().Header.Get("X-Claim") != "state" {
+				return respond.Error(ctx, http.StatusForbidden, "the caller holds no state claim")
+			}
+			return next(ctx)
+		}
+	}
+	e := echo.New()
+	server := &mcp.Server{Name: "demo", Version: "v1"}
+	require.NoError(t, endpoint.Mount(e, endpoint.Set{Service: "demo", Version: "v1.2.3", MCP: server, APIMiddleware: []echo.MiddlewareFunc{claims}, State: &state.Context{Keys: m}, Groups: []state.Definition{memoryGroup[locationBody](m, "location")}}))
+	send := func(method, target, contentType, claim string, body []byte) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(method, target, bytes.NewReader(body))
+		req.Header.Set(echo.HeaderAuthorization, "Bearer anyone")
+		if contentType != "" {
+			req.Header.Set(echo.HeaderContentType, contentType)
+		}
+		if claim != "" {
+			req.Header.Set("X-Claim", claim)
+		}
+		rec := httptest.NewRecorder()
+		e.ServeHTTP(rec, req)
+		return rec
+	}
+
+	exported := send(http.MethodPost, "/api/state/export", echo.MIMEApplicationJSON, "state", []byte(`{}`))
+	require.Equal(t, http.StatusOK, exported.Code, exported.Body.String())
+	assert.Contains(t, exported.Body.String(), "Head office")
+	for _, route := range []struct {
+		method, target, contentType string
+		body                        []byte
+	}{
+		{http.MethodGet, "/api/state", "", nil},
+		{http.MethodPost, "/api/state/export", echo.MIMEApplicationJSON, []byte(`{}`)},
+		{http.MethodPost, "/api/state/import?dry_run=true", state.MIMENDJSON, exported.Body.Bytes()},
+	} {
+		refused := send(route.method, route.target, route.contentType, "", route.body)
+		assert.Equal(t, http.StatusForbidden, refused.Code, route.target)
+		assert.Contains(t, refused.Body.String(), "the caller holds no state claim", route.target)
+		served := send(route.method, route.target, route.contentType, "state", route.body)
+		assert.Equal(t, http.StatusOK, served.Code, route.target+": "+served.Body.String())
+	}
+	assert.Equal(t, 0, m.writes, "the dry run wrote nothing")
+
+	for _, gone := range []string{"/state", "/state/export", "/state/import"} {
+		assert.Equal(t, http.StatusNotFound, send(http.MethodGet, gone, "", "state", nil).Code, gone)
+	}
+	status := send(http.MethodGet, "/status", "", "", nil)
+	var listed struct {
+		Data endpoint.Status `json:"data"`
+	}
+	require.NoError(t, json.Unmarshal(status.Body.Bytes(), &listed))
+	assert.Equal(t, []string{"/api", "/status", "/api/state", "/mcp"}, listed.Data.Endpoints)
+
+	tool := []byte(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"state","arguments":{}}}`)
+	assert.Equal(t, true, result(t, send(http.MethodPost, "/mcp", echo.MIMEApplicationJSON, "", tool))["isError"], "the tool runs the same chain")
+	assert.Nil(t, result(t, send(http.MethodPost, "/mcp", echo.MIMEApplicationJSON, "state", tool))["isError"])
 }

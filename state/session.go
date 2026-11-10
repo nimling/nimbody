@@ -5,7 +5,6 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
-	"errors"
 	"io"
 	"net/http"
 	"strconv"
@@ -13,7 +12,6 @@ import (
 	"time"
 
 	"github.com/labstack/echo/v4"
-	"github.com/nimling/nimbody/respond"
 )
 
 const (
@@ -70,33 +68,47 @@ func (s *sessions) summary(id string, item *staged) Session {
 	return Session{ID: id, Parts: len(item.parts), Bytes: item.bytes, ExpiresAt: item.expires}
 }
 
-func (s *service) postImportSession(ctx echo.Context) error {
+type sessionInput struct {
+	ID string `param:"id" json:"id"`
+}
+
+type partInput struct {
+	ID    string          `param:"id" json:"id"`
+	Part  string          `param:"part" json:"part"`
+	Lines json.RawMessage `body:"*" json:"lines,omitempty"`
+}
+
+type commitInput struct {
+	ID string `param:"id" json:"id"`
+	ImportRequest
+}
+
+func (s *service) openImportSession(ctx echo.Context, in struct{}) (Session, error) {
 	raw := make([]byte, 16)
 	if _, err := rand.Read(raw); err != nil {
-		return failure(ctx, "state import session", err)
+		return Session{}, err
 	}
 	id := hex.EncodeToString(raw)
 	item := &staged{parts: map[int][]byte{}, expires: time.Now().Add(SessionLifetime)}
 	s.sessions.mu.Lock()
+	defer s.sessions.mu.Unlock()
 	s.sessions.purge()
 	s.sessions.items[id] = item
-	summary := s.sessions.summary(id, item)
-	s.sessions.mu.Unlock()
-	return respond.JSON(ctx, http.StatusCreated, summary, 1)
+	return s.sessions.summary(id, item), nil
 }
 
-func (s *service) putImportSessionPart(ctx echo.Context) error {
-	item, err := s.sessions.get(ctx.Param("id"))
+func (s *service) putImportSessionPart(ctx echo.Context, in partInput) (Part, error) {
+	item, err := s.sessions.get(in.ID)
 	if err != nil {
-		return failure(ctx, "state import part", err)
+		return Part{}, err
 	}
-	number, err := strconv.Atoi(ctx.Param("part"))
+	number, err := strconv.Atoi(in.Part)
 	if err != nil || number < 1 {
-		return respond.Error(ctx, http.StatusBadRequest, "a part is numbered from 1")
+		return Part{}, echo.NewHTTPError(http.StatusBadRequest, "a part is numbered from 1")
 	}
 	body, err := io.ReadAll(ctx.Request().Body)
 	if err != nil {
-		return respond.Error(ctx, http.StatusBadRequest, "the part could not be read: "+err.Error())
+		return Part{}, echo.NewHTTPError(http.StatusBadRequest, "the part could not be read: "+err.Error())
 	}
 	lines := 0
 	for _, line := range bytes.Split(body, []byte("\n")) {
@@ -104,7 +116,7 @@ func (s *service) putImportSessionPart(ctx echo.Context) error {
 			continue
 		}
 		if !json.Valid(line) {
-			return respond.Error(ctx, http.StatusBadRequest, "part "+strconv.Itoa(number)+" line "+strconv.Itoa(lines+1)+" is not json; a part holds whole state lines")
+			return Part{}, echo.NewHTTPError(http.StatusBadRequest, "part "+strconv.Itoa(number)+" line "+strconv.Itoa(lines+1)+" is not json; a part holds whole state lines")
 		}
 		lines++
 	}
@@ -112,26 +124,21 @@ func (s *service) putImportSessionPart(ctx echo.Context) error {
 	defer s.sessions.mu.Unlock()
 	previous := len(item.parts[number])
 	if item.bytes-previous+len(body) > SessionMaxBytes {
-		return respond.Error(ctx, http.StatusRequestEntityTooLarge, "an import session holds at most "+strconv.Itoa(SessionMaxBytes>>20)+" MiB")
+		return Part{}, echo.NewHTTPError(http.StatusRequestEntityTooLarge, "an import session holds at most "+strconv.Itoa(SessionMaxBytes>>20)+" MiB")
 	}
 	item.parts[number] = body
 	item.bytes += len(body) - previous
 	item.expires = time.Now().Add(SessionLifetime)
-	return respond.JSON(ctx, http.StatusOK, Part{Session: ctx.Param("id"), Part: number, Lines: lines, Bytes: len(body)}, 1)
+	return Part{Session: in.ID, Part: number, Lines: lines, Bytes: len(body)}, nil
 }
 
-func (s *service) postImportSessionCommit(ctx echo.Context) error {
-	id := ctx.Param("id")
-	item, err := s.sessions.get(id)
+func (s *service) commitImportSession(ctx echo.Context, in commitInput) (ImportResponse, error) {
+	item, err := s.sessions.get(in.ID)
 	if err != nil {
-		return failure(ctx, "state import commit", err)
-	}
-	var in ImportRequest
-	if err := json.NewDecoder(ctx.Request().Body).Decode(&in); err != nil && !errors.Is(err, io.EOF) {
-		return respond.Error(ctx, http.StatusBadRequest, "the commit body is not json: "+err.Error())
+		return ImportResponse{}, err
 	}
 	if in.AssetID != "" {
-		return respond.Error(ctx, http.StatusBadRequest, "a commit imports the staged parts, not an asset")
+		return ImportResponse{}, echo.NewHTTPError(http.StatusBadRequest, "a commit imports the staged parts, not an asset")
 	}
 	s.sessions.mu.Lock()
 	var body bytes.Buffer
@@ -139,7 +146,7 @@ func (s *service) postImportSessionCommit(ctx echo.Context) error {
 		part, ok := item.parts[number]
 		if !ok {
 			s.sessions.mu.Unlock()
-			return respond.Error(ctx, http.StatusConflict, "part "+strconv.Itoa(number)+" is missing; the parts are numbered 1 to "+strconv.Itoa(len(item.parts))+" without a gap")
+			return ImportResponse{}, echo.NewHTTPError(http.StatusConflict, "part "+strconv.Itoa(number)+" is missing; the parts are numbered 1 to "+strconv.Itoa(len(item.parts))+" without a gap")
 		}
 		body.Write(part)
 		if !bytes.HasSuffix(part, []byte("\n")) {
@@ -149,29 +156,28 @@ func (s *service) postImportSessionCommit(ctx echo.Context) error {
 	s.sessions.mu.Unlock()
 	file, err := Read(&body)
 	if err != nil {
-		return failure(ctx, "state import commit", echo.NewHTTPError(http.StatusBadRequest, err.Error()))
+		return ImportResponse{}, echo.NewHTTPError(http.StatusBadRequest, err.Error())
 	}
-	out, err := s.importFile(s.context(ctx), in, file)
+	out, err := s.importFile(s.context(ctx), in.ImportRequest, file)
 	if err != nil {
-		return failure(ctx, "state import commit", err)
+		return ImportResponse{}, err
 	}
 	if !in.DryRun {
 		s.sessions.mu.Lock()
-		delete(s.sessions.items, id)
+		delete(s.sessions.items, in.ID)
 		s.sessions.mu.Unlock()
 	}
-	return respond.JSON(ctx, http.StatusOK, out, len(out.Results))
+	return out, nil
 }
 
-func (s *service) deleteImportSession(ctx echo.Context) error {
-	id := ctx.Param("id")
-	item, err := s.sessions.get(id)
+func (s *service) deleteImportSession(ctx echo.Context, in sessionInput) (Session, error) {
+	item, err := s.sessions.get(in.ID)
 	if err != nil {
-		return failure(ctx, "state import session", err)
+		return Session{}, err
 	}
 	s.sessions.mu.Lock()
-	summary := s.sessions.summary(id, item)
-	delete(s.sessions.items, id)
-	s.sessions.mu.Unlock()
-	return respond.JSON(ctx, http.StatusOK, summary, 1)
+	defer s.sessions.mu.Unlock()
+	summary := s.sessions.summary(in.ID, item)
+	delete(s.sessions.items, in.ID)
+	return summary, nil
 }

@@ -2,9 +2,12 @@ package mcp
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"mime"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -34,7 +37,9 @@ type paging struct {
 }
 
 type structured struct {
-	Data any `json:"data"`
+	Data   any  `json:"data"`
+	Status int  `json:"status,omitempty"`
+	Count  *int `json:"count,omitempty"`
 }
 
 func base(ctx echo.Context) string {
@@ -110,7 +115,7 @@ func (s *Server) remoteTools() []Tool {
 		}
 		tool.InputSchema = schema
 		if tool.Page != "" {
-			tool.Meta = map[string]any{"ui": map[string]any{"resourceUri": s.pageURI(tool.Page)}}
+			tool.Meta = withMeta(tool.Meta, "ui", map[string]any{"resourceUri": s.pageURI(tool.Page)})
 		}
 		tools = append(tools, tool)
 	}
@@ -236,9 +241,21 @@ func (s *Server) invoke(ctx echo.Context, operation Operation, arguments json.Ra
 		return callResult{Content: []content{{Type: "text", Text: "a template file is read by the cli only, pass the template itself"}}, IsError: true}
 	}
 
-	value, total, err := s.dispatch(ctx, operation, arguments, values, page, onStep)
+	value, total, path, err := s.dispatch(ctx, operation, arguments, values, page, onStep)
+	var rejection *respond.Rejection
 	var rejected *echo.HTTPError
+	blob, isBlob := value.Data.(Blob)
 	switch {
+	case err == nil && isBlob && int64(len(blob.Content)) > operation.fileLimit():
+		return callResult{Content: []content{{Type: "text", Text: operation.Name + " answers " + strconv.Itoa(len(blob.Content)) + " bytes, more than the " + strconv.FormatInt(operation.fileLimit(), 10) + " a tool call carries"}}, IsError: true}
+	case err == nil && isBlob && strings.HasPrefix(blob.ContentType, "image/"):
+		return callResult{Content: []content{{Type: "image", Data: base64.StdEncoding.EncodeToString(blob.Content), MimeType: blob.ContentType}}}
+	case err == nil && isBlob:
+		return callResult{Content: []content{{Type: "resource", Resource: &resource{URI: s.Name + "://" + strings.TrimPrefix(path, "/"), MimeType: blob.ContentType, Blob: base64.StdEncoding.EncodeToString(blob.Content)}}}}
+	case errors.As(err, &rejection) && rejection.Data != nil:
+		return callResult{Content: []content{{Type: "text", Text: rejection.Message}}, StructuredContent: structured{Data: rejection.Data}, IsError: true}
+	case errors.As(err, &rejection):
+		return callResult{Content: []content{{Type: "text", Text: rejection.Message}}, IsError: true}
 	case errors.As(err, &rejected):
 		return callResult{Content: []content{{Type: "text", Text: message(rejected)}}, IsError: true}
 	case err != nil:
@@ -246,7 +263,7 @@ func (s *Server) invoke(ctx echo.Context, operation Operation, arguments json.Ra
 		return callResult{Content: []content{{Type: "text", Text: "the server failed on " + operation.Name}}, IsError: true}
 	}
 
-	decoded, err := shape.Decode(value)
+	decoded, err := shape.Decode(value.Data)
 	if err != nil {
 		return callResult{Content: []content{{Type: "text", Text: err.Error()}}, IsError: true}
 	}
@@ -275,13 +292,23 @@ func (s *Server) invoke(ctx echo.Context, operation Operation, arguments json.Ra
 		}
 		out.WriteString(line + ", or narrow with fields or limit\n")
 	}
-	return callResult{Content: []content{{Type: "text", Text: out.String()}}, StructuredContent: structured{Data: value}}
+	return callResult{Content: []content{{Type: "text", Text: out.String()}}, StructuredContent: value}
 }
 
-func (s *Server) dispatch(ctx echo.Context, operation Operation, arguments json.RawMessage, values map[string]any, page paging, onStep func(respond.Step)) (any, int, error) {
-	path := operation.Path
+func (s *Server) dispatch(ctx echo.Context, operation Operation, arguments json.RawMessage, values map[string]any, page paging, onStep func(respond.Step)) (structured, int, string, error) {
+	given := map[string]string{}
 	var names, params []string
 	query := url.Values{}
+	header := http.Header{}
+	add := func(key string, value any) {
+		if items, many := value.([]any); many {
+			for _, item := range items {
+				query.Add(key, shape.Cell(item))
+			}
+			return
+		}
+		query.Set(key, shape.Cell(value))
+	}
 	for _, input := range operation.Inputs {
 		value, present := values[input.Name]
 		if !present || value == nil {
@@ -289,17 +316,31 @@ func (s *Server) dispatch(ctx echo.Context, operation Operation, arguments json.
 		}
 		switch input.In {
 		case InPath:
-			path = strings.Replace(path, ":"+input.Param, url.PathEscape(shape.Cell(value)), 1)
-			names = append(names, input.Param)
-			params = append(params, shape.Cell(value))
-		case InQuery:
-			if items, many := value.([]any); many {
-				for _, item := range items {
-					query.Add(input.Param, shape.Cell(item))
-				}
+			if shape.Cell(value) == "" {
 				continue
 			}
-			query.Set(input.Param, shape.Cell(value))
+			given[input.Param] = shape.Cell(value)
+			names = append(names, input.Param)
+			params = append(params, shape.Cell(value))
+		case InHeader:
+			header.Set(input.Param, shape.Cell(value))
+		case InQuery:
+			prefix, open := strings.CutSuffix(input.Param, "*")
+			if !open {
+				continue
+			}
+			entries, _ := value.(map[string]any)
+			for key, entry := range entries {
+				if entry != nil && !(prefix == "" && taken(key, operation.Inputs)) {
+					add(prefix+key, entry)
+				}
+			}
+		}
+	}
+	for _, input := range operation.Inputs {
+		if value, present := values[input.Name]; present && value != nil && input.In == InQuery && !strings.HasSuffix(input.Param, "*") {
+			query.Del(input.Param)
+			add(input.Param, value)
 		}
 	}
 	if page.Limit > 0 {
@@ -308,8 +349,16 @@ func (s *Server) dispatch(ctx echo.Context, operation Operation, arguments json.
 	if page.Cursor != "" {
 		query.Set("cursor", page.Cursor)
 	}
+	route, err := operation.pick(given)
+	if err != nil {
+		return structured{}, 0, "", err
+	}
+	path := route
+	for name, value := range given {
+		path = strings.Replace(path, ":"+name, url.PathEscape(value), 1)
+	}
 
-	request, response, route := ctx.Request(), ctx.Response(), ctx.Path()
+	request, response, matched := ctx.Request(), ctx.Response(), ctx.Path()
 	savedNames, savedParams := ctx.ParamNames(), ctx.ParamValues()
 	cached := ctx.QueryParams()
 	savedQuery := url.Values{}
@@ -319,12 +368,31 @@ func (s *Server) dispatch(ctx echo.Context, operation Operation, arguments json.
 	clone := request.Clone(request.Context())
 	clone.Method = operation.Method
 	clone.URL = &url.URL{Path: path, RawQuery: query.Encode()}
-	clone.Body = http.NoBody
-	clone.Header.Set(echo.HeaderAccept, respond.MIMEEventStream)
+	clone.Body, clone.ContentLength = http.NoBody, 0
+	if input, found := undecoded(operation.Inputs); found {
+		fields := map[string]json.RawMessage{}
+		_ = json.Unmarshal(arguments, &fields)
+		if body, given := fields[input.Name]; given {
+			var text string
+			if kind := header.Get(echo.HeaderContentType); kind != "" && !isJSON(kind) && json.Unmarshal(body, &text) == nil {
+				body = []byte(text)
+			}
+			clone.Body, clone.ContentLength = io.NopCloser(bytes.NewReader(body)), int64(len(body))
+			clone.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
+		}
+	}
+	accept := respond.MIMEEventStream
+	if operation.Method == http.MethodGet || operation.Method == http.MethodHead {
+		accept = echo.MIMEApplicationJSON
+	}
+	clone.Header.Set(echo.HeaderAccept, accept)
+	for key, value := range header {
+		clone.Header[key] = value
+	}
 	recorder := &capture{header: http.Header{}, onStep: onStep}
 	ctx.SetRequest(clone)
 	ctx.SetResponse(echo.NewResponse(recorder, ctx.Echo()))
-	ctx.SetPath(operation.Path)
+	ctx.SetPath(route)
 	ctx.SetParamNames(names...)
 	ctx.SetParamValues(params...)
 	clear(cached)
@@ -334,7 +402,7 @@ func (s *Server) dispatch(ctx echo.Context, operation Operation, arguments json.
 	defer func() {
 		ctx.SetRequest(request)
 		ctx.SetResponse(response)
-		ctx.SetPath(route)
+		ctx.SetPath(matched)
 		ctx.SetParamNames(savedNames...)
 		ctx.SetParamValues(savedParams...)
 		clear(cached)
@@ -343,9 +411,8 @@ func (s *Server) dispatch(ctx echo.Context, operation Operation, arguments json.
 		}
 	}()
 
-	var value any
+	var value structured
 	var total int
-	var err error
 	reached := false
 	handler := func(inner echo.Context) error {
 		reached = true
@@ -357,11 +424,53 @@ func (s *Server) dispatch(ctx echo.Context, operation Operation, arguments json.
 	}
 	if failed := handler(ctx); !reached {
 		if failed != nil {
-			return nil, 0, failed
+			return structured{}, 0, path, failed
 		}
-		return nil, 0, echo.NewHTTPError(recorder.code(), recorder.message())
+		return structured{}, 0, path, recorder.rejection()
 	}
-	return value, total, err
+	return value, total, path, err
+}
+
+func isJSON(contentType string) bool {
+	kind, _, err := mime.ParseMediaType(contentType)
+	return err == nil && (kind == echo.MIMEApplicationJSON || strings.HasSuffix(kind, "+json"))
+}
+
+func (o Operation) pick(given map[string]string) (string, error) {
+	chosen, most := "", -1
+	for _, path := range o.paths() {
+		count, complete := 0, true
+		for _, segment := range strings.Split(path, "/") {
+			name, placeholder := strings.CutPrefix(segment, ":")
+			if !placeholder {
+				continue
+			}
+			if _, found := given[name]; !found {
+				complete = false
+			}
+			count++
+		}
+		if complete && count > most {
+			chosen, most = path, count
+		}
+	}
+	if most >= 0 {
+		return chosen, nil
+	}
+	var missing []string
+	for _, segment := range strings.Split(o.Path, "/") {
+		name, placeholder := strings.CutPrefix(segment, ":")
+		if _, found := given[name]; !placeholder || found {
+			continue
+		}
+		for _, input := range o.Inputs {
+			if input.In == InPath && input.Param == name {
+				name = input.Name
+			}
+		}
+		missing = append(missing, name)
+	}
+	return "", echo.NewHTTPError(http.StatusBadRequest, o.Name+" needs "+strings.Join(missing, ", "))
 }
 
 type capture struct {
@@ -438,4 +547,15 @@ func (c *capture) message() string {
 		return text
 	}
 	return http.StatusText(c.code())
+}
+
+func (c *capture) rejection() error {
+	var answered respond.ReturnObject
+	if c.result == nil && json.Unmarshal(c.body.Bytes(), &answered) == nil && answered.Error != nil {
+		c.result = &respond.ReturnResult{Status: c.status, Body: answered}
+	}
+	if c.result != nil && c.result.Body.Count > 0 {
+		return &respond.Rejection{Status: c.code(), Message: c.message(), Data: c.result.Body.Data}
+	}
+	return echo.NewHTTPError(c.code(), c.message())
 }

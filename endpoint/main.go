@@ -2,30 +2,30 @@ package endpoint
 
 import (
 	"context"
+	"errors"
 	"net/http"
 
 	"github.com/labstack/echo/v4"
 	"github.com/nimling/nimbody/mcp"
 	"github.com/nimling/nimbody/respond"
 	"github.com/nimling/nimbody/state"
-	"github.com/nimling/nimbody/terraform/registry"
 )
 
 const (
+	APIPath    = "/api"
 	StatusPath = "/status"
 	HealthPath = "/status/health"
-	StatePath  = "/state"
 )
 
 type Set struct {
-	Service   string
-	Version   string
-	Health    func(ctx context.Context) error
-	MCP       *mcp.Server
-	MCPAccess []echo.MiddlewareFunc
-	State     *state.Context
-	Groups    []state.Definition
-	Terraform *registry.Registry
+	Service       string
+	Version       string
+	Health        func(ctx context.Context) error
+	MCP           *mcp.Server
+	MCPAccess     []echo.MiddlewareFunc
+	APIMiddleware []echo.MiddlewareFunc
+	State         *state.Context
+	Groups        []state.Definition
 }
 
 type Status struct {
@@ -38,8 +38,8 @@ type Health struct {
 	Healthy bool `json:"healthy"`
 }
 
-func Mount(e *echo.Echo, set Set) {
-	status := Status{Service: set.Service, Version: set.Version, Endpoints: []string{"/api", StatusPath}}
+func Mount(e *echo.Echo, set Set) error {
+	status := Status{Service: set.Service, Version: set.Version, Endpoints: []string{APIPath, StatusPath}}
 
 	var operations []mcp.Operation
 	if set.State != nil {
@@ -50,26 +50,31 @@ func Mount(e *echo.Echo, set Set) {
 		if host.Version == "" {
 			host.Version = set.Version
 		}
-		operations = state.Register(e.Group(""), host, set.Groups...)
-		status.Endpoints = append(status.Endpoints, StatePath)
+		operations = state.Register(host, set.APIMiddleware, set.Groups...)
+		mcp.Route(e.Group(APIPath), operations...)
+		status.Endpoints = append(status.Endpoints, APIPath+state.Path)
 	}
 
 	if set.MCP != nil {
 		set.MCP.Operations = append(set.MCP.Operations, operations...)
+		var names []string
+		for _, operation := range set.MCP.Operations {
+			names = append(names, operation.Name)
+		}
+		for _, page := range set.MCP.Pages {
+			for _, tool := range page.Tools {
+				names = append(names, tool.Name)
+			}
+		}
+		named := map[string]bool{}
+		for _, name := range names {
+			if named[name] {
+				return errors.New("endpoint: two tools are called " + name)
+			}
+			named[name] = true
+		}
 		set.MCP.Mount(e, set.MCPAccess...)
 		status.Endpoints = append(status.Endpoints, mcp.MountPath)
-	}
-
-	if set.Terraform != nil {
-		r := *set.Terraform
-		if r.Version == "" {
-			r.Version = set.Version
-		}
-		registry.Mount(e, r)
-		status.Endpoints = append(status.Endpoints, registry.DiscoveryPath, registry.ProvidersPath, registry.ModulesPath)
-		if r.State != nil {
-			status.Endpoints = append(status.Endpoints, registry.StatePath)
-		}
 	}
 
 	e.GET(StatusPath, func(ctx echo.Context) error {
@@ -84,4 +89,5 @@ func Mount(e *echo.Echo, set Set) {
 		}
 		return respond.JSON(ctx, http.StatusOK, Health{Healthy: true}, 1)
 	})
+	return nil
 }

@@ -30,7 +30,7 @@ func StateCommand(send Send, output *Output) *cobra.Command {
 		Args:        cobra.NoArgs,
 		Annotations: map[string]string{AnnotationMCP: mcp.AccessRead},
 		RunE: func(cmd *cobra.Command, args []string) error {
-			body, err := send(cmd, http.MethodGet, "/state", nil, "", nil)
+			body, err := send(cmd, http.MethodGet, PathState, nil, "", nil)
 			if err != nil {
 				return err
 			}
@@ -80,14 +80,14 @@ func stateExport(send Send, output *Output) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			body, err := send(cmd, http.MethodPost, "/state/export", nil, "application/json", payload)
+			body, err := send(cmd, http.MethodPost, PathState+"/export", nil, "application/json", payload)
 			if err != nil {
 				return err
 			}
 			if store {
 				return output.Print(cmd.OutOrStdout(), cmd.ErrOrStderr(), body)
 			}
-			lines := stateLines(body)
+			lines := GetStateLines(body)
 			read, err := state.Read(bytes.NewReader(lines))
 			if err != nil {
 				return &Error{Code: ExitFailure, Message: "the export is not state lines", Cause: err}
@@ -165,7 +165,7 @@ func stateImport(send Send, output *Output) *cobra.Command {
 				if chunk > 0 && len(lines) > chunk<<20 {
 					body, err = stateImportStaged(cmd, send, in, lines, chunk<<20)
 				} else {
-					body, err = send(cmd, http.MethodPost, "/state/import", query, state.MIMENDJSON, lines)
+					body, err = send(cmd, http.MethodPost, PathState+"/import", query, state.MIMENDJSON, lines)
 				}
 				if err != nil {
 					return err
@@ -175,7 +175,7 @@ func stateImport(send Send, output *Output) *cobra.Command {
 				if err != nil {
 					return err
 				}
-				body, err = send(cmd, http.MethodPost, "/state/import", nil, "application/json", payload)
+				body, err = send(cmd, http.MethodPost, PathState+"/import", nil, "application/json", payload)
 				if err != nil {
 					return err
 				}
@@ -222,7 +222,7 @@ func readState(in io.Reader, file string) ([]byte, error) {
 	return body, nil
 }
 
-func stateLines(body []byte) []byte {
+func GetStateLines(body []byte) []byte {
 	var wrapped struct {
 		Data      []json.RawMessage `json:"data"`
 		RequestID *string           `json:"request_id"`
@@ -284,7 +284,7 @@ func stateCounts(out state.ImportResponse) string {
 }
 
 func stateImportStaged(cmd *cobra.Command, send Send, in state.ImportRequest, lines []byte, size int) ([]byte, error) {
-	started, err := send(cmd, http.MethodPost, "/state/import/session", nil, "application/json", []byte("{}"))
+	started, err := send(cmd, http.MethodPost, PathState+"/import/session", nil, "application/json", []byte("{}"))
 	if err != nil {
 		return nil, err
 	}
@@ -294,7 +294,7 @@ func stateImportStaged(cmd *cobra.Command, send Send, in state.ImportRequest, li
 	if err := json.Unmarshal(started, &session); err != nil || session.Data.ID == "" {
 		return nil, &Error{Code: ExitFailure, Message: "the import session answer is not json", Cause: err}
 	}
-	path := "/state/import/session/" + session.Data.ID
+	path := PathState + "/import/session/" + session.Data.ID
 	abandon := func(err error) ([]byte, error) {
 		_, _ = send(cmd, http.MethodDelete, path, nil, "", nil)
 		return nil, err

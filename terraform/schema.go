@@ -1,6 +1,9 @@
 package terraform
 
 import (
+	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 
@@ -201,4 +204,100 @@ func typeOf(property map[string]any) tftypes.Type {
 		}
 	}
 	return tftypes.DynamicPseudoType
+}
+
+type schemaFile struct {
+	FormatVersion string                    `json:"format_version"`
+	Schemas       map[string]providerSchema `json:"provider_schemas"`
+}
+
+type providerSchema struct {
+	Provider    blockSchema            `json:"provider"`
+	Resources   map[string]blockSchema `json:"resource_schemas"`
+	DataSources map[string]blockSchema `json:"data_source_schemas"`
+}
+
+type blockSchema struct {
+	Version int64     `json:"version"`
+	Block   blockJSON `json:"block"`
+}
+
+type blockJSON struct {
+	Attributes      map[string]attributeJSON `json:"attributes,omitempty"`
+	Description     string                   `json:"description,omitempty"`
+	DescriptionKind string                   `json:"description_kind"`
+}
+
+type attributeJSON struct {
+	Type            json.RawMessage `json:"type,omitempty"`
+	NestedType      *nestedJSON     `json:"nested_type,omitempty"`
+	Description     string          `json:"description,omitempty"`
+	DescriptionKind string          `json:"description_kind"`
+	Required        bool            `json:"required,omitempty"`
+	Optional        bool            `json:"optional,omitempty"`
+	Computed        bool            `json:"computed,omitempty"`
+	Sensitive       bool            `json:"sensitive,omitempty"`
+	WriteOnly       bool            `json:"write_only,omitempty"`
+}
+
+type nestedJSON struct {
+	Attributes  map[string]attributeJSON `json:"attributes"`
+	NestingMode string                   `json:"nesting_mode"`
+}
+
+func (p Provider) GetSchemaJSON(ctx context.Context) ([]byte, error) {
+	resp, err := p.Server().GetProviderSchema(ctx, &tfprotov6.GetProviderSchemaRequest{})
+	if err != nil {
+		return nil, err
+	}
+	for _, diagnostic := range resp.Diagnostics {
+		if diagnostic.Severity == tfprotov6.DiagnosticSeverityError {
+			return nil, errors.New(diagnostic.Summary + ": " + diagnostic.Detail)
+		}
+	}
+	provider, err := blockOf(resp.Provider)
+	if err != nil {
+		return nil, err
+	}
+	out := providerSchema{Provider: provider, Resources: map[string]blockSchema{}, DataSources: map[string]blockSchema{}}
+	for name, schema := range resp.ResourceSchemas {
+		if out.Resources[name], err = blockOf(schema); err != nil {
+			return nil, err
+		}
+	}
+	return json.MarshalIndent(schemaFile{FormatVersion: "1.0", Schemas: map[string]providerSchema{p.source(): out}}, "", "  ")
+}
+
+func blockOf(schema *tfprotov6.Schema) (blockSchema, error) {
+	attributes, err := attributesJSON(schema.Block.Attributes)
+	if err != nil {
+		return blockSchema{}, err
+	}
+	return blockSchema{Version: schema.Version, Block: blockJSON{Attributes: attributes, Description: schema.Block.Description, DescriptionKind: "plain"}}, nil
+}
+
+func attributesJSON(attributes []*tfprotov6.SchemaAttribute) (map[string]attributeJSON, error) {
+	out := map[string]attributeJSON{}
+	for _, attribute := range attributes {
+		entry := attributeJSON{Description: attribute.Description, DescriptionKind: "plain", Required: attribute.Required, Optional: attribute.Optional, Computed: attribute.Computed, Sensitive: attribute.Sensitive, WriteOnly: attribute.WriteOnly}
+		if attribute.NestedType != nil {
+			nested, err := attributesJSON(attribute.NestedType.Attributes)
+			if err != nil {
+				return nil, err
+			}
+			mode := "single"
+			if attribute.NestedType.Nesting == tfprotov6.SchemaObjectNestingModeList {
+				mode = "list"
+			}
+			entry.NestedType = &nestedJSON{Attributes: nested, NestingMode: mode}
+		} else {
+			typ, err := attribute.Type.MarshalJSON()
+			if err != nil {
+				return nil, err
+			}
+			entry.Type = typ
+		}
+		out[attribute.Name] = entry
+	}
+	return out, nil
 }
