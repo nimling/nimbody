@@ -142,8 +142,17 @@ func memoryGroup[T any](m *memory, group string) state.Group[T] {
 				data["region"] = "north"
 			}
 			if record.ID == "" {
-				m.next++
-				row := &stored{id: fmt.Sprintf("%s-%d", m.prefix, m.next), external: record.Key, data: data, blobs: map[string]state.Blob{}}
+				id := record.Origin
+				for _, row := range m.rows[group] {
+					if row.id == id {
+						id = ""
+					}
+				}
+				if id == "" {
+					m.next++
+					id = fmt.Sprintf("%s-%d", m.prefix, m.next)
+				}
+				row := &stored{id: id, external: record.Key, data: data, blobs: map[string]state.Blob{}}
 				m.rows[group] = append(m.rows[group], row)
 				return row.id, nil
 			}
@@ -358,16 +367,16 @@ func TestStateRoundTrip(t *testing.T) {
 	assert.Equal(t, 2, manifest.Groups[1].Count)
 	assert.Equal(t, 1, manifest.Groups[1].Blobs)
 	assert.NotEmpty(t, manifest.Groups[0].Hash)
-	assert.JSONEq(t, `{"group":"room","key":"room-1","data":{"name":"North","seats":8,"kind":"meeting"},"refs":{"location_id":"loc-1"}}`, lines[3])
+	assert.JSONEq(t, `{"group":"room","key":"room-1","id":"room-1","data":{"name":"North","seats":8,"kind":"meeting"},"refs":{"location_id":"loc-1"}}`, lines[3])
 
 	target := newMemory("b")
 	empty, _ := stateService(target)
 	first := importState(t, empty, "", file)
 	assert.Equal(t, map[string]int{state.OutcomeCreated: 4}, first.Counts)
 	for _, result := range first.Results {
-		assert.True(t, strings.HasPrefix(result.ID, "b-"), "a created record answers its new id")
+		assert.Equal(t, result.Key, result.ID, "a created record keeps the id of its line when that id is free")
 	}
-	assert.Equal(t, file, exportState(t, empty, `{"blobs":true}`), "the import holds the same records, refs and blobs under new ids")
+	assert.Equal(t, file, exportState(t, empty, `{"blobs":true}`), "the import holds the same records, refs and blobs under the same ids")
 
 	writes := target.writes
 	second := importState(t, empty, "", file)
@@ -717,7 +726,7 @@ func TestStateStripsNestedPointers(t *testing.T) {
 	file := string(exportState(t, e, ``))
 	lines := strings.Split(strings.TrimSpace(file), "\n")
 	assert.Len(t, lines, 3)
-	assert.JSONEq(t, `{"group":"connection","key":"conn-1","data":{"name":"Calendar","type":"oauth","config":{"client_id":"public-id","region":"eu","mode":"push"},"auth":{"kind":"token"}}}`, lines[1], "exactly the flagged pointers go, the objects holding them stay")
+	assert.JSONEq(t, `{"group":"connection","key":"conn-1","id":"conn-1","data":{"name":"Calendar","type":"oauth","config":{"client_id":"public-id","region":"eu","mode":"push"},"auth":{"kind":"token"}}}`, lines[1], "exactly the flagged pointers go, the objects holding them stay")
 	assert.NotContains(t, file, "s3cret")
 	assert.NotContains(t, file, "t0ken")
 }
@@ -727,7 +736,7 @@ func TestStateStripsByDiscriminator(t *testing.T) {
 	file := string(exportState(t, e, ``))
 	lines := strings.Split(strings.TrimSpace(file), "\n")
 	assert.NotContains(t, lines[1], "r3fresh", "an oauth record loses its refresh token")
-	assert.JSONEq(t, `{"group":"connection","key":"conn-2","data":{"name":"Printer","type":"basic","config":{"client_id":"printer","refresh_token":"listed","region":"us","mode":"pull"},"auth":{"kind":"user","user":"operator"}}}`, lines[2], "a basic record loses its password and keeps what only oauth hides")
+	assert.JSONEq(t, `{"group":"connection","key":"conn-2","id":"conn-2","data":{"name":"Printer","type":"basic","config":{"client_id":"printer","refresh_token":"listed","region":"us","mode":"pull"},"auth":{"kind":"user","user":"operator"}}}`, lines[2], "a basic record loses its password and keeps what only oauth hides")
 	assert.NotContains(t, file, "p4ss")
 }
 
@@ -1001,4 +1010,30 @@ func TestStateUnderAPIRunsTheServiceChain(t *testing.T) {
 	tool := []byte(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"state","arguments":{}}}`)
 	assert.Equal(t, true, result(t, send(http.MethodPost, "/mcp", echo.MIMEApplicationJSON, "", tool))["isError"], "the tool runs the same chain")
 	assert.Nil(t, result(t, send(http.MethodPost, "/mcp", echo.MIMEApplicationJSON, "state", tool))["isError"])
+}
+
+func TestStateImportTakesANewIDWhenTheLineIDIsTaken(t *testing.T) {
+	seed := seeded()
+	seed.rows["location"][0].external = "hq"
+	source, _ := stateService(seed)
+	file := exportState(t, source, `{"targets":[{"group":"location"}]}`)
+
+	target := newMemory("b")
+	target.add("location", "loc-1", map[string]any{"name": "Elsewhere", "region": "south"}).external = "other"
+	e, _ := stateService(target)
+	out := importState(t, e, "", file)
+	ids := map[string]string{}
+	for _, result := range out.Results {
+		ids[result.Key] = result.ID
+	}
+	assert.Equal(t, "b-1", ids["hq"], "the id is taken by another record, so the created one takes a new id")
+	assert.Equal(t, "loc-2", ids["loc-2"], "a free id is kept")
+}
+
+func TestStateReadsALineWithoutID(t *testing.T) {
+	file := "{\"format\":\"" + state.FormatVersion + "\",\"service\":\"demo\",\"version\":\"1\",\"scope\":[],\"groups\":[]}\n{\"group\":\"location\",\"key\":\"loc-9\",\"data\":{\"name\":\"Old\"}}\n"
+	e, _ := stateService(newMemory("b"))
+	out := importState(t, e, "", []byte(file))
+	assert.Equal(t, map[string]int{state.OutcomeCreated: 1}, out.Counts)
+	assert.Equal(t, "b-1", out.Results[0].ID, "a line from before ids were exported creates under a new id, as before")
 }

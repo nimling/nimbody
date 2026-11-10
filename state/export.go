@@ -158,7 +158,7 @@ func (s *service) line(c *Context, g group, row exported, keys map[string]map[st
 			delete(data, field)
 		}
 	}
-	line := Line{Group: g.name, Key: row.key, Data: data}
+	line := Line{Group: g.name, Key: row.key, ID: row.id, Data: data}
 	if len(refs) > 0 {
 		line.Refs = refs
 	}

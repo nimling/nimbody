@@ -35,6 +35,7 @@ type Manifest struct {
 type Line struct {
 	Group string         `json:"group"`
 	Key   string         `json:"key"`
+	ID    string         `json:"id,omitempty"`
 	Data  map[string]any `json:"data"`
 	Refs  map[string]any `json:"refs,omitempty"`
 }

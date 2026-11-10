@@ -228,7 +228,7 @@ func (s *service) importLine(r *run, g group, line Line, existing exported, blob
 			return result
 		}
 		err := r.write(func() error {
-			written, put, err := g.write(r.c, "", line.Key, data)
+			written, put, err := g.write(r.c, "", line.ID, line.Key, data)
 			if err != nil {
 				return err
 			}
@@ -278,7 +278,7 @@ func (s *service) importLine(r *run, g group, line Line, existing exported, blob
 	err = r.write(func() error {
 		put := existing.put
 		if !same {
-			_, written, err := g.write(r.c, id, line.Key, data)
+			_, written, err := g.write(r.c, id, "", line.Key, data)
 			if err != nil {
 				return err
 			}

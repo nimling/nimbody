@@ -68,10 +68,11 @@ type Query struct {
 }
 
 type Record[T any] struct {
-	ID   string
-	Key  string
-	Data T
-	Body *nimbody.BodyValidator
+	ID     string
+	Origin string
+	Key    string
+	Data   T
+	Body   *nimbody.BodyValidator
 }
 
 type Blobs[T any] struct {
@@ -180,7 +181,7 @@ type group struct {
 	sensitive func() map[string][]string
 	blobs     bool
 	export    func(ctx *Context, query Query) ([]exported, error)
-	write     func(ctx *Context, id, key string, data map[string]any) (string, func(ctx *Context, blob Blob) error, error)
+	write     func(ctx *Context, id, origin, key string, data map[string]any) (string, func(ctx *Context, blob Blob) error, error)
 	delete    func(ctx *Context, id string) error
 }
 
@@ -234,12 +235,12 @@ func (g Group[T]) definition() group {
 		}
 		return out, nil
 	}
-	defined.write = func(ctx *Context, id, key string, data map[string]any) (string, func(ctx *Context, blob Blob) error, error) {
+	defined.write = func(ctx *Context, id, origin, key string, data map[string]any) (string, func(ctx *Context, blob Blob) error, error) {
 		body, err := json.Marshal(data)
 		if err != nil {
 			return "", nil, err
 		}
-		record := Record[T]{ID: id, Key: key, Body: &nimbody.BodyValidator{Body: nimbody.JSONBody(data)}}
+		record := Record[T]{ID: id, Origin: origin, Key: key, Body: &nimbody.BodyValidator{Body: nimbody.JSONBody(data)}}
 		if err := json.Unmarshal(body, &record.Data); err != nil {
 			return "", nil, echo.NewHTTPError(http.StatusBadRequest, err.Error())
 		}
