@@ -120,7 +120,7 @@ func stateImport(send Send, output *Output) *cobra.Command {
 	var chunk int
 	cmd := &cobra.Command{
 		Use:         "import [file]",
-		Short:       "Import state lines from a file, stdin or a stored asset: upsert, create or sync, with deletes by key and a dry run",
+		Short:       "Import state lines from a file, stdin or a stored asset: upsert, create, sync or skip, with deletes by key and a dry run",
 		Example:     "state import rooms.ndjson --mode sync --target room:location=hq --dry-run",
 		Args:        cobra.MaximumNArgs(1),
 		Annotations: map[string]string{AnnotationMCP: mcp.AccessDestructive},
@@ -203,7 +203,7 @@ func stateImport(send Send, output *Output) *cobra.Command {
 	}
 	flags := cmd.Flags()
 	flags.BoolVar(&dryRun, "dry-run", false, "list every outcome and write nothing")
-	flags.StringVar(&mode, "mode", "", "upsert (default), create, or sync, which also deletes what the targets reach and the file lacks")
+	flags.StringVar(&mode, "mode", "", "upsert (default), create, sync, which also deletes what the targets reach and the file lacks, or skip, which leaves every record that exists as it is")
 	flags.StringArrayVar(&deletes, "delete", nil, "delete a record as group:key, repeatable")
 	flags.StringArrayVar(&targets, "target", nil, "import only this group, group:field=value to narrow what a sync deletes, repeatable")
 	flags.StringVar(&asset, "asset", "", "import a stored export by its asset id instead of a file")

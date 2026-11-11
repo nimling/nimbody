@@ -31,8 +31,8 @@ func (s *service) importFile(c *Context, in ImportRequest, file File) (ImportRes
 	if mode == "" {
 		mode = ModeUpsert
 	}
-	if mode != ModeUpsert && mode != ModeCreate && mode != ModeSync {
-		return ImportResponse{}, echo.NewHTTPError(http.StatusBadRequest, "mode is upsert, create or sync, not "+mode)
+	if mode != ModeUpsert && mode != ModeCreate && mode != ModeSync && mode != ModeSkip {
+		return ImportResponse{}, echo.NewHTTPError(http.StatusBadRequest, "mode is upsert, create, sync or skip, not "+mode)
 	}
 	selected := map[string]bool{}
 	if len(in.Targets) > 0 {
@@ -216,6 +216,12 @@ func (s *service) importLine(r *run, g group, line Line, existing exported, blob
 	id, err := r.id(g.name, line.Key)
 	if err != nil {
 		return r.refuse(result, err)
+	}
+	if id != "" && r.mode == ModeSkip {
+		result.ID = id
+		r.remember(g.name, line.Key, id)
+		result.Outcome = OutcomeUnchanged
+		return result
 	}
 	data, err := s.resolve(r, g, line)
 	if err != nil {

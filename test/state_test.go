@@ -485,6 +485,99 @@ func TestStateFieldFlagsDecideDrift(t *testing.T) {
 	assert.Equal(t, state.OutcomeUnchanged, outcomes(created)["room:room-1"])
 }
 
+func TestStateModesDecideWhatAnExistingRecordGets(t *testing.T) {
+	m := seeded()
+	source, _ := stateService(m)
+	base := exportState(t, source, `{"blobs":true}`)
+
+	read, err := state.Read(bytes.NewReader(base))
+	require.NoError(t, err)
+	for i := range read.Manifest.Groups {
+		read.Manifest.Groups[i].Hash = ""
+	}
+	var unhashed bytes.Buffer
+	require.NoError(t, read.Write(&unhashed))
+	edited := strings.Replace(unhashed.String(), `"seats":8`, `"seats":10`, 1)
+	edited = strings.Replace(edited, `"kind":"desk"`, `"kind":"meeting"`, 1)
+	input := []byte(edited + `{"group":"room","key":"room-3","data":{"name":"Hub","seats":2,"kind":"desk"},"refs":{"location_id":"loc-1"}}` + "\n")
+
+	m.rows["room"][0].blobs["photo"] = state.Blob{Name: "photo", MIME: "image/png", Data: []byte("south photo")}
+	drifted := exportState(t, source, `{"blobs":true}`)
+
+	prepared := func() (*echo.Echo, *memory) {
+		target := newMemory("b")
+		e, _ := stateService(target)
+		importState(t, e, "", base)
+		return e, target
+	}
+	room := func(target *memory, id string) *stored {
+		for _, row := range target.rows["room"] {
+			if row.id == id {
+				return row
+			}
+		}
+		return &stored{blobs: map[string]state.Blob{}}
+	}
+
+	for _, mode := range []struct {
+		name       string
+		query      string
+		missing    string
+		identical  string
+		differs    string
+		immutable  string
+		drift      string
+		seats      string
+		kind       string
+		photo      string
+		writes     int
+		blobWrites int
+	}{
+		{name: state.ModeUpsert, query: "", missing: state.OutcomeCreated, identical: state.OutcomeUnchanged, differs: state.OutcomeUpdated, immutable: state.OutcomeRefused, drift: state.OutcomeUpdated, seats: "10", kind: "desk", photo: "south photo", writes: 2, blobWrites: 1},
+		{name: state.ModeCreate, query: "mode=create", missing: state.OutcomeCreated, identical: state.OutcomeUnchanged, differs: state.OutcomeRefused, immutable: state.OutcomeRefused, drift: state.OutcomeRefused, seats: "8", kind: "desk", photo: "north photo", writes: 1, blobWrites: 0},
+		{name: state.ModeSync, query: "mode=sync", missing: state.OutcomeCreated, identical: state.OutcomeUnchanged, differs: state.OutcomeUpdated, immutable: state.OutcomeRefused, drift: state.OutcomeUpdated, seats: "10", kind: "desk", photo: "south photo", writes: 2, blobWrites: 1},
+		{name: state.ModeSkip, query: "mode=skip", missing: state.OutcomeCreated, identical: state.OutcomeUnchanged, differs: state.OutcomeUnchanged, immutable: state.OutcomeUnchanged, drift: state.OutcomeUnchanged, seats: "8", kind: "desk", photo: "north photo", writes: 1, blobWrites: 0},
+	} {
+		t.Run(mode.name, func(t *testing.T) {
+			want := map[string]string{
+				"room:room-3":    mode.missing,
+				"location:loc-1": mode.identical,
+				"location:loc-2": mode.identical,
+				"room:room-1":    mode.differs,
+				"room:room-2":    mode.immutable,
+			}
+			e, target := prepared()
+			writes := target.writes
+
+			planned := importState(t, e, "dry_run=true&"+mode.query, input)
+			assert.Equal(t, mode.name, planned.Mode, "a caller that sends no mode gets upsert")
+			assert.True(t, planned.DryRun)
+			assert.Equal(t, want, outcomes(planned), "a dry run reports the outcomes of its mode")
+			assert.Equal(t, writes, target.writes, "a dry run writes nothing")
+			assert.Equal(t, 2, target.count("room"))
+
+			out := importState(t, e, mode.query, input)
+			assert.Equal(t, mode.name, out.Mode)
+			assert.Equal(t, want, outcomes(out))
+			assert.Equal(t, writes+mode.writes, target.writes)
+			assert.Equal(t, 3, target.count("room"), "a record the target lacks is created in every mode")
+			assert.Equal(t, mode.seats, fmt.Sprint(room(target, "room-1").data["seats"]))
+			assert.Equal(t, mode.kind, fmt.Sprint(room(target, "room-2").data["kind"]), "an immutable field never changes in place")
+
+			blobbed, blobTarget := prepared()
+			writes = blobTarget.writes
+			planned = importState(t, blobbed, "dry_run=true&"+mode.query, drifted)
+			assert.Equal(t, mode.drift, outcomes(planned)["room:room-1"])
+			assert.Equal(t, writes, blobTarget.writes)
+
+			out = importState(t, blobbed, mode.query, drifted)
+			assert.Equal(t, mode.drift, outcomes(out)["room:room-1"], "a record whose blob alone differs")
+			assert.Equal(t, writes+mode.blobWrites, blobTarget.writes)
+			assert.Equal(t, mode.photo, string(room(blobTarget, "room-1").blobs["photo"].Data))
+		})
+	}
+}
+
 func TestStateExportDeclaresAnUnboundedFrame(t *testing.T) {
 	e, _ := stateService(seeded())
 	rec := call(e, http.MethodPost, "/api/state/export", echo.MIMEApplicationJSON, respond.MIMEEventStream, []byte(`{}`))
