@@ -1220,3 +1220,131 @@ func TestRemoteBridgeKeepsTheLocalTools(t *testing.T) {
 	assert.Equal(t, "cleared", byID[3]["result"].(map[string]any)["content"].([]any)[0].(map[string]any)["text"])
 	assert.Equal(t, "ui://demo/run", byID[4]["result"].(map[string]any)["contents"].([]any)[0].(map[string]any)["uri"])
 }
+
+func tableService() *echo.Echo {
+	auth := func(next echo.HandlerFunc) echo.HandlerFunc {
+		return func(ctx echo.Context) error {
+			if ctx.Request().Header.Get(echo.HeaderAuthorization) != "Bearer good" {
+				return ctx.String(http.StatusUnauthorized, "Unauthorized")
+			}
+			ctx.Set("user", "reader-one")
+			return next(ctx)
+		}
+	}
+	e := echo.New()
+	api := e.Group("/api", auth)
+	api.GET("/articles", func(ctx echo.Context) error {
+		rows := []article{{ID: "a", Title: "Orion", Reader: ctx.Get("user").(string)}, {ID: "b", Title: ctx.QueryParam("title")}}
+		return respond.JSON(ctx, http.StatusOK, rows, 2)
+	})
+	api.GET("/articles/:article_id", func(ctx echo.Context) error {
+		if ctx.Param("article_id") == "locked" {
+			return respond.Error(ctx, http.StatusForbidden, "no claim reaches article locked")
+		}
+		return respond.JSON(ctx, http.StatusOK, article{ID: ctx.Param("article_id"), Title: "Orion", Reader: ctx.Get("user").(string)}, 1)
+	})
+	api.POST("/articles", func(ctx echo.Context) error {
+		var in articleCreate
+		if err := ctx.Bind(&in); err != nil {
+			return respond.Error(ctx, http.StatusBadRequest, "Invalid JSON body")
+		}
+		steps := respond.GetSteps(ctx)
+		steps.Start("store", "store the article", "")
+		steps.Done("store", nil)
+		return respond.JSON(ctx, http.StatusCreated, article{ID: "new", Title: in.Title, Reader: ctx.Get("user").(string)}, 1)
+	})
+	api.DELETE("/articles/:article_id", func(ctx echo.Context) error {
+		return respond.NoContent(ctx, http.StatusNoContent)
+	})
+	api.GET("/articles/:article_id/cover", func(ctx echo.Context) error {
+		return ctx.Blob(http.StatusOK, "image/png", []byte("png"))
+	})
+	table := cli.Table{Name: "demo", Resources: []cli.Resource{{
+		Name: "article",
+		Verbs: []cli.Verb{
+			{Name: "get", Short: "Read articles, or one", Method: http.MethodGet, Paths: []string{"/api/articles", "/api/articles/{article_id}"}},
+			{Name: "create", Short: "Add an article", Method: http.MethodPost, Paths: []string{"/api/articles"}, Body: true},
+			{Name: "delete", Short: "Remove an article", Method: http.MethodDelete, Paths: []string{"", "/api/articles/{article_id}"}},
+			{Name: "upload", Short: "Upload a cover", Method: http.MethodPost, Paths: []string{"", "/api/articles/{article_id}/cover"}, Upload: true},
+		},
+		Children: []cli.Resource{{Name: "cover", Verbs: []cli.Verb{{Name: "get", Short: "Read the cover", Method: http.MethodGet, Paths: []string{"", "/api/articles/{article_id}/cover"}}}}},
+	}}}
+	server := &mcp.Server{Name: "demo", Version: "v1", Operations: table.Operations(), AuthorizationServer: "https://auth.example.test"}
+	server.Mount(e, auth)
+	return e
+}
+
+func TestTableOperationsAreTheCommandTools(t *testing.T) {
+	e := tableService()
+	rec := post(e, "good", "application/json", `{"jsonrpc":"2.0","id":1,"method":"tools/list"}`)
+	tools := map[string]map[string]any{}
+	for _, tool := range result(t, rec)["tools"].([]any) {
+		tools[tool.(map[string]any)["name"].(string)] = tool.(map[string]any)
+	}
+	assert.ElementsMatch(t, []string{"article_get", "article_create", "article_delete", "article_cover_get"}, mapKeys(tools), "an upload verb stays a local tool")
+	assert.Equal(t, true, tools["article_get"]["annotations"].(map[string]any)["readOnlyHint"])
+	assert.Equal(t, true, tools["article_delete"]["annotations"].(map[string]any)["destructiveHint"])
+	get := tools["article_get"]["inputSchema"].(map[string]any)
+	assert.Nil(t, get["required"], "article_id is optional where one path takes none")
+	assert.Contains(t, get["properties"], "query")
+	assert.Contains(t, get["properties"], "limit")
+	assert.Equal(t, []any{"article_id"}, tools["article_delete"]["inputSchema"].(map[string]any)["required"])
+	assert.Contains(t, tools["article_create"]["inputSchema"].(map[string]any)["properties"], "body")
+	assert.NotContains(t, get["properties"], "body")
+}
+
+func mapKeys(tools map[string]map[string]any) []string {
+	keys := make([]string, 0, len(tools))
+	for key := range tools {
+		keys = append(keys, key)
+	}
+	return keys
+}
+
+func TestTableOperationReachesTheRouteAsTheCaller(t *testing.T) {
+	e := tableService()
+	called := result(t, post(e, "good", "application/json", `{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"article_get","arguments":{"article_id":"42"}}}`))
+	assert.Nil(t, called["isError"])
+	assert.Equal(t, map[string]any{"id": "42", "title": "Orion", "reader": "reader-one", "lead": nil}, called["structuredContent"].(map[string]any)["data"])
+
+	called = result(t, post(e, "good", "application/json", `{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"article_get","arguments":{"query":{"title":"Atlas"},"jq":".[].title"}}}`))
+	assert.Equal(t, "Orion\nAtlas\n", called["content"].([]any)[0].(map[string]any)["text"], "the path without an id is picked and query reaches the route")
+
+	called = result(t, post(e, "good", "application/json", `{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"article_get","arguments":{"article_id":"locked"}}}`))
+	assert.Equal(t, true, called["isError"])
+	assert.Equal(t, "no claim reaches article locked", called["content"].([]any)[0].(map[string]any)["text"], "the route's refusal is the tool's")
+
+	called = result(t, post(e, "good", "application/json", `{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"article_create","arguments":{"body":{"title":"Vega"}}}}`))
+	assert.Nil(t, called["isError"])
+	assert.Equal(t, "Vega", called["structuredContent"].(map[string]any)["data"].(map[string]any)["title"])
+	assert.Equal(t, float64(http.StatusCreated), called["structuredContent"].(map[string]any)["status"])
+
+	called = result(t, post(e, "good", "application/json", `{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"article_delete","arguments":{"article_id":"42"}}}`))
+	assert.Nil(t, called["isError"])
+
+	called = result(t, post(e, "good", "application/json", `{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"article_cover_get","arguments":{"article_id":"42"}}}`))
+	assert.Equal(t, "image", called["content"].([]any)[0].(map[string]any)["type"], "a non json answer is the bytes")
+}
+
+func TestTableOperationNeedsTheCallersToken(t *testing.T) {
+	e := tableService()
+	rec := post(e, "", "application/json", `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"article_get","arguments":{"article_id":"42"}}}`)
+	assert.Equal(t, http.StatusUnauthorized, rec.Code)
+}
+
+func TestTableOperationStreamsTheRoutesSteps(t *testing.T) {
+	e := tableService()
+	rec := post(e, "good", "application/json, text/event-stream", `{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"article_create","arguments":{"body":{"title":"Vega"}},"_meta":{"progressToken":"p3"}}}`)
+	assert.Equal(t, respond.MIMEEventStream, rec.Header().Get(echo.HeaderContentType))
+	var messages []map[string]any
+	for _, line := range strings.Split(rec.Body.String(), "\n") {
+		if data, ok := strings.CutPrefix(line, "data: "); ok {
+			var message map[string]any
+			assert.NoError(t, json.Unmarshal([]byte(data), &message))
+			messages = append(messages, message)
+		}
+	}
+	assert.NotEmpty(t, messages)
+	assert.Equal(t, "notifications/progress", messages[0]["method"])
+	assert.Equal(t, float64(8), messages[len(messages)-1]["id"])
+}

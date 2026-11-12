@@ -234,6 +234,45 @@ func Define[In any, Out any](spec Spec, service func(ctx echo.Context, in In) (O
 	return operation
 }
 
+func Forward(spec Spec, inputs []Input) Operation {
+	return Operation{
+		Spec:        spec,
+		Inputs:      inputs,
+		InputSchema: inputSchema(inputs, reflect.TypeFor[struct{}]()),
+		call: func(ctx echo.Context, arguments json.RawMessage) (structured, int, error) {
+			recorder, captured := ctx.Response().Writer.(*capture)
+			if !captured {
+				recorder = &capture{header: http.Header{}}
+			}
+			ctx.Echo().ServeHTTP(recorder, ctx.Request())
+			status := recorder.code()
+			if status >= http.StatusBadRequest {
+				return structured{}, 0, recorder.rejection()
+			}
+			if status == http.StatusNoContent {
+				return structured{Status: status}, 0, nil
+			}
+			body := respond.ReturnObject{}
+			switch {
+			case recorder.result != nil:
+				body = recorder.result.Body
+			case isJSON(recorder.header.Get(echo.HeaderContentType)):
+				if err := json.Unmarshal(recorder.body.Bytes(), &body); err != nil {
+					return structured{}, 0, err
+				}
+			default:
+				blob := Blob{Content: recorder.body.Bytes(), ContentType: recorder.header.Get(echo.HeaderContentType), ETag: recorder.header.Get("ETag"), CacheControl: recorder.header.Get(echo.HeaderCacheControl)}
+				return structured{Data: blob, Status: status}, 1, nil
+			}
+			total := body.Count
+			if body.Pagination != nil && body.Pagination.Total > total {
+				total = body.Pagination.Total
+			}
+			return structured{Data: body.Data, Status: status, Count: &body.Count}, total, nil
+		},
+	}
+}
+
 func Route(group *echo.Group, operations ...Operation) {
 	for _, operation := range operations {
 		for _, path := range operation.paths() {

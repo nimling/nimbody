@@ -95,25 +95,90 @@ func (t Table) output() *Output {
 	return t.Output
 }
 
+func (t Table) Operations() []mcp.Operation {
+	var operations []mcp.Operation
+	var walk func(parents []string, resources []Resource)
+	walk = func(parents []string, resources []Resource) {
+		for _, resource := range resources {
+			path := append(append([]string{}, parents...), resource.Name)
+			for _, verb := range resource.Verbs {
+				if verb.Upload {
+					continue
+				}
+				operations = append(operations, verb.operation(path))
+			}
+			walk(path, resource.Children)
+		}
+	}
+	walk(nil, t.Resources)
+	return operations
+}
+
+func (v Verb) operation(path []string) mcp.Operation {
+	var routes []string
+	for _, target := range v.Paths {
+		if target != "" {
+			routes = append(routes, target)
+		}
+	}
+	var inputs []mcp.Input
+	seen := map[string]int{}
+	for _, route := range routes {
+		for _, name := range v.placeholders(route, nil) {
+			seen[name]++
+			if seen[name] == 1 {
+				inputs = append(inputs, mcp.Input{Name: name, Param: name, In: mcp.InPath, Kind: "string", Usage: "the " + strings.ReplaceAll(name, "_", " ")})
+			}
+		}
+	}
+	for index, input := range inputs {
+		inputs[index].Required = seen[input.Name] == len(routes)
+	}
+	inputs = append(inputs, mcp.Input{Name: "query", Param: "*", In: mcp.InQuery, Kind: "object", Usage: "the server's own filters, key to value, as the cli's --query"})
+	if v.Body {
+		inputs = append(inputs, mcp.Input{Name: "body", Param: "*", In: mcp.InBody, Kind: "object", Usage: "the request body as json, as the cli's --data"})
+	}
+	for index, route := range routes {
+		for _, name := range v.placeholders(route, nil) {
+			route = strings.Replace(route, "{"+name+"}", ":"+name, 1)
+		}
+		routes[index] = route
+	}
+	spec := mcp.Spec{
+		Name:        strings.ReplaceAll(strings.Join(append(append([]string{}, path...), v.Name), "_"), "-", "_"),
+		Description: v.Short,
+		Method:      v.Method,
+		Access:      v.access(),
+		Example:     v.Example,
+	}
+	if len(routes) > 0 {
+		spec.Path, spec.Paths = routes[0], routes[1:]
+	}
+	return mcp.Forward(spec, inputs)
+}
+
+func (v Verb) access() string {
+	if v.Access != "" {
+		return v.Access
+	}
+	switch v.Method {
+	case http.MethodGet, http.MethodHead:
+		return mcp.AccessRead
+	case http.MethodDelete:
+		return mcp.AccessDestructive
+	}
+	return mcp.AccessWrite
+}
+
 func (t Table) verb(verb Verb, path []string) *cobra.Command {
 	body := &Body{}
 	least, most := verb.arities()
-	access := verb.Access
-	if access == "" {
-		access = mcp.AccessWrite
-		switch verb.Method {
-		case http.MethodGet, http.MethodHead:
-			access = mcp.AccessRead
-		case http.MethodDelete:
-			access = mcp.AccessDestructive
-		}
-	}
 	cmd := &cobra.Command{
 		Use:         verb.use(t.Fill),
 		Short:       verb.Short,
 		Example:     verb.Example,
 		Args:        cobra.RangeArgs(least, most),
-		Annotations: map[string]string{AnnotationMCP: access},
+		Annotations: map[string]string{AnnotationMCP: verb.access()},
 		RunE: func(cmd *cobra.Command, args []string) error {
 			target, err := verb.path(args, t.Fill)
 			if err != nil {
