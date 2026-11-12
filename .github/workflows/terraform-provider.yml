@@ -1,0 +1,66 @@
+name: Publish a Terraform provider
+
+on:
+  workflow_call:
+    inputs:
+      cli:
+        description: the cli that is the provider, sauth, book, scon, ssync, sdm or hvrg
+        required: true
+        type: string
+      repository:
+        description: the service repository whose release built the provider, owner/name
+        required: true
+        type: string
+      tag:
+        description: the service release tag, v<version>
+        required: true
+        type: string
+    secrets:
+      repo_token:
+        description: reads the release of the private service repository
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ inputs.tag }}
+      CLI: ${{ inputs.cli }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download the provider files from the service release
+        env:
+          GH_TOKEN: ${{ secrets.repo_token }}
+        run: |
+          gh release download "$TAG" --repo "${{ inputs.repository }}" --dir dist \
+            --pattern "terraform-provider-${CLI}_*" \
+            --pattern "${CLI}-provider-docs_*.tar.gz"
+          ls dist
+
+      - name: Place the docs
+        run: |
+          rm -rf docs
+          mkdir docs
+          tar -xzf "dist/${CLI}-provider-docs_${TAG#v}.tar.gz" -C docs
+          rm "dist/${CLI}-provider-docs_${TAG#v}.tar.gz"
+
+      - name: Commit the docs and tag the release
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add docs
+          git diff --cached --quiet || git commit -m "$TAG"
+          git tag -f "$TAG"
+          git push origin HEAD:${{ github.ref_name }}
+          git push -f origin "$TAG"
+
+      - name: Create the release and attach the files
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "$TAG" > /dev/null 2>&1 || gh release create "$TAG" --title "$TAG" --notes "The $CLI provider, built by the release $TAG of ${{ inputs.repository }}." --verify-tag
+          gh release upload "$TAG" dist/* --clobber

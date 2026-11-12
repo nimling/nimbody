@@ -17,7 +17,7 @@ import (
 
 const DefaultHost = "registry.terraform.io"
 
-const DefaultNamespace = "samna"
+const DefaultNamespace = "nimling"
 
 type Provider struct {
 	Name     string

@@ -28,7 +28,7 @@ What `stream/`, `mcp/`, `cli/` and `state/` do: `.nimpress/packages.md`.
 ## Index
 
 1. `.claude/rules/packages.md`, always: package boundaries and dependencies, the dependency whitelist, fixing here and never in a consumer, and the version bump each kind of change takes.
-2. `.claude/rules/deploy.md`, always: tests under `test/`, the recipes, and the release constraints.
+2. `.claude/rules/deploy.md`, always: tests under `test/`, the recipes, the release constraints, and the workflow that publishes a Terraform provider.
 3. `.claude/rules/envelope.md`, path scoped to `respond/`, `stream/`, `mcp/` and `test/`: what is frozen in the envelope, pagination and step stream contract.
 4. Hidden docs in `.nimpress/`: `envelope.md`, the envelope, pagination and step stream contract; `packages.md`, what `stream/`, `mcp/` and `cli/` do; `standards.md` and `compliance.md`.
 5. `.claude/skills/deploy`: use when the user says deploy, release or ship in this repo.
