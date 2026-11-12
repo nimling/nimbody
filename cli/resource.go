@@ -173,11 +173,15 @@ func (v Verb) access() string {
 func (t Table) verb(verb Verb, path []string) *cobra.Command {
 	body := &Body{}
 	least, most := verb.arities()
+	args := cobra.RangeArgs(least, most)
+	if least == most {
+		args = cobra.ExactArgs(least)
+	}
 	cmd := &cobra.Command{
 		Use:         verb.use(t.Fill),
 		Short:       verb.Short,
 		Example:     verb.Example,
-		Args:        cobra.RangeArgs(least, most),
+		Args:        args,
 		Annotations: map[string]string{AnnotationMCP: verb.access()},
 		RunE: func(cmd *cobra.Command, args []string) error {
 			target, err := verb.path(args, t.Fill)

@@ -1348,3 +1348,17 @@ func TestTableOperationStreamsTheRoutesSteps(t *testing.T) {
 	assert.Equal(t, "notifications/progress", messages[0]["method"])
 	assert.Equal(t, float64(8), messages[len(messages)-1]["id"])
 }
+
+func TestTableVerbWithOneArityNamesTheExactCount(t *testing.T) {
+	root := &cobra.Command{Use: "demo"}
+	cli.Table{Name: "demo", Resources: []cli.Resource{{Name: "article", Verbs: []cli.Verb{
+		{Name: "delete", Short: "Remove an article", Method: http.MethodDelete, Paths: []string{"", "/api/articles/{article_id}"}},
+		{Name: "get", Short: "Read articles, or one", Method: http.MethodGet, Paths: []string{"/api/articles", "/api/articles/{article_id}"}},
+	}}}}.Mount(root)
+	root.SetArgs([]string{"article", "delete"})
+	root.SilenceUsage, root.SilenceErrors = true, true
+	err := root.Execute()
+	assert.EqualError(t, err, "accepts 1 arg(s), received 0")
+	root.SetArgs([]string{"article", "get", "a", "b"})
+	assert.EqualError(t, root.Execute(), "accepts between 0 and 1 arg(s), received 2")
+}
