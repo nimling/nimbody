@@ -423,6 +423,37 @@ func TestStateSyncPrunesInsideTheScope(t *testing.T) {
 	assert.Equal(t, http.StatusBadRequest, rec.Code, "a key both imported and deleted is rejected before anything is written")
 }
 
+func TestStateReplacePrunesEveryGroup(t *testing.T) {
+	source, _ := stateService(seeded())
+	file := exportState(t, source, ``)
+
+	target := newMemory("b")
+	e, _ := stateService(target)
+	importState(t, e, "", file)
+	target.add("location", "stray-site", map[string]any{"name": "Stray site", "region": "south"})
+	target.add("room", "stray-desk", map[string]any{"name": "Stray", "location_id": "b-1", "seats": 1, "kind": "desk"})
+
+	synced := importState(t, e, "mode=sync&target=room:kind=meeting", file)
+	assert.NotContains(t, outcomes(synced), "room:stray-desk", "a sync prunes only what its targets reach")
+	assert.NotContains(t, outcomes(synced), "location:stray-site")
+	assert.Equal(t, 3, target.count("room"))
+	assert.Equal(t, 3, target.count("location"))
+
+	planned := importState(t, e, "dry_run=true&mode=replace&target=room", file)
+	assert.Equal(t, state.OutcomeDeleted, outcomes(planned)["room:stray-desk"])
+	assert.Equal(t, state.OutcomeDeleted, outcomes(planned)["location:stray-site"], "a replace prunes a group outside the targets")
+	assert.Equal(t, 3, target.count("room"), "a dry run writes nothing")
+	assert.Equal(t, 3, target.count("location"))
+
+	replaced := importState(t, e, "mode=replace", file)
+	assert.Equal(t, state.ModeReplace, replaced.Mode)
+	assert.Equal(t, state.OutcomeDeleted, outcomes(replaced)["room:stray-desk"])
+	assert.Equal(t, state.OutcomeDeleted, outcomes(replaced)["location:stray-site"], "only the imported state stays")
+	assert.Equal(t, state.OutcomeUnchanged, outcomes(replaced)["location:loc-1"])
+	assert.Equal(t, 2, target.count("room"))
+	assert.Equal(t, 2, target.count("location"))
+}
+
 func TestStateDryRunWritesNothing(t *testing.T) {
 	source, _ := stateService(seeded())
 	file := exportState(t, source, `{"blobs":true}`)
@@ -537,6 +568,7 @@ func TestStateModesDecideWhatAnExistingRecordGets(t *testing.T) {
 		{name: state.ModeCreate, query: "mode=create", missing: state.OutcomeCreated, identical: state.OutcomeUnchanged, differs: state.OutcomeRefused, immutable: state.OutcomeRefused, drift: state.OutcomeRefused, seats: "8", kind: "desk", photo: "north photo", writes: 1, blobWrites: 0},
 		{name: state.ModeSync, query: "mode=sync", missing: state.OutcomeCreated, identical: state.OutcomeUnchanged, differs: state.OutcomeUpdated, immutable: state.OutcomeRefused, drift: state.OutcomeUpdated, seats: "10", kind: "desk", photo: "south photo", writes: 2, blobWrites: 1},
 		{name: state.ModeSkip, query: "mode=skip", missing: state.OutcomeCreated, identical: state.OutcomeUnchanged, differs: state.OutcomeUnchanged, immutable: state.OutcomeUnchanged, drift: state.OutcomeUnchanged, seats: "8", kind: "desk", photo: "north photo", writes: 1, blobWrites: 0},
+		{name: state.ModeReplace, query: "mode=replace", missing: state.OutcomeCreated, identical: state.OutcomeUnchanged, differs: state.OutcomeUpdated, immutable: state.OutcomeRefused, drift: state.OutcomeUpdated, seats: "10", kind: "desk", photo: "south photo", writes: 2, blobWrites: 1},
 	} {
 		t.Run(mode.name, func(t *testing.T) {
 			want := map[string]string{

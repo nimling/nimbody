@@ -31,8 +31,8 @@ func (s *service) importFile(c *Context, in ImportRequest, file File) (ImportRes
 	if mode == "" {
 		mode = ModeUpsert
 	}
-	if mode != ModeUpsert && mode != ModeCreate && mode != ModeSync && mode != ModeSkip {
-		return ImportResponse{}, echo.NewHTTPError(http.StatusBadRequest, "mode is upsert, create, sync or skip, not "+mode)
+	if mode != ModeUpsert && mode != ModeCreate && mode != ModeSync && mode != ModeSkip && mode != ModeReplace {
+		return ImportResponse{}, echo.NewHTTPError(http.StatusBadRequest, "mode is upsert, create, sync, skip or replace, not "+mode)
 	}
 	selected := map[string]bool{}
 	if len(in.Targets) > 0 {
@@ -82,7 +82,7 @@ func (s *service) importFile(c *Context, in ImportRequest, file File) (ImportRes
 		}
 	}
 
-	if mode == ModeSync {
+	if mode == ModeSync || mode == ModeReplace {
 		if err := s.prune(r, in, file, incoming, removals); err != nil {
 			return ImportResponse{}, err
 		}
@@ -432,6 +432,12 @@ func putBlobs(c *Context, put func(ctx *Context, blob Blob) error, blobs []Blob)
 
 func (s *service) prune(r *run, in ImportRequest, file File, incoming map[string][]Line, removals map[string][]removal) error {
 	scope := in.Targets
+	if r.mode == ModeReplace {
+		scope = make([]Target, 0, len(s.groups))
+		for _, g := range s.groups {
+			scope = append(scope, Target{Group: g.name})
+		}
+	}
 	if len(scope) == 0 {
 		scope = file.Manifest.Scope
 	}
