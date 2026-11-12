@@ -17,3 +17,9 @@ This repo publishes one artefact: the Go module consumed via `go get github.com/
 6. The commit message is one line that describes the user visible change. The release notes derive from `git log` after the tag.
 7. `just deploy` does a patch bump. For minor or major, run `sbump minor|major --env APP_VERSION --push-version --auto --workflow` instead. The repo does not gate this; the human running the deploy picks the right bump by `.claude/rules/packages.md` Compatibility.
 8. Consumers pick it up with `go get github.com/nimling/nimbody@vX.Y.Z`.
+
+## Publishing a Terraform provider
+
+1. `.github/workflows/terraform-provider.yml` is a reusable `workflow_call` workflow. Inputs: `cli`, `repository` (the service repo, `owner/name`) and `tag` (the service release, `v<version>`). Secret: `repo_token`, a token that reads the private service repo's release. It downloads `terraform-provider-<cli>_*` and `<cli>-provider-docs_<version>.tar.gz` from that release, unpacks the docs into `docs/`, commits them, pushes the tag and creates the release with the provider files on the calling repository.
+2. The callers are the six public repos `nimling/terraform-provider-<cli>`, one per provider, each with one workflow `release.yml` on `workflow_dispatch` with the input `tag` that calls this workflow with its cli and service repo and passes `secrets.DOCKER_PACKAGE_READ` as `repo_token`; the service release starts it as its last step, `gh workflow run` with `PRIVATE_GITHUB_TOKEN`. Nothing else is written in those repos.
+3. The service release builds, signs and documents the provider; this workflow builds nothing. A change to the files a service release attaches changes the two download patterns here and nowhere else.

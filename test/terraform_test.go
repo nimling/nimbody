@@ -271,7 +271,7 @@ func TestTerraformInstall(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		file += ".exe"
 	}
-	assert.Equal(t, filepath.Join(dir, "registry.terraform.io", "samna", "demo", "1.2.3", runtime.GOOS+"_"+runtime.GOARCH, file), path, "the provider version follows the cli version")
+	assert.Equal(t, filepath.Join(dir, "registry.terraform.io", "nimling", "demo", "1.2.3", runtime.GOOS+"_"+runtime.GOARCH, file), path, "the provider version follows the cli version")
 	info, err := os.Stat(path)
 	require.NoError(t, err)
 	assert.NotZero(t, info.Mode()&0o100)
@@ -362,7 +362,7 @@ func TestTerraformSchemaCommand(t *testing.T) {
 	}
 	require.NoError(t, json.Unmarshal(body, &schemas))
 	assert.Equal(t, "1.0", schemas.FormatVersion)
-	demo, ok := schemas.Schemas["registry.terraform.io/samna/demo"]
+	demo, ok := schemas.Schemas["registry.terraform.io/nimling/demo"]
 	require.True(t, ok, "keyed by the provider source, as terraform providers schema -json keys it")
 	names := []string{}
 	for name := range demo.Resources {
