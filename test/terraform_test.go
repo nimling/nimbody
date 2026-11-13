@@ -265,13 +265,18 @@ func stringOf(value tftypes.Value) string {
 func TestTerraformInstall(t *testing.T) {
 	dir := t.TempDir()
 	p := terraform.Provider{Name: "demo", Version: func() string { return "v1.2.3" }}
-	path, err := p.Install(dir)
+	paths, err := p.Install(dir)
 	require.NoError(t, err)
 	file := "terraform-provider-demo_v1.2.3"
 	if runtime.GOOS == "windows" {
 		file += ".exe"
 	}
-	assert.Equal(t, filepath.Join(dir, "registry.terraform.io", "nimling", "demo", "1.2.3", runtime.GOOS+"_"+runtime.GOARCH, file), path, "the provider version follows the cli version")
+	platform := runtime.GOOS + "_" + runtime.GOARCH
+	assert.Equal(t, []string{
+		filepath.Join(dir, "registry.opentofu.org", "nimling", "demo", "1.2.3", platform, file),
+		filepath.Join(dir, "registry.terraform.io", "nimling", "demo", "1.2.3", platform, file),
+	}, paths, "the provider version follows the cli version, placed for OpenTofu and for Terraform")
+	path := paths[0]
 	info, err := os.Stat(path)
 	require.NoError(t, err)
 	assert.NotZero(t, info.Mode()&0o100)
@@ -362,7 +367,7 @@ func TestTerraformSchemaCommand(t *testing.T) {
 	}
 	require.NoError(t, json.Unmarshal(body, &schemas))
 	assert.Equal(t, "1.0", schemas.FormatVersion)
-	demo, ok := schemas.Schemas["registry.terraform.io/nimling/demo"]
+	demo, ok := schemas.Schemas["registry.opentofu.org/nimling/demo"]
 	require.True(t, ok, "keyed by the provider source, as terraform providers schema -json keys it")
 	names := []string{}
 	for name := range demo.Resources {

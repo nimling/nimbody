@@ -15,7 +15,9 @@ import (
 	"github.com/spf13/cobra"
 )
 
-const DefaultHost = "registry.terraform.io"
+const DefaultHost = "registry.opentofu.org"
+
+const TerraformHost = "registry.terraform.io"
 
 const DefaultNamespace = "nimling"
 
@@ -57,6 +59,22 @@ func (p Provider) source() string {
 	return host + "/" + namespace + "/" + name
 }
 
+func (p Provider) hosts() []string {
+	host, _, _ := p.address()
+	if p.Source == "" || len(strings.Split(p.Source, "/")) == 2 {
+		return []string{DefaultHost, TerraformHost}
+	}
+	return []string{host}
+}
+
+func (p Provider) hint() string {
+	if len(p.hosts()) == 2 {
+		_, namespace, name := p.address()
+		return namespace + "/" + name
+	}
+	return p.source()
+}
+
 func (p Provider) version() (string, error) {
 	version := strings.TrimPrefix(p.Version(), "v")
 	if !semver.MatchString(version) {
@@ -84,54 +102,60 @@ func PluginDir() (string, error) {
 	return filepath.Join(home, ".terraform.d", "plugins"), nil
 }
 
-func (p Provider) Install(dir string) (string, error) {
+func (p Provider) Install(dir string) ([]string, error) {
 	version, err := p.version()
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	if dir == "" {
 		if dir, err = PluginDir(); err != nil {
-			return "", err
+			return nil, err
 		}
 	}
 	executable, err := cli.Executable()
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	body, err := os.ReadFile(executable)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	file := GetFiles(p.Name, version, runtime.GOOS, runtime.GOARCH).Executable
-	host, namespace, name := p.address()
-	path := filepath.Join(dir, host, namespace, name, version, runtime.GOOS+"_"+runtime.GOARCH, file)
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return "", err
+	_, namespace, name := p.address()
+	var paths []string
+	for _, host := range p.hosts() {
+		path := filepath.Join(dir, host, namespace, name, version, runtime.GOOS+"_"+runtime.GOARCH, file)
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			return nil, err
+		}
+		if err := os.WriteFile(path, body, 0o755); err != nil {
+			return nil, err
+		}
+		paths = append(paths, path)
 	}
-	if err := os.WriteFile(path, body, 0o755); err != nil {
-		return "", err
-	}
-	return path, nil
+	return paths, nil
 }
 
 func Command(p Provider) *cobra.Command {
 	root := &cobra.Command{
 		Use:   "terraform",
-		Short: "The terraform provider this binary serves, one resource per state group",
+		Short: "The OpenTofu and Terraform provider this binary serves, one resource per state group",
 	}
 	var dir string
 	install := &cobra.Command{
 		Use:   "install",
-		Short: "Place this binary as the " + p.Name + " provider in the local terraform plugin directory, or a filesystem mirror with --dir",
+		Short: "Place this binary as the " + p.Name + " provider in the local plugin directory OpenTofu and Terraform read, under both registry hosts, or a filesystem mirror with --dir",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			path, err := p.Install(dir)
+			paths, err := p.Install(dir)
 			if err != nil {
 				return err
 			}
 			version, _ := p.version()
-			fmt.Fprintln(cmd.OutOrStdout(), path)
-			fmt.Fprintf(cmd.ErrOrStderr(), "required_providers { %s = { source = %q, version = %q } }\n", p.Name, p.source(), version)
+			for _, path := range paths {
+				fmt.Fprintln(cmd.OutOrStdout(), path)
+			}
+			fmt.Fprintf(cmd.ErrOrStderr(), "required_providers { %s = { source = %q, version = %q } }\n", p.Name, p.hint(), version)
 			return nil
 		},
 	}
