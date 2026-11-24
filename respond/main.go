@@ -57,11 +57,12 @@ type PageCursor struct {
 }
 
 type ReturnPagination struct {
-	Page  int     `json:"page,omitempty"`
-	Limit int     `json:"limit,omitempty"`
-	Total int     `json:"total,omitempty"`
-	Prev  *string `json:"prev,omitempty"`
-	Next  *string `json:"next,omitempty"`
+	Page   int     `json:"page,omitempty"`
+	Limit  int     `json:"limit,omitempty"`
+	Total  int     `json:"total,omitempty"`
+	Cursor *string `json:"cursor,omitempty"`
+	Prev   *string `json:"prev,omitempty"`
+	Next   *string `json:"next,omitempty"`
 }
 
 var (
@@ -411,6 +412,7 @@ func (r *ReturnObject) WithPagination(ctx echo.Context, count, total int) {
 				if additionalParams != "" {
 					nextURL += "&" + additionalParams
 				}
+				returnPagination.Cursor = &cursorStr
 				returnPagination.Next = &nextURL
 				returnPagination.Page = paginationObj.Page
 			}
