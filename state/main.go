@@ -22,12 +22,16 @@ const Path = "/state"
 
 const MIMENDJSON = "application/x-ndjson"
 
+const MIMEMarkdown = "text/markdown"
+
 const (
 	ModeUpsert  = "upsert"
 	ModeCreate  = "create"
 	ModeSync    = "sync"
 	ModeSkip    = "skip"
 	ModeReplace = "replace"
+	ModeMerge   = "merge"
+	ModeLatest  = "latest"
 )
 
 const (
@@ -89,6 +93,8 @@ type Group[T any] struct {
 	Refs          map[string]string
 	Filters       []string
 	Discriminator string
+	Updated       string
+	Document      string
 	Sensitive     func() map[string][]string
 	Export        func(ctx *Context, query Query) ([]Record[T], error)
 	Import        func(ctx *Context, record Record[T]) (string, error)
@@ -144,7 +150,7 @@ type Stored struct {
 
 type ImportRequest struct {
 	AssetID string              `json:"asset_id,omitempty" jsonschema:"the stored export to import"`
-	Mode    string              `json:"mode,omitempty" jsonschema:"upsert (default), create, sync, skip or replace; sync deletes what the targets reach and the input lacks, skip leaves every record that exists as it is, replace deletes every record of every group the input lacks"`
+	Mode    string              `json:"mode,omitempty" jsonschema:"upsert (default), create, sync, skip, replace, merge or latest; sync deletes what the targets reach and the input lacks, skip leaves every record that exists as it is, replace deletes every record of every group the input lacks, merge writes only the fields the input carries over the existing record, latest keeps whichever of the input and the existing record changed last"`
 	DryRun  bool                `json:"dry_run,omitempty" jsonschema:"list every outcome and write nothing"`
 	Delete  map[string][]string `json:"delete,omitempty" jsonschema:"keys to delete, per group"`
 	Targets []Target            `json:"targets,omitempty" jsonschema:"the groups to import, and the scope a sync prunes"`
@@ -182,6 +188,8 @@ type group struct {
 	fields    Fields
 	sensitive func() map[string][]string
 	blobs     bool
+	updated   string
+	document  string
 	export    func(ctx *Context, query Query) ([]exported, error)
 	write     func(ctx *Context, id, origin, key string, data map[string]any) (string, func(ctx *Context, blob Blob) error, error)
 	delete    func(ctx *Context, id string) error
@@ -192,6 +200,14 @@ func (g Group[T]) definition() group {
 		if _, err := ParsePointer(g.Discriminator); err != nil {
 			panic("state: group " + g.Name + " names discriminator " + g.Discriminator + ", which is not a field pointer")
 		}
+	}
+	if g.Updated != "" {
+		if _, err := ParsePointer(g.Updated); err != nil {
+			panic("state: group " + g.Name + " names updated " + g.Updated + ", which is not a field pointer")
+		}
+	}
+	if g.Document != "" && strings.Contains(g.Document, "/") {
+		panic("state: group " + g.Name + " names document " + g.Document + ", which is not a top level field")
 	}
 	if g.Sensitive != nil && g.Discriminator == "" {
 		panic("state: group " + g.Name + " declares sensitive fields per type without a discriminator")
@@ -205,6 +221,8 @@ func (g Group[T]) definition() group {
 		fields:    fieldsOf(g.Schema),
 		sensitive: g.Sensitive,
 		blobs:     g.Blobs.Get != nil,
+		updated:   g.Updated,
+		document:  g.Document,
 		delete:    g.Delete,
 	}
 	defined.fields.Discriminator = g.Discriminator
@@ -364,7 +382,7 @@ func Register(host Context, middleware []echo.MiddlewareFunc, definitions ...Def
 			return file.Lines()
 		})
 	exported.Route = s.postExport
-	imported := mcp.Define(mcp.Spec{Name: "state_import", Description: "Import a stored export by asset id: upsert, create, sync, skip or replace, with deletes by key and a dry run that lists every outcome", Method: http.MethodPost, Path: Path + "/import", Access: mcp.AccessDestructive, Headers: host.Headers, Middleware: chain},
+	imported := mcp.Define(mcp.Spec{Name: "state_import", Description: "Import a stored export by asset id: upsert, create, sync, skip, replace, merge or latest, with deletes by key and a dry run that lists every outcome", Method: http.MethodPost, Path: Path + "/import", Access: mcp.AccessDestructive, Headers: host.Headers, Middleware: chain},
 		func(ctx echo.Context, in ImportRequest) (ImportResponse, error) {
 			if in.AssetID == "" {
 				return ImportResponse{}, echo.NewHTTPError(http.StatusBadRequest, "an import over mcp takes asset_id")
@@ -378,7 +396,7 @@ func Register(host Context, middleware []echo.MiddlewareFunc, definitions ...Def
 	imported.Route = s.postImport
 	session := mcp.Define(mcp.Spec{Name: "state_import_session", Description: "Open an import session that takes a large file in parts before one commit imports them as one file", Method: http.MethodPost, Path: Path + "/import/session", Access: mcp.AccessWrite, Headers: host.Headers, Middleware: chain}, s.openImportSession)
 	part := mcp.Define(mcp.Spec{Name: "state_import_part", Description: "Stage one numbered part of state lines in an import session; parts are numbered from 1 and may arrive in any order", Method: http.MethodPut, Path: Path + "/import/session/:id/part/:part", Access: mcp.AccessWrite, Headers: host.Headers, Middleware: chain}, s.putImportSessionPart)
-	commit := mcp.Define(mcp.Spec{Name: "state_import_commit", Description: "Import every staged part of a session as one file: upsert, create, sync, skip or replace, with deletes by key and a dry run that lists every outcome and keeps the session", Method: http.MethodPost, Path: Path + "/import/session/:id/commit", Status: http.StatusOK, Access: mcp.AccessDestructive, Headers: host.Headers, Middleware: chain}, s.commitImportSession)
+	commit := mcp.Define(mcp.Spec{Name: "state_import_commit", Description: "Import every staged part of a session as one file: upsert, create, sync, skip, replace, merge or latest, with deletes by key and a dry run that lists every outcome and keeps the session", Method: http.MethodPost, Path: Path + "/import/session/:id/commit", Status: http.StatusOK, Access: mcp.AccessDestructive, Headers: host.Headers, Middleware: chain}, s.commitImportSession)
 	abandon := mcp.Define(mcp.Spec{Name: "state_import_session_delete", Description: "Drop an import session and its staged parts", Method: http.MethodDelete, Path: Path + "/import/session/:id", Status: http.StatusOK, Access: mcp.AccessWrite, Headers: host.Headers, Middleware: chain}, s.deleteImportSession)
 	return []mcp.Operation{schema, exported, imported, session, part, commit, abandon}
 }
@@ -490,7 +508,19 @@ func (s *service) postImport(ctx echo.Context) error {
 func (s *service) importRequest(ctx echo.Context) (ImportRequest, File, error) {
 	req := ctx.Request()
 	var in ImportRequest
-	if strings.HasPrefix(req.Header.Get(echo.HeaderContentType), MIMENDJSON) {
+	kind := req.Header.Get(echo.HeaderContentType)
+	markdown := strings.HasPrefix(kind, MIMEMarkdown)
+	lines := strings.HasPrefix(kind, MIMENDJSON)
+	var body io.Reader = req.Body
+	if !lines && !markdown {
+		raw, err := io.ReadAll(req.Body)
+		if err != nil {
+			return in, File{}, echo.NewHTTPError(http.StatusBadRequest, "the import body could not be read: "+err.Error())
+		}
+		body = bytes.NewReader(raw)
+		lines = bytes.HasPrefix(bytes.TrimLeft(raw, " \t\r\n"), []byte("["))
+	}
+	if lines || markdown {
 		values := ctx.QueryParams()
 		in.Mode = values.Get("mode")
 		in.DryRun = values.Get("dry_run") == "true"
@@ -511,13 +541,37 @@ func (s *service) importRequest(ctx echo.Context) (ImportRequest, File, error) {
 			}
 			in.Targets = append(in.Targets, target)
 		}
-		file, err := Read(req.Body)
+		if markdown {
+			if len(in.Targets) != 1 || in.Targets[0].Filter != nil || in.Targets[0].Keys != nil {
+				return in, File{}, echo.NewHTTPError(http.StatusBadRequest, "a markdown import names its group as one target=group")
+			}
+			name := in.Targets[0].Group
+			g, ok := s.byName[name]
+			if !ok {
+				return in, File{}, echo.NewHTTPError(http.StatusBadRequest, "no group is called "+name)
+			}
+			if g.document == "" {
+				return in, File{}, echo.NewHTTPError(http.StatusBadRequest, "group "+name+" takes no markdown document")
+			}
+			line, err := ReadMarkdown(body, name, g.document)
+			if err != nil {
+				return in, File{}, echo.NewHTTPError(http.StatusBadRequest, err.Error())
+			}
+			if key := values.Get("key"); key != "" {
+				line.Key = key
+			}
+			if line.Key == "" {
+				return in, File{}, echo.NewHTTPError(http.StatusBadRequest, "a markdown record carries a key, as key in its frontmatter or as the key query parameter")
+			}
+			return in, File{Manifest: Manifest{Format: FormatVersion}, Records: []Line{line}}, nil
+		}
+		file, err := Read(body)
 		if err != nil {
 			return in, File{}, echo.NewHTTPError(http.StatusBadRequest, err.Error())
 		}
 		return in, file, nil
 	}
-	if err := json.NewDecoder(req.Body).Decode(&in); err != nil {
+	if err := json.NewDecoder(body).Decode(&in); err != nil {
 		return in, File{}, echo.NewHTTPError(http.StatusBadRequest, "the import body is neither state lines nor json: "+err.Error())
 	}
 	if in.AssetID == "" {

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"sort"
+	"time"
 
 	"github.com/labstack/echo/v4"
 )
@@ -31,8 +32,8 @@ func (s *service) importFile(c *Context, in ImportRequest, file File) (ImportRes
 	if mode == "" {
 		mode = ModeUpsert
 	}
-	if mode != ModeUpsert && mode != ModeCreate && mode != ModeSync && mode != ModeSkip && mode != ModeReplace {
-		return ImportResponse{}, echo.NewHTTPError(http.StatusBadRequest, "mode is upsert, create, sync, skip or replace, not "+mode)
+	if mode != ModeUpsert && mode != ModeCreate && mode != ModeSync && mode != ModeSkip && mode != ModeReplace && mode != ModeMerge && mode != ModeLatest {
+		return ImportResponse{}, echo.NewHTTPError(http.StatusBadRequest, "mode is upsert, create, sync, skip, replace, merge or latest, not "+mode)
 	}
 	selected := map[string]bool{}
 	if len(in.Targets) > 0 {
@@ -223,6 +224,18 @@ func (s *service) importLine(r *run, g group, line Line, existing exported, blob
 		result.Outcome = OutcomeUnchanged
 		return result
 	}
+	if id != "" && r.mode == ModeLatest && existing.key != "" {
+		newer, err := changedLast(g, line, existing)
+		if err != nil {
+			return r.refuse(result, err)
+		}
+		if !newer {
+			result.ID = id
+			r.remember(g.name, line.Key, id)
+			result.Outcome = OutcomeUnchanged
+			return result
+		}
+	}
 	data, err := s.resolve(r, g, line)
 	if err != nil {
 		return r.refuse(result, err)
@@ -256,6 +269,17 @@ func (s *service) importLine(r *run, g group, line Line, existing exported, blob
 		current, err := s.line(r.c, g, existing, r.keys)
 		if err != nil {
 			return r.refuse(result, err)
+		}
+		if r.mode == ModeMerge {
+			merged := make(map[string]any, len(existing.data)+len(data))
+			for field, value := range existing.data {
+				merged[field] = value
+			}
+			for field, value := range data {
+				merged[field] = value
+			}
+			data = merged
+			line = Line{Group: line.Group, Key: line.Key, ID: line.ID, Data: overlay(current.Data, line.Data), Refs: overlay(current.Refs, line.Refs)}
 		}
 		same, immutable = compare(g, line, current)
 	}
@@ -387,6 +411,53 @@ func compare(g group, incoming, current Line) (bool, string) {
 		}
 	}
 	return same && equal(want, have), immutable
+}
+
+func overlay(held, sent map[string]any) map[string]any {
+	out := make(map[string]any, len(held)+len(sent))
+	for field, value := range held {
+		out[field] = value
+	}
+	for field, value := range sent {
+		out[field] = value
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func changedLast(g group, incoming Line, existing exported) (bool, error) {
+	if g.updated == "" {
+		return false, echo.NewHTTPError(http.StatusBadRequest, "group "+g.name+" declares no update time, so mode latest cannot compare its records")
+	}
+	sent, ok := lookup(incoming.Data, g.updated)
+	if !ok || sent == nil {
+		return false, nil
+	}
+	incomingTime, err := parseTime(g, sent)
+	if err != nil {
+		return false, err
+	}
+	held, ok := lookup(existing.data, g.updated)
+	if !ok || held == nil {
+		return true, nil
+	}
+	existingTime, err := parseTime(g, held)
+	if err != nil {
+		return false, err
+	}
+	return incomingTime.After(existingTime), nil
+}
+
+func parseTime(g group, value any) (time.Time, error) {
+	text, ok := value.(string)
+	if ok {
+		if parsed, err := time.Parse(time.RFC3339Nano, text); err == nil {
+			return parsed, nil
+		}
+	}
+	return time.Time{}, echo.NewHTTPError(http.StatusBadRequest, g.name+"."+dotted(g.updated)+" is not an RFC 3339 time")
 }
 
 func equal(left, right any) bool {

@@ -1162,3 +1162,290 @@ func TestStateReadsALineWithoutID(t *testing.T) {
 	assert.Equal(t, map[string]int{state.OutcomeCreated: 1}, out.Counts)
 	assert.Equal(t, "b-1", out.Results[0].ID, "a line from before ids were exported creates under a new id, as before")
 }
+
+type articleBody struct {
+	Title     string   `json:"title,omitempty"`
+	Version   string   `json:"version,omitempty"`
+	Tags      []string `json:"tags,omitempty"`
+	Body      string   `json:"body,omitempty"`
+	UpdatedAt string   `json:"updated_at,omitempty"`
+}
+
+func articleGroup(m *memory) state.Group[articleBody] {
+	article := memoryGroup[articleBody](m, "article")
+	article.Updated = "/updated_at"
+	article.Document = "body"
+	return article
+}
+
+func articleService(m *memory) *echo.Echo {
+	e, _ := stateService(m, articleGroup(m))
+	return e
+}
+
+const stateHeader = `{"format":"2","service":"demo","version":"1","scope":[],"groups":[]}` + "\n"
+
+func rowOf(m *memory, group, id string) *stored {
+	for _, row := range m.rows[group] {
+		if row.id == id {
+			return row
+		}
+	}
+	return nil
+}
+
+func TestStateMergeWritesOnlyTheFieldsTheLineCarries(t *testing.T) {
+	m := seeded()
+	e, _ := stateService(m)
+	file := stateHeader +
+		`{"group":"room","key":"room-1","data":{"seats":10}}` + "\n" +
+		`{"group":"room","key":"room-2","data":{"seats":1}}` + "\n" +
+		`{"group":"room","key":"room-9","data":{"name":"New","seats":3,"kind":"desk"},"refs":{"location_id":"loc-1"}}` + "\n"
+
+	writes := m.writes
+	planned := importState(t, e, "mode=merge&dry_run=true", []byte(file))
+	assert.Equal(t, state.ModeMerge, planned.Mode)
+	assert.Equal(t, map[string]string{"room:room-1": state.OutcomeUpdated, "room:room-2": state.OutcomeUnchanged, "room:room-9": state.OutcomeCreated}, outcomes(planned))
+	assert.Equal(t, writes, m.writes, "a dry run writes nothing")
+
+	out := importState(t, e, "mode=merge", []byte(file))
+	assert.Equal(t, map[string]string{"room:room-1": state.OutcomeUpdated, "room:room-2": state.OutcomeUnchanged, "room:room-9": state.OutcomeCreated}, outcomes(out))
+	north := rowOf(m, "room", "room-1")
+	assert.Equal(t, "10", fmt.Sprint(north.data["seats"]))
+	assert.Equal(t, "North", north.data["name"], "a field the line lacks keeps its stored value")
+	assert.Equal(t, "loc-1", north.data["location_id"], "a reference the line lacks is kept")
+	assert.Equal(t, "meeting", north.data["kind"])
+	assert.Equal(t, "1234", north.data["code"])
+	assert.Equal(t, 3, m.count("room"))
+
+	again := importState(t, e, "mode=merge", []byte(file))
+	assert.Equal(t, map[string]string{"room:room-1": state.OutcomeUnchanged, "room:room-2": state.OutcomeUnchanged, "room:room-9": state.OutcomeUnchanged}, outcomes(again))
+
+	upsert := newMemory("b")
+	upserted, _ := stateService(upsert)
+	upsert.add("room", "room-1", map[string]any{"name": "North", "location_id": "loc-1", "seats": 8, "kind": "meeting"})
+	upsert.add("location", "loc-1", map[string]any{"name": "Head office"})
+	importState(t, upserted, "", []byte(stateHeader+`{"group":"room","key":"room-1","data":{"seats":10}}`+"\n"))
+	assert.Equal(t, "", rowOf(upsert, "room", "room-1").data["name"], "upsert writes the line as it is, merge does not")
+}
+
+func TestStateMergeRefusesAnImmutableChange(t *testing.T) {
+	m := seeded()
+	e, _ := stateService(m)
+	out := importState(t, e, "mode=merge", []byte(stateHeader+`{"group":"room","key":"room-1","data":{"kind":"desk"}}`+"\n"))
+	assert.Equal(t, map[string]string{"room:room-1": state.OutcomeRefused}, outcomes(out))
+	assert.Equal(t, "meeting", rowOf(m, "room", "room-1").data["kind"])
+}
+
+func TestStateLatestKeepsWhicheverChangedLast(t *testing.T) {
+	m := newMemory("a")
+	m.add("article", "newer", map[string]any{"title": "Held", "updated_at": "2026-01-02T00:00:00Z"})
+	m.add("article", "older", map[string]any{"title": "Held", "updated_at": "2026-01-02T00:00:00Z"})
+	m.add("article", "same", map[string]any{"title": "Held", "updated_at": "2026-01-02T00:00:00Z"})
+	m.add("article", "untimed", map[string]any{"title": "Held", "updated_at": "2026-01-02T00:00:00Z"})
+	m.add("article", "unstamped", map[string]any{"title": "Held"})
+	e := articleService(m)
+	file := stateHeader +
+		`{"group":"article","key":"newer","data":{"title":"Sent","updated_at":"2026-01-03T00:00:00Z"}}` + "\n" +
+		`{"group":"article","key":"older","data":{"title":"Sent","updated_at":"2026-01-01T00:00:00Z"}}` + "\n" +
+		`{"group":"article","key":"same","data":{"title":"Sent","updated_at":"2026-01-02T00:00:00Z"}}` + "\n" +
+		`{"group":"article","key":"untimed","data":{"title":"Sent"}}` + "\n" +
+		`{"group":"article","key":"unstamped","data":{"title":"Sent","updated_at":"2026-01-01T00:00:00Z"}}` + "\n" +
+		`{"group":"article","key":"fresh","data":{"title":"Sent"}}` + "\n"
+	want := map[string]string{
+		"article:newer":     state.OutcomeUpdated,
+		"article:older":     state.OutcomeUnchanged,
+		"article:same":      state.OutcomeUnchanged,
+		"article:untimed":   state.OutcomeUnchanged,
+		"article:unstamped": state.OutcomeUpdated,
+		"article:fresh":     state.OutcomeCreated,
+	}
+	writes := m.writes
+	planned := importState(t, e, "mode=latest&dry_run=true", []byte(file))
+	assert.Equal(t, state.ModeLatest, planned.Mode)
+	assert.Equal(t, want, outcomes(planned))
+	assert.Equal(t, writes, m.writes)
+
+	out := importState(t, e, "mode=latest", []byte(file))
+	assert.Equal(t, want, outcomes(out))
+	assert.Equal(t, writes+3, m.writes)
+	assert.Equal(t, "Sent", rowOf(m, "article", "newer").data["title"])
+	assert.Equal(t, "Held", rowOf(m, "article", "older").data["title"])
+	assert.Equal(t, "Held", rowOf(m, "article", "same").data["title"])
+	assert.Equal(t, "Held", rowOf(m, "article", "untimed").data["title"], "a line without an update time loses to an existing record")
+	assert.Equal(t, "Sent", rowOf(m, "article", "unstamped").data["title"], "an existing record without an update time loses to a line that has one")
+}
+
+func TestStateLatestRefusesWhatItCannotCompare(t *testing.T) {
+	m := seeded()
+	m.add("article", "a1", map[string]any{"title": "Held", "updated_at": "2026-01-02T00:00:00Z"})
+	e, _ := stateService(m, articleGroup(m))
+	out := importState(t, e, "mode=latest", []byte(stateHeader+
+		`{"group":"room","key":"room-1","data":{"seats":10}}`+"\n"+
+		`{"group":"article","key":"a1","data":{"title":"Sent","updated_at":"yesterday"}}`+"\n"))
+	assert.Equal(t, map[string]string{"room:room-1": state.OutcomeRefused, "article:a1": state.OutcomeRefused}, outcomes(out))
+	for _, result := range out.Results {
+		if result.Group == "room" {
+			assert.Contains(t, result.Error, "declares no update time")
+		} else {
+			assert.Contains(t, result.Error, "RFC 3339")
+		}
+	}
+}
+
+func TestStateReadsAJSONArrayOfLines(t *testing.T) {
+	source, _ := stateService(seeded())
+	ndjson := exportState(t, source, `{"blobs":true}`)
+	read, err := state.Read(bytes.NewReader(ndjson))
+	require.NoError(t, err)
+	lines, err := read.Lines()
+	require.NoError(t, err)
+	array, err := json.Marshal(lines)
+	require.NoError(t, err)
+
+	fromArray, err := state.Read(bytes.NewReader(array))
+	require.NoError(t, err)
+	assert.Equal(t, read.Manifest, fromArray.Manifest)
+	assert.Equal(t, read.Records, fromArray.Records)
+	assert.Equal(t, read.Blobs, fromArray.Blobs)
+
+	records, err := json.Marshal(lines[1:])
+	require.NoError(t, err)
+	bare, err := state.Read(strings.NewReader("\n  " + string(records)))
+	require.NoError(t, err)
+	assert.Equal(t, state.FormatVersion, bare.Manifest.Format, "an array without a manifest reads as a file of this format")
+	assert.Equal(t, read.Records, bare.Records)
+
+	empty, err := state.Read(strings.NewReader("[]"))
+	require.NoError(t, err)
+	assert.Empty(t, empty.Records)
+
+	_, err = state.Read(strings.NewReader(`[{"group":"room"}]`))
+	assert.ErrorContains(t, err, "element 1: a record carries group and key")
+	_, err = state.Read(strings.NewReader(`[{"format":"2"},{"format":"2"}]`))
+	assert.ErrorContains(t, err, "element 2 is a second manifest")
+	_, err = state.Read(strings.NewReader(`[{"group":"room"`))
+	assert.Error(t, err)
+
+	for _, contentType := range []string{echo.MIMEApplicationJSON, state.MIMENDJSON, ""} {
+		target := newMemory("b")
+		e, _ := stateService(target)
+		rec := call(e, http.MethodPost, "/api/state/import?mode=create", contentType, "", array)
+		require.Equal(t, http.StatusOK, rec.Code, contentType+" "+rec.Body.String())
+		var wrapped struct {
+			Data state.ImportResponse `json:"data"`
+		}
+		require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &wrapped))
+		assert.Equal(t, state.ModeCreate, wrapped.Data.Mode, "the options of an array come from the query")
+		assert.Equal(t, 2, target.count("room"), contentType)
+		assert.Equal(t, 2, target.count("location"), contentType)
+		assert.Equal(t, "north photo", string(rowOf(target, "room", "room-1").blobs["photo"].Data))
+	}
+
+	e, _ := stateService(newMemory("b"))
+	rec := call(e, http.MethodPost, "/api/state/import", echo.MIMEApplicationJSON, "", []byte(`{"seats":`))
+	assert.Equal(t, http.StatusBadRequest, rec.Code, "a body that is neither an array nor an object is refused as before")
+}
+
+const releaseNote = "---\n" +
+	"key: v1.1.81\n" +
+	"title: \"Locations: a new tab\"\n" +
+	"version: '1.1.81'\n" +
+	"# a comment\n" +
+	"tags: [release, \"ui, web\"]\n" +
+	"updated_at: 2026-01-05T10:00:00Z\n" +
+	"---\n" +
+	"# Locations\n\nThe company page has a tab.\n\n---\n\nA rule above stays in the body.\n"
+
+func importMarkdown(t *testing.T, e *echo.Echo, query, body string) *httptest.ResponseRecorder {
+	return call(e, http.MethodPost, "/api/state/import?"+query, state.MIMEMarkdown, "", []byte(body))
+}
+
+func TestStateImportsAMarkdownFile(t *testing.T) {
+	m := newMemory("a")
+	e := articleService(m)
+
+	rec := importMarkdown(t, e, "target=article&dry_run=true", releaseNote)
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+	assert.Equal(t, 0, m.count("article"), "a dry run writes nothing")
+
+	rec = importMarkdown(t, e, "target=article", releaseNote)
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+	var wrapped struct {
+		Data state.ImportResponse `json:"data"`
+	}
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &wrapped))
+	assert.Equal(t, map[string]string{"article:v1.1.81": state.OutcomeCreated}, outcomes(wrapped.Data))
+	row := m.rows["article"][0]
+	assert.Equal(t, "v1.1.81", row.external)
+	assert.Equal(t, "Locations: a new tab", row.data["title"])
+	assert.Equal(t, "1.1.81", row.data["version"])
+	assert.Equal(t, []any{"release", "ui, web"}, row.data["tags"])
+	assert.Equal(t, "2026-01-05T10:00:00Z", row.data["updated_at"])
+	assert.Equal(t, "# Locations\n\nThe company page has a tab.\n\n---\n\nA rule above stays in the body.\n", row.data["body"])
+	assert.NotContains(t, row.data, "key")
+
+	again := importMarkdown(t, e, "target=article", releaseNote)
+	require.Equal(t, http.StatusOK, again.Code)
+	require.NoError(t, json.Unmarshal(again.Body.Bytes(), &wrapped))
+	assert.Equal(t, map[string]string{"article:v1.1.81": state.OutcomeUnchanged}, outcomes(wrapped.Data), "the same file imports as unchanged")
+
+	named := importMarkdown(t, e, "target=article&key=other", "no frontmatter, only a document\n")
+	require.Equal(t, http.StatusOK, named.Code, named.Body.String())
+	assert.Equal(t, 2, m.count("article"))
+	assert.Equal(t, "no frontmatter, only a document\n", m.rows["article"][1].data["body"])
+	assert.Equal(t, "other", m.rows["article"][1].external, "the key parameter names the record")
+
+	merged := importMarkdown(t, e, "target=article&mode=merge", "---\nkey: v1.1.81\ntitle: Renamed\n---\n")
+	require.Equal(t, http.StatusOK, merged.Code, merged.Body.String())
+	assert.Equal(t, "Renamed", row.data["title"])
+	assert.Equal(t, "1.1.81", row.data["version"])
+}
+
+func TestStateRefusesAMarkdownFileItCannotPlace(t *testing.T) {
+	m := newMemory("a")
+	e := articleService(m)
+	for name, c := range map[string]struct{ query, body, contains string }{
+		"no target":      {"", releaseNote, "one target=group"},
+		"two targets":    {"target=article&target=room", releaseNote, "one target=group"},
+		"a filter":       {"target=article:title=x", releaseNote, "one target=group"},
+		"unknown group":  {"target=nothing", releaseNote, "no group is called nothing"},
+		"no document":    {"target=room", releaseNote, "takes no markdown document"},
+		"no key":         {"target=article", "---\ntitle: x\n---\nbody", "carries a key"},
+		"never closes":   {"target=article", "---\nkey: a\ntitle: x\n", "never closes"},
+		"a block scalar": {"target=article", "---\nkey: a\ntitle: |\n  x\n---\n", "block scalar"},
+		"a list of maps": {"target=article", "---\nkey: a\ntags:\n  - a: b\n---\n", "list of fields"},
+		"a tab":          {"target=article", "---\nkey: a\n\ttitle: x\n---\n", "tab"},
+		"a double key":   {"target=article", "---\nkey: a\ntitle: x\ntitle: y\n---\n", "given twice"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			rec := importMarkdown(t, e, c.query, c.body)
+			assert.Equal(t, http.StatusBadRequest, rec.Code, rec.Body.String())
+			assert.Contains(t, rec.Body.String(), c.contains)
+			assert.Equal(t, 0, m.count("article"))
+		})
+	}
+}
+
+func TestStateReadMarkdownParsesFrontmatter(t *testing.T) {
+	line, err := state.ReadMarkdown(strings.NewReader("\ufeff---\r\nkey: 7\r\nseats: 4\r\nratio: 1.5\r\nzero: 007\r\nflag: true\r\nnone: ~\r\nempty:\r\nname: 'it''s'\r\ntext: plain # a comment\r\nnested:\r\n  inner:\r\n    - a\r\n    - 2\r\n  flow: {x: 1, y: [a, b]}\r\nlist:\r\n- one\r\n- \"two\\n\"\r\n---\r\nbody\r\n"), "article", "body")
+	require.NoError(t, err)
+	assert.Equal(t, "article", line.Group)
+	assert.Equal(t, "7", line.Key)
+	assert.Equal(t, map[string]any{
+		"seats":  json.Number("4"),
+		"ratio":  json.Number("1.5"),
+		"zero":   "007",
+		"flag":   true,
+		"none":   nil,
+		"empty":  nil,
+		"name":   "it's",
+		"text":   "plain",
+		"nested": map[string]any{"inner": []any{"a", json.Number("2")}, "flow": map[string]any{"x": json.Number("1"), "y": []any{"a", "b"}}},
+		"list":   []any{"one", "two\n"},
+		"body":   "body\r\n",
+	}, line.Data)
+
+	_, err = state.ReadMarkdown(strings.NewReader("x"), "article", "")
+	assert.ErrorContains(t, err, "takes no markdown document")
+}
