@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -45,12 +46,13 @@ func StateCommand(send Send, output *Output) *cobra.Command {
 
 func stateExport(send Send, output *Output) *cobra.Command {
 	var targets, keys []string
-	var store, history, blobs bool
+	var store, history, blobs, archive bool
 	var file string
+	var size int
 	cmd := &cobra.Command{
 		Use:         "export",
-		Short:       "Export records as state lines: a manifest, one line per record and one per blob",
-		Example:     "state export --target room:location=hq --key room:north --blobs -o rooms.ndjson",
+		Short:       "Export records as state lines: a manifest, one line per record and one per blob, or packed into an archive",
+		Example:     "state export --target room:location=hq --key room:north --blobs -o rooms.ndjson\nROOMS_STATE_KEY=secret state export --archive -o rooms.tar.zst.age",
 		Args:        cobra.NoArgs,
 		Annotations: map[string]string{AnnotationMCP: mcp.AccessRead},
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -95,6 +97,17 @@ func stateExport(send Send, output *Output) *cobra.Command {
 				return &Error{Code: ExitFailure, Message: "the export is not state lines", Cause: err}
 			}
 			switch {
+			case archive:
+				if file == "" || file == "-" {
+					return Rejected("an archive is written to a file", "Pass -o <file>.")
+				}
+				written, err := statePack(cmd, []state.ArchiveFile{{Name: stateArchiveName, Data: lines}}, file, size)
+				if err != nil {
+					return err
+				}
+				fmt.Fprintln(cmd.ErrOrStderr(), stateSummary(read.Manifest, file))
+				fmt.Fprintln(cmd.ErrOrStderr(), written)
+				return nil
 			case file == "" || file == "-":
 				if _, err := cmd.OutOrStdout().Write(lines); err != nil {
 					return err
@@ -109,6 +122,8 @@ func stateExport(send Send, output *Output) *cobra.Command {
 		},
 	}
 	flags := cmd.Flags()
+	flags.BoolVar(&archive, "archive", false, "pack the state lines into one tar archive compressed with zstd, encrypted with age when the key is set in the environment as <CLI>_STATE_KEY, written to the -o file")
+	flags.IntVar(&size, "chunk-size", 64, "split an archive over this many MiB into files named <output>.part-0001, <output>.part-0002 and so on; 0 writes one file")
 	flags.StringArrayVar(&targets, "target", nil, "group to export, group:field=value,field=value to filter it, repeatable; none exports every group")
 	flags.StringArrayVar(&keys, "key", nil, "one record as group:key, repeatable")
 	flags.BoolVar(&store, "store", false, "save the export as an asset on the service and print its id")
@@ -125,8 +140,8 @@ func stateImport(send Send, output *Output) *cobra.Command {
 	var chunk int
 	cmd := &cobra.Command{
 		Use:         "import [file]",
-		Short:       "Import state lines, a JSON array, a markdown file, a folder of them, or a stored asset: upsert, create, sync, skip, replace, merge or latest, with deletes by key and a dry run",
-		Example:     "state import rooms.ndjson --mode sync --target room:location=hq --dry-run\nstate import docs/changelogs --target changelog --mode upsert",
+		Short:       "Import state lines, a JSON array, a markdown file, a folder of them, an archive or a stored asset: upsert, create, sync, skip, replace, merge or latest, with deletes by key and a dry run",
+		Example:     "state import rooms.ndjson --mode sync --target room:location=hq --dry-run\nstate import docs/changelogs --target changelog --mode upsert\nROOMS_STATE_KEY=secret state import rooms.tar.zst.age",
 		Args:        cobra.MaximumNArgs(1),
 		Annotations: map[string]string{AnnotationMCP: mcp.AccessDestructive},
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -400,48 +415,145 @@ func stateGroupCounts(out state.ImportResponse) []string {
 	return lines
 }
 
+const stateArchiveName = "state.ndjson"
+
 type stateInput struct {
 	name string
 	body []byte
 }
 
+func stateKeyName(cmd *cobra.Command) string {
+	return strings.ToUpper(strings.NewReplacer("-", "_", ".", "_").Replace(cmd.Root().Name())) + "_STATE_KEY"
+}
+
 func stateInputs(cmd *cobra.Command, arg string) ([]stateInput, error) {
-	if arg == "-" {
+	var found []stateInput
+	info, err := os.Stat(arg)
+	switch {
+	case arg == "-":
 		body, err := io.ReadAll(cmd.InOrStdin())
 		if err != nil {
 			return nil, err
 		}
-		return []stateInput{{name: arg, body: body}}, nil
-	}
-	info, err := os.Stat(arg)
-	if err != nil {
-		return nil, Rejected("cannot read "+arg, "")
-	}
-	if !info.IsDir() {
-		body, err := os.ReadFile(arg)
+		found = []stateInput{{name: arg, body: body}}
+	case err == nil && info.IsDir():
+		entries, err := os.ReadDir(arg)
 		if err != nil {
 			return nil, Rejected("cannot read "+arg, "")
 		}
-		return []stateInput{{name: arg, body: body}}, nil
+		seen := map[string]bool{}
+		for _, entry := range entries {
+			if !entry.Type().IsRegular() || strings.HasPrefix(entry.Name(), ".") {
+				continue
+			}
+			full := filepath.Join(arg, entry.Name())
+			if base, _, ok := state.ParseChunkName(full); ok {
+				if seen[base] {
+					continue
+				}
+				seen[base] = true
+				body, err := stateChunks(base)
+				if err != nil {
+					return nil, err
+				}
+				found = append(found, stateInput{name: base, body: body})
+				continue
+			}
+			body, err := os.ReadFile(full)
+			if err != nil {
+				return nil, Rejected("cannot read "+full, "")
+			}
+			found = append(found, stateInput{name: full, body: body})
+		}
+		if len(found) == 0 {
+			return nil, Rejected(arg+" holds no files", "")
+		}
+	default:
+		base := arg
+		if named, _, ok := state.ParseChunkName(arg); ok {
+			base = named
+		} else if err == nil {
+			body, err := os.ReadFile(arg)
+			if err != nil {
+				return nil, Rejected("cannot read "+arg, "")
+			}
+			found = []stateInput{{name: arg, body: body}}
+		}
+		if found == nil {
+			body, err := stateChunks(base)
+			if err != nil {
+				return nil, err
+			}
+			found = []stateInput{{name: base, body: body}}
+		}
 	}
-	entries, err := os.ReadDir(arg)
-	if err != nil {
-		return nil, Rejected("cannot read "+arg, "")
-	}
-	var found []stateInput
-	for _, entry := range entries {
-		if !entry.Type().IsRegular() || strings.HasPrefix(entry.Name(), ".") {
+	key := os.Getenv(stateKeyName(cmd))
+	var out []stateInput
+	for _, input := range found {
+		if !state.IsArchive(input.body) {
+			out = append(out, input)
 			continue
 		}
-		full := filepath.Join(arg, entry.Name())
-		body, err := os.ReadFile(full)
-		if err != nil {
-			return nil, Rejected("cannot read "+full, "")
+		files, err := state.Unpack(input.body, key)
+		if errors.Is(err, state.ErrKeyRequired) {
+			return nil, Rejected(input.name+": "+err.Error(), "Set "+stateKeyName(cmd)+" to the key it was exported with.")
 		}
-		found = append(found, stateInput{name: full, body: body})
+		if err != nil {
+			return nil, Rejected(input.name+": "+err.Error(), "")
+		}
+		for _, file := range files {
+			out = append(out, stateInput{name: file.Name, body: file.Data})
+		}
 	}
-	if len(found) == 0 {
-		return nil, Rejected(arg+" holds no files", "")
+	return out, nil
+}
+
+func stateChunks(base string) ([]byte, error) {
+	names, _ := filepath.Glob(strings.NewReplacer("*", "[*]", "?", "[?]", "[", "[[]").Replace(base) + state.ChunkSeparator + "*")
+	var body []byte
+	count := 0
+	for _, name := range names {
+		if _, _, ok := state.ParseChunkName(name); ok {
+			count++
+		}
 	}
-	return found, nil
+	for number := 1; number <= count; number++ {
+		part, err := os.ReadFile(state.GetChunkName(base, number))
+		if err != nil {
+			return nil, Rejected("the chunk set of "+base+" has no part "+strconv.Itoa(number), "The parts are numbered from 1 without a gap.")
+		}
+		body = append(body, part...)
+	}
+	if count == 0 {
+		return nil, Rejected("cannot read "+base, "")
+	}
+	return body, nil
+}
+
+func statePack(cmd *cobra.Command, files []state.ArchiveFile, file string, size int) (string, error) {
+	key := os.Getenv(stateKeyName(cmd))
+	packed, err := state.Pack(files, key)
+	if err != nil {
+		return "", err
+	}
+	parts := state.Split(packed, size<<20)
+	if len(parts) == 1 {
+		if err := os.WriteFile(file, parts[0], 0o600); err != nil {
+			return "", err
+		}
+	} else {
+		for i, part := range parts {
+			if err := os.WriteFile(state.GetChunkName(file, i+1), part, 0o600); err != nil {
+				return "", err
+			}
+		}
+	}
+	line := fmt.Sprintf("archive of %d files, %d bytes", len(files), len(packed))
+	if key != "" {
+		line += ", encrypted"
+	}
+	if len(parts) > 1 {
+		line += fmt.Sprintf(", in %d chunk files %s", len(parts), state.GetChunkName(file, 1)+" to "+filepath.Base(state.GetChunkName(file, len(parts))))
+	}
+	return line, nil
 }
