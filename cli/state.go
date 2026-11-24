@@ -102,7 +102,7 @@ func stateExport(send Send, output *Output) *cobra.Command {
 				if file == "" || file == "-" {
 					return Rejected("an archive is written to a file", "Pass -o <file>.")
 				}
-				written, err := statePack(cmd, []state.ArchiveFile{{Name: stateArchiveName, Data: lines}}, file, size, mode)
+				written, err := statePack(cmd, []state.ArchiveFile{{Name: stateArchiveName, Data: lines}}, file, size, mode, cmd.Flags().Changed("chunk-size"))
 				if err != nil {
 					return err
 				}
@@ -124,7 +124,7 @@ func stateExport(send Send, output *Output) *cobra.Command {
 	}
 	flags := cmd.Flags()
 	flags.BoolVar(&archive, "archive", false, "pack the state lines into one tar archive compressed with zstd, encrypted with age when the key is set in the environment as <CLI>_STATE_KEY, written to the -o file")
-	flags.IntVar(&size, "chunk-size", 64, "split an archive over this many MiB into files named <output>.part-0001, <output>.part-0002 and so on; with fastcdc the average size, rounded down to a power of two; 0 writes one file")
+	flags.IntVar(&size, "chunk-size", 64, "split an archive over this many MiB into files named <output>.part-0001, <output>.part-0002 and so on; with fastcdc the average size, rounded down to a power of two, and the library's standard sizes when the flag is not given; 0 writes one file")
 	flags.StringVar(&mode, "chunk-mode", state.ChunkFixed, "how an archive is split: fixed cuts every --chunk-size MiB, fastcdc cuts on content so data unchanged between two exports lands in the same chunks")
 	flags.StringArrayVar(&targets, "target", nil, "group to export, group:field=value,field=value to filter it, repeatable; none exports every group")
 	flags.StringArrayVar(&keys, "key", nil, "one record as group:key, repeatable")
@@ -532,13 +532,17 @@ func stateChunks(base string) ([]byte, error) {
 	return body, nil
 }
 
-func statePack(cmd *cobra.Command, files []state.ArchiveFile, file string, size int, mode string) (string, error) {
+func statePack(cmd *cobra.Command, files []state.ArchiveFile, file string, size int, mode string, sized bool) (string, error) {
 	key := os.Getenv(stateKeyName(cmd))
 	packed, err := state.Pack(files, key)
 	if err != nil {
 		return "", err
 	}
-	parts, err := state.Split(packed, size<<20, mode)
+	bytesPerChunk := size << 20
+	if mode == state.ChunkFastCDC && !sized {
+		bytesPerChunk = -1
+	}
+	parts, err := state.Split(packed, bytesPerChunk, mode)
 	if err != nil {
 		return "", Rejected(err.Error(), "")
 	}

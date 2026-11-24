@@ -164,7 +164,7 @@ func Split(data []byte, size int, mode string) ([][]byte, error) {
 	switch mode {
 	case ChunkFixed, "":
 	case ChunkFastCDC:
-		if size <= 0 || len(data) <= size {
+		if size == 0 || (size > 0 && len(data) <= size) {
 			return [][]byte{data}, nil
 		}
 		return splitFastCDC(data, size)
@@ -183,11 +183,20 @@ func Split(data []byte, size int, mode string) ([][]byte, error) {
 }
 
 func splitFastCDC(data []byte, size int) ([][]byte, error) {
-	normal := 1 << (bits.Len(uint(size)) - 1)
-	if normal < 1024 {
-		return nil, errors.New("the fastcdc chunk size is at least 1024 bytes")
+	standard, err := chunkers.NewChunker("fastcdc", bytes.NewReader(nil), nil)
+	if err != nil {
+		return nil, err
 	}
-	chunker, err := chunkers.NewChunker("fastcdc", bytes.NewReader(data), &chunkers.ChunkerOpts{MinSize: normal / 4, NormalSize: normal, MaxSize: normal * 4})
+	opts := &chunkers.ChunkerOpts{MinSize: standard.MinSize(), NormalSize: standard.NormalSize(), MaxSize: standard.MaxSize()}
+	if size > 0 {
+		opts.NormalSize = 1 << (bits.Len(uint(size)) - 1)
+		opts.MinSize = opts.NormalSize / (standard.NormalSize() / standard.MinSize())
+		opts.MaxSize = opts.NormalSize * (standard.MaxSize() / standard.NormalSize())
+		if opts.MinSize < 64 {
+			return nil, fmt.Errorf("the fastcdc chunk size is at least %d bytes", 64*standard.NormalSize()/standard.MinSize())
+		}
+	}
+	chunker, err := chunkers.NewChunker("fastcdc", bytes.NewReader(data), opts)
 	if err != nil {
 		return nil, err
 	}

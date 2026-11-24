@@ -204,7 +204,7 @@ func TestStateFastCDCSplitJoinsBackAndKeepsUnchangedChunks(t *testing.T) {
 	assert.Equal(t, data, bytes.Join(parts, nil))
 	for _, part := range parts[:len(parts)-1] {
 		assert.GreaterOrEqual(t, len(part), 16<<10)
-		assert.LessOrEqual(t, len(part), 256<<10)
+		assert.LessOrEqual(t, len(part), 512<<10)
 	}
 
 	again, err := state.Split(data, 64<<10, state.ChunkFastCDC)
@@ -247,7 +247,16 @@ func TestStateFastCDCSplitJoinsBackAndKeepsUnchangedChunks(t *testing.T) {
 	}
 	assert.Zero(t, shared, "a fixed split shifts every chunk")
 
-	_, err = state.Split(data, 512, state.ChunkFastCDC)
+	standard, err := state.Split(data, -1, state.ChunkFastCDC)
+	require.NoError(t, err)
+	assert.Equal(t, data, bytes.Join(standard, nil))
+	for _, part := range standard[:len(standard)-1] {
+		assert.GreaterOrEqual(t, len(part), 2<<10)
+		assert.LessOrEqual(t, len(part), 64<<10)
+	}
+	assert.Greater(t, len(standard), len(parts), "the standard sizes cut finer than 64 KiB")
+
+	_, err = state.Split(data, 128, state.ChunkFastCDC)
 	assert.Error(t, err)
 }
 
