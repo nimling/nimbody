@@ -8,6 +8,8 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -92,12 +94,15 @@ func stateExport(send Send, output *Output) *cobra.Command {
 			if err != nil {
 				return &Error{Code: ExitFailure, Message: "the export is not state lines", Cause: err}
 			}
-			if file == "" || file == "-" {
+			switch {
+			case file == "" || file == "-":
 				if _, err := cmd.OutOrStdout().Write(lines); err != nil {
 					return err
 				}
-			} else if err := os.WriteFile(file, lines, 0o600); err != nil {
-				return err
+			default:
+				if err := os.WriteFile(file, lines, 0o600); err != nil {
+					return err
+				}
 			}
 			fmt.Fprintln(cmd.ErrOrStderr(), stateSummary(read.Manifest, file))
 			return nil
@@ -120,8 +125,8 @@ func stateImport(send Send, output *Output) *cobra.Command {
 	var chunk int
 	cmd := &cobra.Command{
 		Use:         "import [file]",
-		Short:       "Import state lines from a file, stdin or a stored asset: upsert, create, sync, skip or replace, with deletes by key and a dry run",
-		Example:     "state import rooms.ndjson --mode sync --target room:location=hq --dry-run",
+		Short:       "Import state lines, a JSON array, a markdown file, a folder of them, or a stored asset: upsert, create, sync, skip, replace, merge or latest, with deletes by key and a dry run",
+		Example:     "state import rooms.ndjson --mode sync --target room:location=hq --dry-run\nstate import docs/changelogs --target changelog --mode upsert",
 		Args:        cobra.MaximumNArgs(1),
 		Annotations: map[string]string{AnnotationMCP: mcp.AccessDestructive},
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -150,43 +155,83 @@ func stateImport(send Send, output *Output) *cobra.Command {
 					in.Delete = map[string][]string{}
 				}
 				in.Delete[group] = append(in.Delete[group], key)
-				query.Add("delete", raw)
 			}
-			var body []byte
-			var err error
+			var wrapped struct {
+				Data state.ImportResponse `json:"data"`
+			}
 			switch {
 			case len(args) == 1 && asset != "":
 				return Rejected("import takes a file or --asset, not both", "")
 			case len(args) == 1:
-				lines, err := readState(cmd.InOrStdin(), args[0])
+				inputs, err := stateInputs(cmd, args[0])
 				if err != nil {
 					return err
 				}
-				if chunk > 0 && len(lines) > chunk<<20 {
-					body, err = stateImportStaged(cmd, send, in, lines, chunk<<20)
-				} else {
-					body, err = send(cmd, http.MethodPost, PathState+"/import", query, state.MIMENDJSON, lines)
+				if len(inputs) > 1 && (mode == state.ModeSync || mode == state.ModeReplace) {
+					return Rejected(fmt.Sprintf("%s prunes what each request lacks, and %d files are %d requests", mode, len(inputs), len(inputs)), "Use upsert, create, skip, merge or latest, or import one file.")
 				}
-				if err != nil {
-					return err
+				for i, input := range inputs {
+					request := in
+					values := url.Values{}
+					for name, list := range query {
+						values[name] = list
+					}
+					if i > 0 {
+						request.Delete = nil
+					} else {
+						for group, keys := range in.Delete {
+							for _, key := range keys {
+								values.Add("delete", group+":"+key)
+							}
+						}
+					}
+					var body []byte
+					switch {
+					case strings.EqualFold(path.Ext(input.name), ".md"):
+						if len(in.Targets) != 1 {
+							return Rejected("a markdown file is placed by its group: "+input.name, "Pass --target <group> once.")
+						}
+						body, err = send(cmd, http.MethodPost, PathState+"/import", values, state.MIMEMarkdown, input.body)
+					case chunk > 0 && len(input.body) > chunk<<20 && !bytes.HasPrefix(bytes.TrimLeft(input.body, " \t\r\n"), []byte("[")):
+						body, err = stateImportStaged(cmd, send, request, input.body, chunk<<20)
+					default:
+						body, err = send(cmd, http.MethodPost, PathState+"/import", values, state.MIMENDJSON, input.body)
+					}
+					if err != nil {
+						return err
+					}
+					var one struct {
+						Data state.ImportResponse `json:"data"`
+					}
+					if err = json.Unmarshal(body, &one); err != nil {
+						return &Error{Code: ExitFailure, Message: "the import answer is not json", Cause: err}
+					}
+					if i == 0 {
+						wrapped = one
+						if wrapped.Data.Counts == nil {
+							wrapped.Data.Counts = map[string]int{}
+						}
+						continue
+					}
+					for outcome, count := range one.Data.Counts {
+						wrapped.Data.Counts[outcome] += count
+					}
+					wrapped.Data.Results = append(wrapped.Data.Results, one.Data.Results...)
 				}
 			case asset != "":
 				payload, err := json.Marshal(in)
 				if err != nil {
 					return err
 				}
-				body, err = send(cmd, http.MethodPost, PathState+"/import", nil, "application/json", payload)
+				body, err := send(cmd, http.MethodPost, PathState+"/import", nil, "application/json", payload)
 				if err != nil {
 					return err
 				}
+				if err = json.Unmarshal(body, &wrapped); err != nil {
+					return &Error{Code: ExitFailure, Message: "the import answer is not json", Cause: err}
+				}
 			default:
-				return Rejected("import takes a file, - for stdin, or --asset", "Run '"+cmd.Root().Name()+" state export -o <file>' for a file.")
-			}
-			var wrapped struct {
-				Data state.ImportResponse `json:"data"`
-			}
-			if err = json.Unmarshal(body, &wrapped); err != nil {
-				return &Error{Code: ExitFailure, Message: "the import answer is not json", Cause: err}
+				return Rejected("import takes a file, a folder, - for stdin, or --asset", "Run '"+cmd.Root().Name()+" state export -o <file>' for a file.")
 			}
 			if err := output.PrintValue(cmd.OutOrStdout(), wrapped.Data.Results); err != nil {
 				return err
@@ -203,23 +248,12 @@ func stateImport(send Send, output *Output) *cobra.Command {
 	}
 	flags := cmd.Flags()
 	flags.BoolVar(&dryRun, "dry-run", false, "list every outcome and write nothing")
-	flags.StringVar(&mode, "mode", "", "upsert (default), create, sync, which also deletes what the targets reach and the file lacks, skip, which leaves every record that exists as it is, or replace, which deletes every record of every group the file lacks")
+	flags.StringVar(&mode, "mode", "", "upsert (default), create, sync, which also deletes what the targets reach and the file lacks, skip, which leaves every record that exists as it is, replace, which deletes every record of every group the file lacks, merge, which writes only the fields the file carries over the existing record, or latest, which keeps whichever of the file and the existing record changed last")
 	flags.StringArrayVar(&deletes, "delete", nil, "delete a record as group:key, repeatable")
-	flags.StringArrayVar(&targets, "target", nil, "import only this group, group:field=value to narrow what a sync deletes, repeatable")
+	flags.StringArrayVar(&targets, "target", nil, "import only this group, group:field=value to narrow what a sync deletes, repeatable; a markdown file takes its group as one --target group")
 	flags.StringVar(&asset, "asset", "", "import a stored export by its asset id instead of a file")
 	flags.IntVar(&chunk, "chunk", 4, "upload a file over this many MiB in parts of that size to an import session, committed as one import; 0 sends it in one request")
 	return cmd
-}
-
-func readState(in io.Reader, file string) ([]byte, error) {
-	if file == "-" {
-		return io.ReadAll(in)
-	}
-	body, err := os.ReadFile(file)
-	if err != nil {
-		return nil, Rejected("cannot read "+file, "")
-	}
-	return body, nil
 }
 
 func GetStateLines(body []byte) []byte {
@@ -364,4 +398,50 @@ func stateGroupCounts(out state.ImportResponse) []string {
 		lines = append(lines, group+": "+strings.Join(parts, ", "))
 	}
 	return lines
+}
+
+type stateInput struct {
+	name string
+	body []byte
+}
+
+func stateInputs(cmd *cobra.Command, arg string) ([]stateInput, error) {
+	if arg == "-" {
+		body, err := io.ReadAll(cmd.InOrStdin())
+		if err != nil {
+			return nil, err
+		}
+		return []stateInput{{name: arg, body: body}}, nil
+	}
+	info, err := os.Stat(arg)
+	if err != nil {
+		return nil, Rejected("cannot read "+arg, "")
+	}
+	if !info.IsDir() {
+		body, err := os.ReadFile(arg)
+		if err != nil {
+			return nil, Rejected("cannot read "+arg, "")
+		}
+		return []stateInput{{name: arg, body: body}}, nil
+	}
+	entries, err := os.ReadDir(arg)
+	if err != nil {
+		return nil, Rejected("cannot read "+arg, "")
+	}
+	var found []stateInput
+	for _, entry := range entries {
+		if !entry.Type().IsRegular() || strings.HasPrefix(entry.Name(), ".") {
+			continue
+		}
+		full := filepath.Join(arg, entry.Name())
+		body, err := os.ReadFile(full)
+		if err != nil {
+			return nil, Rejected("cannot read "+full, "")
+		}
+		found = append(found, stateInput{name: full, body: body})
+	}
+	if len(found) == 0 {
+		return nil, Rejected(arg+" holds no files", "")
+	}
+	return found, nil
 }

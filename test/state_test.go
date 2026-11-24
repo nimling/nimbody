@@ -1449,3 +1449,73 @@ func TestStateReadMarkdownParsesFrontmatter(t *testing.T) {
 	_, err = state.ReadMarkdown(strings.NewReader("x"), "article", "")
 	assert.ErrorContains(t, err, "takes no markdown document")
 }
+
+func stateSender(e *echo.Echo, calls *[]string) cli.Send {
+	return func(cmd *cobra.Command, method, path string, query url.Values, contentType string, body []byte) ([]byte, error) {
+		target := path
+		if len(query) > 0 {
+			target += "?" + query.Encode()
+		}
+		*calls = append(*calls, method+" "+path+" "+contentType)
+		rec := call(e, method, target, contentType, "", body)
+		if rec.Code >= http.StatusBadRequest {
+			return nil, cli.Rejected(rec.Body.String(), "")
+		}
+		return rec.Body.Bytes(), nil
+	}
+}
+
+func runState(send cli.Send, args ...string) (string, error) {
+	root := &cobra.Command{Use: "demo"}
+	root.AddCommand(cli.StateCommand(send, &cli.Output{JSON: true}))
+	var stdout, stderr bytes.Buffer
+	root.SetOut(&stdout)
+	root.SetErr(&stderr)
+	root.SetArgs(append([]string{"state"}, args...))
+	err := root.Execute()
+	return stderr.String(), err
+}
+
+func TestStateCommandImportsAMarkdownFileAndAFolder(t *testing.T) {
+	m := newMemory("a")
+	e := articleService(m)
+	var calls []string
+	send := stateSender(e, &calls)
+	dir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "v1.1.81.md"), []byte(releaseNote), 0o600))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "v1.1.82.md"), []byte("---\nkey: v1.1.82\ntitle: Second\n---\nbody\n"), 0o600))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, ".hidden.md"), []byte("---\nkey: hidden\n---\n"), 0o600))
+
+	out, err := runState(send, "import", filepath.Join(dir, "v1.1.81.md"), "--target", "article")
+	require.NoError(t, err, out)
+	assert.Equal(t, []string{"POST /api/state/import text/markdown"}, calls, "a markdown file is one markdown request")
+	assert.Equal(t, 1, m.count("article"))
+
+	calls = nil
+	out, err = runState(send, "import", dir, "--target", "article", "--mode", "upsert")
+	require.NoError(t, err, out)
+	assert.Equal(t, []string{"POST /api/state/import text/markdown", "POST /api/state/import text/markdown"}, calls, "one request per markdown file, dotfiles left out")
+	assert.Equal(t, 2, m.count("article"))
+	assert.Contains(t, out, "article: 1 created, 1 unchanged\n")
+	assert.Contains(t, out, "upsert: 1 created, 1 unchanged\n")
+
+	_, err = runState(send, "import", dir, "--mode", "latest")
+	require.Error(t, err, "a markdown file is placed by its group")
+	_, err = runState(send, "import", dir, "--target", "article", "--mode", "sync")
+	require.Error(t, err, "sync prunes per request, so a folder of files refuses it")
+}
+
+func TestStateCommandSendsAJSONArrayInOneRequest(t *testing.T) {
+	m := newMemory("b")
+	e := areaService(m)
+	var calls []string
+	send := stateSender(e, &calls)
+	elements := strings.Split(strings.TrimSpace(areaFile), "\n")
+	file := filepath.Join(t.TempDir(), "areas.json")
+	require.NoError(t, os.WriteFile(file, []byte("[\n"+strings.Join(elements, ",\n")+strings.Repeat(" ", 1100<<10)+"\n]"), 0o600))
+
+	out, err := runState(send, "import", file, "--chunk", "1")
+	require.NoError(t, err, out)
+	assert.Equal(t, []string{"POST /api/state/import application/x-ndjson"}, calls, "an array over the chunk size is not split")
+	assert.Equal(t, 4, m.count("area"))
+}
