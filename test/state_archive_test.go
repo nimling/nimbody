@@ -1,9 +1,11 @@
 package test
 
 import (
+	"bytes"
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	mathrand "math/rand"
 	"os"
 	"path/filepath"
 	"testing"
@@ -44,10 +46,16 @@ func TestStatePackRoundTripsFilesPlainAndEncrypted(t *testing.T) {
 
 func TestStateSplitAndChunkNames(t *testing.T) {
 	data := []byte("0123456789")
-	parts := state.Split(data, 4)
+	parts, err := state.Split(data, 4, state.ChunkFixed)
+	require.NoError(t, err)
 	assert.Equal(t, [][]byte{[]byte("0123"), []byte("4567"), []byte("89")}, parts)
-	assert.Equal(t, [][]byte{data}, state.Split(data, 0))
-	assert.Equal(t, [][]byte{data}, state.Split(data, 10))
+	for _, size := range []int{0, 10} {
+		whole, err := state.Split(data, size, state.ChunkFixed)
+		require.NoError(t, err)
+		assert.Equal(t, [][]byte{data}, whole)
+	}
+	_, err = state.Split(data, 4, "rabin")
+	assert.Error(t, err)
 
 	name := state.GetChunkName("out.tar.zst", 3)
 	assert.Equal(t, "out.tar.zst.part-0003", name)
@@ -183,4 +191,96 @@ func TestStateCommandImportsMarkdownFilesFromAnArchive(t *testing.T) {
 	require.NoError(t, err, out)
 	assert.Equal(t, 2, m.count("article"))
 	assert.Equal(t, []string{"POST /api/state/import text/markdown", "POST /api/state/import text/markdown"}, calls)
+}
+
+func TestStateFastCDCSplitJoinsBackAndKeepsUnchangedChunks(t *testing.T) {
+	data := make([]byte, 4<<20)
+	_, err := mathrand.New(mathrand.NewSource(7)).Read(data)
+	require.NoError(t, err)
+
+	parts, err := state.Split(data, 64<<10, state.ChunkFastCDC)
+	require.NoError(t, err)
+	require.Greater(t, len(parts), 8)
+	assert.Equal(t, data, bytes.Join(parts, nil))
+	for _, part := range parts[:len(parts)-1] {
+		assert.GreaterOrEqual(t, len(part), 16<<10)
+		assert.LessOrEqual(t, len(part), 256<<10)
+	}
+
+	again, err := state.Split(data, 64<<10, state.ChunkFastCDC)
+	require.NoError(t, err)
+	assert.Equal(t, parts, again, "the same data gives the same chunks")
+
+	edited := append([]byte(nil), data...)
+	edited[len(edited)/2] ^= 0xff
+	changed, err := state.Split(edited, 64<<10, state.ChunkFastCDC)
+	require.NoError(t, err)
+	seen := map[string]bool{}
+	for _, part := range parts {
+		seen[string(part)] = true
+	}
+	shared := 0
+	for _, part := range changed {
+		if seen[string(part)] {
+			shared++
+		}
+	}
+	assert.GreaterOrEqual(t, shared, len(changed)-3, "one changed byte leaves the other chunks as they were")
+
+	shifted, err := state.Split(append([]byte("inserted at the front"), data...), 64<<10, state.ChunkFastCDC)
+	require.NoError(t, err)
+	shared = 0
+	for _, part := range shifted {
+		if seen[string(part)] {
+			shared++
+		}
+	}
+	assert.GreaterOrEqual(t, shared, len(shifted)-3, "an insert at the front moves no chunk boundary behind it")
+
+	fixed, err := state.Split(append([]byte("inserted at the front"), data...), 64<<10, state.ChunkFixed)
+	require.NoError(t, err)
+	shared = 0
+	for _, part := range fixed {
+		if seen[string(part)] {
+			shared++
+		}
+	}
+	assert.Zero(t, shared, "a fixed split shifts every chunk")
+
+	_, err = state.Split(data, 512, state.ChunkFastCDC)
+	assert.Error(t, err)
+}
+
+func TestStateCommandRoundTripsAFastCDCChunkedArchive(t *testing.T) {
+	source := randomAreas(t, 800)
+	var calls []string
+	archive := filepath.Join(t.TempDir(), "areas.tar.zst")
+
+	out, err := runState(stateSender(areaService(source), &calls), "export", "--archive", "-o", archive, "--chunk-size", "1", "--chunk-mode", "fastcdc")
+	require.NoError(t, err, out)
+	assert.NoFileExists(t, archive)
+	chunks, err := filepath.Glob(archive + state.ChunkSeparator + "*")
+	require.NoError(t, err)
+	require.Greater(t, len(chunks), 1)
+
+	repeat := filepath.Join(t.TempDir(), "areas.tar.zst")
+	_, err = runState(stateSender(areaService(source), &calls), "export", "--archive", "-o", repeat, "--chunk-size", "1", "--chunk-mode", "fastcdc")
+	require.NoError(t, err)
+	for i := range chunks {
+		first, err := os.ReadFile(state.GetChunkName(archive, i+1))
+		require.NoError(t, err)
+		second, err := os.ReadFile(state.GetChunkName(repeat, i+1))
+		require.NoError(t, err)
+		assert.Equal(t, first, second, "an export of unchanged data writes the same chunks")
+	}
+
+	for name, arg := range map[string]string{"the base name": archive, "a part": state.GetChunkName(archive, 2)} {
+		target := newMemory("b")
+		out, err = runState(stateSender(areaService(target), &calls), "import", arg)
+		require.NoError(t, err, name+": "+out)
+		assert.Equal(t, areaNames(source), areaNames(target), name)
+	}
+
+	_, err = runState(stateSender(areaService(source), &calls), "export", "--archive", "-o", filepath.Join(t.TempDir(), "x.tar.zst"), "--chunk-mode", "rabin")
+	assert.ErrorContains(t, err, "chunk mode")
 }

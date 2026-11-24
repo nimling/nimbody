@@ -4,6 +4,7 @@ go 1.25.0
 
 require (
 	filippo.io/age v1.3.2
+	github.com/PlakarKorp/go-cdc-chunkers v1.1.0
 	github.com/google/uuid v1.6.0
 	github.com/hashicorp/terraform-plugin-go v0.30.0
 	github.com/itchyny/gojq v0.12.19
@@ -32,6 +33,7 @@ require (
 	github.com/inconshreveable/mousetrap v1.1.0 // indirect
 	github.com/itchyny/timefmt-go v0.1.8 // indirect
 	github.com/jinzhu/inflection v1.0.0 // indirect
+	github.com/klauspost/cpuid/v2 v2.0.12 // indirect
 	github.com/kr/text v0.2.0 // indirect
 	github.com/labstack/gommon v0.4.2 // indirect
 	github.com/mattn/go-colorable v0.1.14 // indirect
@@ -45,6 +47,7 @@ require (
 	github.com/valyala/fasttemplate v1.2.2 // indirect
 	github.com/vmihailenco/msgpack/v5 v5.4.1 // indirect
 	github.com/vmihailenco/tagparser/v2 v2.0.0 // indirect
+	github.com/zeebo/blake3 v0.2.4 // indirect
 	golang.org/x/crypto v0.55.0 // indirect
 	golang.org/x/net v0.57.0 // indirect
 	golang.org/x/sys v0.47.0 // indirect

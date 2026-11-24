@@ -6,16 +6,24 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/bits"
 	"regexp"
 	"strconv"
 
 	"filippo.io/age"
+	chunkers "github.com/PlakarKorp/go-cdc-chunkers"
+	_ "github.com/PlakarKorp/go-cdc-chunkers/chunkers/fastcdc"
 	"github.com/klauspost/compress/zstd"
 )
 
 const ArchiveMaxBytes = 1 << 30
 
 const ChunkSeparator = ".part-"
+
+const (
+	ChunkFixed   = "fixed"
+	ChunkFastCDC = "fastcdc"
+)
 
 var ErrKeyRequired = errors.New("the archive is encrypted and takes a key")
 
@@ -152,16 +160,50 @@ func Unpack(data []byte, key string) ([]ArchiveFile, error) {
 	return files, nil
 }
 
-func Split(data []byte, size int) [][]byte {
+func Split(data []byte, size int, mode string) ([][]byte, error) {
+	switch mode {
+	case ChunkFixed, "":
+	case ChunkFastCDC:
+		if size <= 0 || len(data) <= size {
+			return [][]byte{data}, nil
+		}
+		return splitFastCDC(data, size)
+	default:
+		return nil, fmt.Errorf("the chunk mode %q is not %s or %s", mode, ChunkFixed, ChunkFastCDC)
+	}
 	if size <= 0 || len(data) <= size {
-		return [][]byte{data}
+		return [][]byte{data}, nil
 	}
 	parts := make([][]byte, 0, len(data)/size+1)
 	for len(data) > size {
 		parts = append(parts, data[:size])
 		data = data[size:]
 	}
-	return append(parts, data)
+	return append(parts, data), nil
+}
+
+func splitFastCDC(data []byte, size int) ([][]byte, error) {
+	normal := 1 << (bits.Len(uint(size)) - 1)
+	if normal < 1024 {
+		return nil, errors.New("the fastcdc chunk size is at least 1024 bytes")
+	}
+	chunker, err := chunkers.NewChunker("fastcdc", bytes.NewReader(data), &chunkers.ChunkerOpts{MinSize: normal / 4, NormalSize: normal, MaxSize: normal * 4})
+	if err != nil {
+		return nil, err
+	}
+	var parts [][]byte
+	for {
+		chunk, err := chunker.Next()
+		if len(chunk) > 0 {
+			parts = append(parts, append([]byte(nil), chunk...))
+		}
+		if errors.Is(err, io.EOF) {
+			return parts, nil
+		}
+		if err != nil {
+			return nil, err
+		}
+	}
 }
 
 func GetChunkName(base string, number int) string {

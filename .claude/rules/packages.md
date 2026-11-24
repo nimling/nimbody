@@ -14,7 +14,7 @@
 
 3.3. `shape/`: output shaping the cli renderer and the remote mcp tools share, fields, sort, jq and templates. Depends on stdlib and itchyny/gojq.
 
-4. The dependency whitelist for the whole module is stdlib, echo, google/uuid, uptrace/bun, and spf13/cobra with spf13/pflag, gopkg.in/yaml.v3 and joho/godotenv for `cli/` alone, itchyny/gojq for `shape/` alone, klauspost/compress and filippo.io/age for `state/` and `cli/` alone, and stretchr/testify for `test/` alone. Nothing else enters go.mod without a coordinated decision.
+4. The dependency whitelist for the whole module is stdlib, echo, google/uuid, uptrace/bun, and spf13/cobra with spf13/pflag, gopkg.in/yaml.v3 and joho/godotenv for `cli/` alone, itchyny/gojq for `shape/` alone, klauspost/compress, filippo.io/age and PlakarKorp/go-cdc-chunkers for `state/` and `cli/` alone, and stretchr/testify for `test/` alone. Nothing else enters go.mod without a coordinated decision.
 
 5. Nothing app specific enters any package: no models, no ORM setup, no database connections beyond the bun select in `respond`, no samna auth primitives, no imports from consumer repos. godotenv is for `example/` and `cli/` only.
 
