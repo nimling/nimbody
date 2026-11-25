@@ -1675,3 +1675,111 @@ func TestStateGatesBeforeTheCallback(t *testing.T) {
 	assert.True(t, gated >= 0 && gated < removed, "%v", calls)
 	assert.Equal(t, 0, m.count("skill"))
 }
+
+const placeholderFile = stateHeader +
+	`{"group":"location","key":"wing","data":{"name":"Wing of {{hq.name}}","region":"{{boardroom}}"}}` + "\n" +
+	`{"group":"location","key":"annex","data":{"name":"Annex","region":"{{hq.region}}"}}` + "\n" +
+	`{"group":"room","id":"{{boardroom}}","data":{"name":"Boardroom","location_id":"{{hq}}","seats":12,"kind":"meeting"}}` + "\n" +
+	`{"group":"room","key":"desk","data":{"name":"Desk in {{hq}}","seats":1,"kind":"desk"},"refs":{"location_id":"{{hq}}"}}` + "\n" +
+	`{"group":"location","id":"{{hq}}","data":{"name":"HQ","region":"north"}}` + "\n"
+
+func TestStatePlaceholdersDefineAndResolve(t *testing.T) {
+	m := newMemory("p")
+	e, _ := stateService(m)
+	out := importState(t, e, "", []byte(placeholderFile))
+	require.Equal(t, map[string]int{state.OutcomeCreated: 5}, out.Counts, "%+v", out.Results)
+
+	ids := map[string]string{}
+	var order []string
+	for _, result := range out.Results {
+		ids[result.Key] = result.ID
+		order = append(order, result.Key)
+	}
+	assert.NotEmpty(t, ids["hq"])
+	assert.NotContains(t, ids["hq"], "{{")
+	assert.Less(t, indexOf(order, "hq"), indexOf(order, "boardroom"), "a record lands after the one its placeholder names")
+	assert.Less(t, indexOf(order, "boardroom"), indexOf(order, "wing"), "a room a location names lands before it, against the group order")
+	assert.Less(t, indexOf(order, "hq"), indexOf(order, "annex"))
+
+	assert.Equal(t, ids["hq"], rowOf(m, "room", ids["boardroom"]).data["location_id"], "{{name}} in a reference field is the id")
+	assert.Equal(t, ids["hq"], rowOf(m, "room", ids["desk"]).data["location_id"])
+	assert.Equal(t, "Desk in "+ids["hq"], rowOf(m, "room", ids["desk"]).data["name"], "{{name}} inside a text is the id")
+	assert.Equal(t, ids["boardroom"], rowOf(m, "location", ids["wing"]).data["region"], "{{name}} in any field is the id")
+	assert.Equal(t, "Wing of HQ", rowOf(m, "location", ids["wing"]).data["name"], "{{name.field}} is the field of the created record")
+	assert.Equal(t, "north", rowOf(m, "location", ids["annex"]).data["region"])
+	assert.Equal(t, "hq", rowOf(m, "location", ids["hq"]).external, "the name is the record's key")
+}
+
+func TestStatePlaceholdersChangeNothingOnASecondRun(t *testing.T) {
+	m := newMemory("p")
+	e, _ := stateService(m)
+	first := importState(t, e, "", []byte(placeholderFile))
+	require.Equal(t, map[string]int{state.OutcomeCreated: 5}, first.Counts, "%+v", first.Results)
+	writes := m.writes
+
+	var array []json.RawMessage
+	for _, row := range strings.Split(strings.TrimSpace(placeholderFile), "\n")[1:] {
+		array = append(array, json.RawMessage(row))
+	}
+	body, err := json.Marshal(array)
+	require.NoError(t, err)
+	for _, query := range []string{"", "mode=replace", "dry_run=true"} {
+		rec := call(e, http.MethodPost, "/api/state/import?"+query, echo.MIMEApplicationJSON, "", body)
+		require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+		var wrapped struct {
+			Data state.ImportResponse `json:"data"`
+		}
+		require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &wrapped))
+		assert.Equal(t, map[string]int{state.OutcomeUnchanged: 5}, wrapped.Data.Counts, "%s: %+v", query, wrapped.Data.Results)
+	}
+	assert.Equal(t, writes, m.writes)
+	assert.Equal(t, 3, m.count("location"))
+	assert.Equal(t, 2, m.count("room"))
+}
+
+func TestStatePlaceholdersRefuseWhatNothingDefines(t *testing.T) {
+	file := stateHeader +
+		`{"group":"location","id":"{{hq}}","data":{"name":"HQ"}}` + "\n" +
+		`{"group":"location","key":"annex","data":{"name":"Annex","region":"{{campus}}"}}` + "\n"
+	for _, query := range []string{"", "dry_run=true", "mode=replace"} {
+		m := seeded()
+		e, _ := stateService(m)
+		rec := call(e, http.MethodPost, "/api/state/import?"+query, state.MIMENDJSON, "", []byte(file))
+		assert.Equal(t, http.StatusBadRequest, rec.Code, rec.Body.String())
+		assert.Contains(t, rec.Body.String(), "{{campus}}")
+		assert.Equal(t, 0, m.writes, query)
+		assert.Equal(t, 2, m.count("location"), query)
+	}
+}
+
+func TestStatePlaceholdersRefuseACycle(t *testing.T) {
+	file := stateHeader +
+		`{"group":"location","id":"{{north}}","data":{"name":"North","region":"{{south}}"}}` + "\n" +
+		`{"group":"location","id":"{{south}}","data":{"name":"South","region":"{{north.name}}"}}` + "\n"
+	for _, query := range []string{"", "dry_run=true"} {
+		m := newMemory("p")
+		e, _ := stateService(m)
+		rec := call(e, http.MethodPost, "/api/state/import?"+query, state.MIMENDJSON, "", []byte(file))
+		assert.Equal(t, http.StatusBadRequest, rec.Code, rec.Body.String())
+		assert.Contains(t, rec.Body.String(), "cycle")
+		assert.Equal(t, 0, m.writes, query)
+	}
+}
+
+func TestStatePlaceholdersInAMarkdownFile(t *testing.T) {
+	m := newMemory("p")
+	e := articleService(m)
+	rec := importMarkdown(t, e, "target=article", "---\nid: \"{{intro}}\"\ntitle: Intro\n---\nWelcome.\n")
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+	require.Len(t, m.rows["article"], 1)
+	assert.Equal(t, "intro", m.rows["article"][0].external)
+	assert.NotContains(t, m.rows["article"][0].id, "{{")
+}
+
+func TestStateReadsBracesAsTextWhenNothingIsDefined(t *testing.T) {
+	m := newMemory("p")
+	e, _ := stateService(m)
+	out := importState(t, e, "", []byte(stateHeader+`{"group":"location","key":"mail","data":{"name":"Hello {{first_name}}"}}`+"\n"))
+	require.Equal(t, map[string]int{state.OutcomeCreated: 1}, out.Counts, "%+v", out.Results)
+	assert.Equal(t, "Hello {{first_name}}", m.rows["location"][0].data["name"])
+}

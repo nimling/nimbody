@@ -25,6 +25,7 @@ type run struct {
 	ids     map[string]map[string]string
 	keys    map[string]map[string]string
 	planned map[string]map[string]bool
+	names   *placeholders
 	out     ImportResponse
 }
 
@@ -84,6 +85,11 @@ func (s *service) importFile(c *Context, in ImportRequest, file File) (ImportRes
 		}
 	}
 
+	sequence, err := s.placeholders(r, incoming)
+	if err != nil {
+		return ImportResponse{}, err
+	}
+
 	if mode == ModeSync || mode == ModeReplace {
 		if err := s.prune(r, in, file, incoming, removals); err != nil {
 			return ImportResponse{}, err
@@ -115,24 +121,31 @@ func (s *service) importFile(c *Context, in ImportRequest, file File) (ImportRes
 		blobs[blob.Group][blob.Key] = append(blobs[blob.Group][blob.Key], blob)
 	}
 
-	for _, g := range s.groups {
-		lines := incoming[g.name]
-		if len(lines) == 0 {
-			continue
+	groups := map[string]group{}
+	current := map[string]map[string]exported{}
+	left := map[string]int{}
+	for _, line := range sequence {
+		left[line.Group]++
+	}
+	for _, line := range sequence {
+		step := "import:" + line.Group
+		g, started := groups[line.Group]
+		if !started {
+			g = s.byName[line.Group].resolved()
+			groups[g.name] = g
+			c.Steps.Start(step, "import "+g.name, "")
+			rows, err := s.current(r, g, incoming[g.name])
+			if err != nil {
+				c.Steps.Fail(step, err)
+				return ImportResponse{}, err
+			}
+			current[g.name] = rows
 		}
-		g = g.resolved()
-		lines = orderLines(g, lines)
-		step := "import:" + g.name
-		c.Steps.Start(step, "import "+g.name, "")
-		current, err := s.current(r, g, lines)
-		if err != nil {
-			c.Steps.Fail(step, err)
-			return ImportResponse{}, err
+		r.report(step, "import "+g.name+" "+line.Key, s.importLine(r, g, line, current[g.name][line.Key], blobs[g.name][line.Key]))
+		left[g.name]--
+		if left[g.name] == 0 {
+			c.Steps.Done(step, nil)
 		}
-		for _, line := range lines {
-			r.report(step, "import "+g.name+" "+line.Key, s.importLine(r, g, line, current[line.Key], blobs[g.name][line.Key]))
-		}
-		c.Steps.Done(step, nil)
 	}
 
 	return r.out, nil
@@ -221,6 +234,13 @@ func (s *service) current(r *run, g group, lines []Line) (map[string]exported, e
 
 func (s *service) importLine(r *run, g group, line Line, existing exported, blobs []Blob) Result {
 	result := Result{Key: line.Key, Group: g.name}
+	if r.names != nil {
+		data, err := r.names.fill(g, line.Data)
+		if err != nil {
+			return r.refuse(result, err)
+		}
+		line.Data = data
+	}
 	id, err := r.id(g.name, line.Key)
 	if err != nil {
 		return r.refuse(result, err)

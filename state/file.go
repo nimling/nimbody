@@ -134,6 +134,9 @@ func Read(r io.Reader) (File, error) {
 			if err := lineDecoder.Decode(&line); err != nil {
 				return fmt.Errorf("%s %d: %w", label, index, err)
 			}
+			if name, ok := defined(line.ID); ok && line.Key == "" {
+				line.Key = name
+			}
 			if line.Group == "" || line.Key == "" {
 				return fmt.Errorf("%s %d: a record carries group and key", label, index)
 			}
@@ -373,6 +376,12 @@ func ReadMarkdown(r io.Reader, group, document string) (Line, error) {
 		body = rest
 	}
 	line := Line{Group: group, Data: data}
+	if id, ok := data["id"].(string); ok {
+		if name, ok := defined(id); ok {
+			delete(data, "id")
+			line.ID, line.Key = id, name
+		}
+	}
 	if value, ok := data["key"]; ok {
 		delete(data, "key")
 		switch keyed := value.(type) {
