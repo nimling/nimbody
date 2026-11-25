@@ -1,7 +1,6 @@
 package state
 
 import (
-	"errors"
 	"net/http"
 	"sort"
 
@@ -57,8 +56,6 @@ func (s *service) export(c *Context, in ExportRequest) (File, error) {
 	file := File{Manifest: Manifest{Format: FormatVersion, Service: c.Service, Version: c.Version, Scope: scope, History: in.History, Blobs: in.Blobs}}
 	keys := map[string]map[string]string{}
 	taken := map[string]map[string]bool{}
-	owners := map[string]string{}
-	refused := map[string]bool{}
 	var names []string
 	for _, target := range targets {
 		g := s.byName[target.Group].resolved()
@@ -86,26 +83,6 @@ func (s *service) export(c *Context, in ExportRequest) (File, error) {
 		var lines []Line
 		var blobs []Blob
 		for _, row := range kept {
-			owner := g.named(row.data)
-			organization, gated := owners[owner]
-			if !gated {
-				err := c.gate(owner)
-				var rejected *echo.HTTPError
-				switch {
-				case err == nil:
-				case errors.As(err, &rejected) && (rejected.Code == http.StatusForbidden || rejected.Code == http.StatusNotFound):
-					refused[owner] = true
-				default:
-					c.Steps.Fail(step, err)
-					return File{}, err
-				}
-				organization = c.Organization
-				owners[owner] = organization
-			}
-			if refused[owner] {
-				continue
-			}
-			c.Organization = organization
 			line, err := s.line(c, g, row, keys)
 			if err != nil {
 				c.Steps.Fail(step, err)
@@ -126,7 +103,6 @@ func (s *service) export(c *Context, in ExportRequest) (File, error) {
 				blobs = append(blobs, blob)
 			}
 		}
-		c.Organization = ""
 		sortLines(lines)
 		sort.SliceStable(blobs, func(i, j int) bool {
 			if blobs[i].Key != blobs[j].Key {

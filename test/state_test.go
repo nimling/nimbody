@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -242,13 +241,6 @@ func stateGroups(m *memory, extra ...state.Definition) []state.Definition {
 	return append([]state.Definition{room, location}, extra...)
 }
 
-func owns(ctx echo.Context, owner string) (string, error) {
-	if owner == "" {
-		owner = "org-app"
-	}
-	return owner, nil
-}
-
 func stateService(m *memory, extra ...state.Definition) (*echo.Echo, []mcp.Operation) {
 	access := func(next echo.HandlerFunc) echo.HandlerFunc {
 		return func(ctx echo.Context) error {
@@ -262,7 +254,6 @@ func stateService(m *memory, extra ...state.Definition) (*echo.Echo, []mcp.Opera
 		Service: "demo",
 		Version: "v1.2.3",
 		Keys:    m,
-		Owner:   owns,
 		Names: func(ctx echo.Context) (map[string]any, error) {
 			m.mu.Lock()
 			defer m.mu.Unlock()
@@ -831,7 +822,7 @@ func connectionGroup(m *memory) state.Group[connectionBody] {
 
 func connectionService(m *memory) *echo.Echo {
 	e := echo.New()
-	mcp.Route(e.Group("/api"), state.Register(state.Context{Service: "demo", Version: "v1.2.3", Keys: m, Owner: owns}, nil, connectionGroup(m))...)
+	mcp.Route(e.Group("/api"), state.Register(state.Context{Service: "demo", Version: "v1.2.3", Keys: m}, nil, connectionGroup(m))...)
 	return e
 }
 
@@ -1053,7 +1044,7 @@ func TestStateHeadersReachTheAccessOverTheRelay(t *testing.T) {
 		}
 	}
 	e := echo.New()
-	operations := state.Register(state.Context{Service: "demo", Version: "v1.2.3", Keys: m, Owner: owns, Headers: []mcp.Header{{Name: "app_slug", Param: "SAuth-App-Slug", Usage: "the app the session belongs to"}}}, []echo.MiddlewareFunc{session}, memoryGroup[locationBody](m, "location"))
+	operations := state.Register(state.Context{Service: "demo", Version: "v1.2.3", Keys: m, Headers: []mcp.Header{{Name: "app_slug", Param: "SAuth-App-Slug", Usage: "the app the session belongs to"}}}, []echo.MiddlewareFunc{session}, memoryGroup[locationBody](m, "location"))
 	mcp.Route(e.Group("/api"), operations...)
 	server := &mcp.Server{Name: "demo", Version: "v1", Operations: operations}
 	server.Mount(e)
@@ -1105,7 +1096,7 @@ func TestStateUnderAPIRunsTheServiceChain(t *testing.T) {
 	}
 	e := echo.New()
 	server := &mcp.Server{Name: "demo", Version: "v1"}
-	require.NoError(t, endpoint.Mount(e, endpoint.Set{Service: "demo", Version: "v1.2.3", MCP: server, APIMiddleware: []echo.MiddlewareFunc{claims}, State: &state.Context{Keys: m, Owner: owns}, Groups: []state.Definition{memoryGroup[locationBody](m, "location")}}))
+	require.NoError(t, endpoint.Mount(e, endpoint.Set{Service: "demo", Version: "v1.2.3", MCP: server, APIMiddleware: []echo.MiddlewareFunc{claims}, State: &state.Context{Keys: m}, Groups: []state.Definition{memoryGroup[locationBody](m, "location")}}))
 	send := func(method, target, contentType, claim string, body []byte) *httptest.ResponseRecorder {
 		req := httptest.NewRequest(method, target, bytes.NewReader(body))
 		req.Header.Set(echo.HeaderAuthorization, "Bearer anyone")
@@ -1537,66 +1528,6 @@ func TestStateCommandSendsAJSONArrayInOneRequest(t *testing.T) {
 	assert.Equal(t, 4, m.count("area"))
 }
 
-type ownedBody struct {
-	Name    string `json:"name"`
-	OwnerID string `json:"owner_id,omitempty"`
-}
-
-func ownedService(m *memory, calls *[]string) *echo.Echo {
-	skill := memoryGroup[ownedBody](m, "skill")
-	skill.Owner = "/owner_id"
-	exported, imported, deleted := skill.Export, skill.Import, skill.Delete
-	skill.Export = func(ctx *state.Context, query state.Query) ([]state.Record[ownedBody], error) {
-		*calls = append(*calls, "export "+ctx.Organization)
-		return exported(ctx, query)
-	}
-	skill.Import = func(ctx *state.Context, record state.Record[ownedBody]) (string, error) {
-		*calls = append(*calls, "import "+ctx.Organization)
-		return imported(ctx, record)
-	}
-	skill.Delete = func(ctx *state.Context, id string) error {
-		*calls = append(*calls, "delete "+ctx.Organization)
-		return deleted(ctx, id)
-	}
-	host := state.Context{
-		Service: "demo",
-		Version: "v1.2.3",
-		Keys:    m,
-		Owner: func(ctx echo.Context, owner string) (string, error) {
-			*calls = append(*calls, "gate "+owner)
-			if owner == "" {
-				owner = "org-app"
-			}
-			if !containsString(strings.Split(ctx.Request().Header.Get("X-Owns"), ","), owner) {
-				return "", echo.NewHTTPError(http.StatusForbidden, "Forbidden")
-			}
-			return owner, nil
-		},
-	}
-	e := echo.New()
-	mcp.Route(e.Group("/api"), state.Register(host, nil, skill)...)
-	return e
-}
-
-func callAs(e *echo.Echo, owns, target, contentType string, body []byte) *httptest.ResponseRecorder {
-	req := httptest.NewRequest(http.MethodPost, target, bytes.NewReader(body))
-	req.Header.Set("X-Owns", owns)
-	req.Header.Set(echo.HeaderContentType, contentType)
-	rec := httptest.NewRecorder()
-	e.ServeHTTP(rec, req)
-	return rec
-}
-
-func importAs(t *testing.T, e *echo.Echo, owns, query, lines string) state.ImportResponse {
-	rec := callAs(e, owns, "/api/state/import?"+query, state.MIMENDJSON, []byte(stateHeader+lines))
-	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
-	var wrapped struct {
-		Data state.ImportResponse `json:"data"`
-	}
-	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &wrapped))
-	return wrapped.Data
-}
-
 func indexOf(list []string, value string) int {
 	for index, item := range list {
 		if item == value {
@@ -1606,177 +1537,68 @@ func indexOf(list []string, value string) int {
 	return -1
 }
 
-func TestStateRegisterStopsWithoutAnOwnerHook(t *testing.T) {
+func TestStateReportsWhatTheGroupFunctionsAnswer(t *testing.T) {
 	m := newMemory("a")
-	assert.Panics(t, func() {
-		state.Register(state.Context{Service: "demo", Keys: m}, nil, memoryGroup[locationBody](m, "location"))
-	})
-}
-
-func TestStateRefusesACallerWhoDoesNotOwn(t *testing.T) {
-	m := newMemory("a")
-	m.add("skill", "skill-1", map[string]any{"name": "Go", "owner_id": "org-a"})
-	var calls []string
-	e := ownedService(m, &calls)
-
-	rec := callAs(e, "org-b", "/api/state/export", echo.MIMEApplicationJSON, []byte(`{}`))
-	assert.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
-	assert.NotContains(t, rec.Body.String(), "skill-1")
-	assert.Equal(t, []string{"export ", "gate org-a"}, calls)
-
-	calls = nil
-	out := importAs(t, e, "org-b", "delete=skill:skill-1",
-		`{"group":"skill","key":"sql","data":{"name":"SQL","owner_id":"org-a"}}`+"\n")
-	assert.Equal(t, map[string]string{"skill:sql": state.OutcomeRefused, "skill:skill-1": state.OutcomeRefused}, outcomes(out))
-	for _, result := range out.Results {
-		assert.Equal(t, "Forbidden", result.Error)
+	m.add("location", "loc-1", map[string]any{"name": "Head office", "region": "north"})
+	m.add("location", "loc-2", map[string]any{"name": "Annex", "region": "north"})
+	m.add("location", "loc-3", map[string]any{"name": "Vault", "region": "north"})
+	location := memoryGroup[locationBody](m, "location")
+	exported, imported, deleted := location.Export, location.Import, location.Delete
+	location.Export = func(ctx *state.Context, query state.Query) ([]state.Record[locationBody], error) {
+		rows, err := exported(ctx, query)
+		var out []state.Record[locationBody]
+		for _, row := range rows {
+			if row.Data.Name != "Vault" {
+				out = append(out, row)
+			}
+		}
+		return out, err
 	}
-	assert.Equal(t, 1, m.count("skill"))
-	assert.Equal(t, 0, m.writes)
-	assert.Equal(t, -1, indexOf(calls, "import org-a"))
-	assert.Equal(t, -1, indexOf(calls, "delete org-a"))
+	location.Import = func(ctx *state.Context, record state.Record[locationBody]) (string, error) {
+		if record.Data.Name == "Cellar" {
+			return "", echo.NewHTTPError(http.StatusForbidden, "Forbidden")
+		}
+		return imported(ctx, record)
+	}
+	location.Delete = func(ctx *state.Context, id string) error {
+		if id == "loc-3" {
+			return echo.NewHTTPError(http.StatusForbidden, "Forbidden")
+		}
+		return deleted(ctx, id)
+	}
+	e := echo.New()
+	mcp.Route(e.Group("/api"), state.Register(state.Context{Service: "demo", Version: "v1.2.3", Keys: m}, nil, location)...)
+	post := func(target, contentType string, body []byte) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPost, target, bytes.NewReader(body))
+		req.Header.Set(echo.HeaderContentType, contentType)
+		rec := httptest.NewRecorder()
+		e.ServeHTTP(rec, req)
+		require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+		return rec
+	}
 
-	out = importAs(t, e, "org-b", "dry_run=true", `{"group":"skill","key":"skill-1","data":{"name":"Golang","owner_id":"org-b"}}`+"\n")
-	assert.Equal(t, map[string]string{"skill:skill-1": state.OutcomeRefused}, outcomes(out))
-}
-
-func TestStateFallsBackToTheApplicationOwner(t *testing.T) {
-	m := newMemory("a")
-	var calls []string
-	e := ownedService(m, &calls)
-
-	out := importAs(t, e, "org-app", "", `{"group":"skill","key":"sql","data":{"name":"SQL"}}`+"\n")
-	assert.Equal(t, map[string]string{"skill:sql": state.OutcomeCreated}, outcomes(out))
-	assert.Contains(t, calls, "gate ")
-	assert.Contains(t, calls, "import org-app")
-
-	out = importAs(t, e, "org-a", "", `{"group":"skill","key":"css","data":{"name":"CSS"}}`+"\n")
-	assert.Equal(t, map[string]string{"skill:css": state.OutcomeRefused}, outcomes(out))
-	assert.Equal(t, 1, m.count("skill"))
-}
-
-func TestStateGatesBeforeTheCallback(t *testing.T) {
-	m := newMemory("a")
-	var calls []string
-	e := ownedService(m, &calls)
-
-	out := importAs(t, e, "org-a", "", `{"group":"skill","key":"sql","data":{"name":"SQL","owner_id":"org-a"}}`+"\n")
-	assert.Equal(t, map[string]string{"skill:sql": state.OutcomeCreated}, outcomes(out))
-	gated, written := indexOf(calls, "gate org-a"), indexOf(calls, "import org-a")
-	assert.True(t, gated >= 0 && gated < written, "%v", calls)
-
-	calls = nil
-	out = importAs(t, e, "org-a", "", `{"group":"skill","key":"sql","data":{"name":"Postgres","owner_id":"org-b"}}`+"\n")
-	assert.Equal(t, map[string]string{"skill:sql": state.OutcomeUpdated}, outcomes(out))
-	assert.Equal(t, -1, indexOf(calls, "gate org-b"))
-	gated, written = indexOf(calls, "gate org-a"), indexOf(calls, "import org-a")
-	assert.True(t, gated >= 0 && gated < written, "%v", calls)
-
-	calls = nil
-	rec := callAs(e, "org-b", "/api/state/export", echo.MIMEApplicationJSON, []byte(`{}`))
-	assert.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
-	assert.Contains(t, rec.Body.String(), "Postgres")
-	assert.Equal(t, []string{"export ", "gate org-b"}, calls)
-
-	m.rows["skill"][0].data["owner_id"] = "org-a"
-	calls = nil
-	out = importAs(t, e, "org-a", "delete=skill:sql", "")
-	assert.Equal(t, map[string]string{"skill:sql": state.OutcomeDeleted}, outcomes(out))
-	gated, removed := indexOf(calls, "gate org-a"), indexOf(calls, "delete org-a")
-	assert.True(t, gated >= 0 && gated < removed, "%v", calls)
-	assert.Equal(t, 0, m.count("skill"))
-}
-
-func exportedKeys(t *testing.T, rec *httptest.ResponseRecorder) []string {
-	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
-	file, err := state.Read(bytes.NewReader(rec.Body.Bytes()))
+	file, err := state.Read(bytes.NewReader(post("/api/state/export", echo.MIMEApplicationJSON, []byte(`{}`)).Body.Bytes()))
 	require.NoError(t, err)
 	keys := []string{}
 	for _, line := range file.Records {
 		keys = append(keys, line.Key)
 	}
-	return keys
-}
+	assert.Equal(t, []string{"loc-1", "loc-2"}, keys, "an export holds the rows the group's function answered and no other")
 
-func countOf(list []string, value string) int {
-	count := 0
-	for _, item := range list {
-		if item == value {
-			count++
+	rec := post("/api/state/import?delete=location:loc-3", state.MIMENDJSON, []byte(stateHeader+
+		`{"group":"location","key":"cellar","data":{"name":"Cellar"}}`+"\n"+
+		`{"group":"location","key":"attic","data":{"name":"Attic"}}`+"\n"))
+	var wrapped struct {
+		Data state.ImportResponse `json:"data"`
+	}
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &wrapped))
+	assert.Equal(t, map[string]string{"location:cellar": state.OutcomeRefused, "location:attic": state.OutcomeCreated, "location:loc-3": state.OutcomeRefused}, outcomes(wrapped.Data))
+	for _, result := range wrapped.Data.Results {
+		if result.Outcome == state.OutcomeRefused {
+			assert.Equal(t, "Forbidden", result.Error, result.Key)
 		}
 	}
-	return count
-}
-
-func TestStateExportGatesEveryRowOnItsOwner(t *testing.T) {
-	m := newMemory("a")
-	m.add("skill", "skill-1", map[string]any{"name": "Go", "owner_id": "org-a"})
-	m.add("skill", "skill-2", map[string]any{"name": "SQL", "owner_id": "org-b"})
-	m.add("skill", "skill-3", map[string]any{"name": "CSS", "owner_id": "org-a"})
-	m.add("skill", "skill-4", map[string]any{"name": "Rust", "owner_id": "org-b"})
-	m.add("skill", "skill-5", map[string]any{"name": "Zig"})
-	var calls []string
-	e := ownedService(m, &calls)
-
-	keys := exportedKeys(t, callAs(e, "org-a", "/api/state/export", echo.MIMEApplicationJSON, []byte(`{}`)))
-	assert.Equal(t, []string{"skill-1", "skill-3"}, keys)
-	assert.Equal(t, []string{"export ", "gate org-a", "gate org-b", "gate "}, calls)
-
-	calls = nil
-	keys = exportedKeys(t, callAs(e, "org-a,org-b,org-app", "/api/state/export", echo.MIMEApplicationJSON, []byte(`{"targets":[{"group":"skill"},{"group":"skill","keys":["skill-2"]}]}`)))
-	assert.Equal(t, []string{"skill-1", "skill-2", "skill-3", "skill-4", "skill-5"}, keys)
-	assert.Equal(t, 1, countOf(calls, "gate org-a"), "%v", calls)
-	assert.Equal(t, 1, countOf(calls, "gate org-b"), "%v", calls)
-	assert.Equal(t, 1, countOf(calls, "gate "), "%v", calls)
-
-	keys = exportedKeys(t, callAs(e, "org-c", "/api/state/export", echo.MIMEApplicationJSON, []byte(`{}`)))
-	assert.Empty(t, keys)
-}
-
-func TestStateExportGatesAGroupWithoutAnOwnerOnTheApplicationOwner(t *testing.T) {
-	m := newMemory("a")
-	m.add("location", "loc-1", map[string]any{"name": "Head office", "owner_id": "org-a"})
-	m.add("location", "loc-2", map[string]any{"name": "Annex"})
-	var calls []string
-	location := memoryGroup[ownedBody](m, "location")
-	exported := location.Export
-	location.Export = func(ctx *state.Context, query state.Query) ([]state.Record[ownedBody], error) {
-		calls = append(calls, "export "+ctx.Organization)
-		return exported(ctx, query)
-	}
-	location.Blobs.Get = func(ctx *state.Context, record state.Record[ownedBody]) ([]state.Blob, error) {
-		calls = append(calls, "blobs "+ctx.Organization)
-		return nil, nil
-	}
-	host := state.Context{Service: "demo", Version: "v1.2.3", Keys: m, Owner: func(ctx echo.Context, owner string) (string, error) {
-		calls = append(calls, "gate "+owner)
-		return owns(ctx, owner)
-	}}
-	e := echo.New()
-	mcp.Route(e.Group("/api"), state.Register(host, nil, location)...)
-
-	keys := exportedKeys(t, callAs(e, "", "/api/state/export", echo.MIMEApplicationJSON, []byte(`{"blobs":true}`)))
-	assert.Equal(t, []string{"loc-1", "loc-2"}, keys)
-	assert.Equal(t, []string{"export ", "gate ", "blobs org-app", "blobs org-app"}, calls)
-}
-
-func TestStateExportStopsOnAHookErrorThatIsNoRefusal(t *testing.T) {
-	m := newMemory("a")
-	m.add("location", "loc-1", map[string]any{"name": "Head office"})
-	for _, failed := range []error{errors.New("the database is gone"), echo.NewHTTPError(http.StatusServiceUnavailable, "the prophet is away")} {
-		calls := 0
-		host := state.Context{Service: "demo", Version: "v1.2.3", Keys: m, Owner: func(ctx echo.Context, owner string) (string, error) {
-			calls++
-			return "", failed
-		}}
-		e := echo.New()
-		mcp.Route(e.Group("/api"), state.Register(host, nil, memoryGroup[locationBody](m, "location"))...)
-
-		rec := callAs(e, "", "/api/state/export", echo.MIMEApplicationJSON, []byte(`{}`))
-		assert.GreaterOrEqual(t, rec.Code, http.StatusInternalServerError, rec.Body.String())
-		assert.NotContains(t, rec.Body.String(), "loc-1")
-		assert.Equal(t, 1, calls)
-	}
+	assert.Equal(t, 4, m.count("location"), "a refused record is neither written nor deleted")
 }
 
 const placeholderFile = stateHeader +

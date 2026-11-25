@@ -12,9 +12,8 @@ import (
 )
 
 type removal struct {
-	key   string
-	id    string
-	owner string
+	key string
+	id  string
 }
 
 type run struct {
@@ -102,12 +101,7 @@ func (s *service) importFile(c *Context, in ImportRequest, file File) (ImportRes
 		}
 		step := "delete:" + g.name
 		c.Steps.Start(step, "delete "+g.name, "")
-		items, err := s.owners(r, g, removals[g.name])
-		if err != nil {
-			c.Steps.Fail(step, err)
-			return ImportResponse{}, err
-		}
-		for _, item := range items {
+		for _, item := range removals[g.name] {
 			r.report(step, "delete "+g.name+" "+item.key, s.deleteRecord(r, g, item))
 		}
 		c.Steps.Done(step, nil)
@@ -219,7 +213,6 @@ func (s *service) current(r *run, g group, lines []Line) (map[string]exported, e
 	for _, line := range lines {
 		keys = append(keys, line.Key)
 	}
-	r.c.Organization = ""
 	rows, err := g.export(r.c, Query{Keys: keys})
 	if err != nil {
 		return nil, err
@@ -243,13 +236,6 @@ func (s *service) importLine(r *run, g group, line Line, existing exported, blob
 	}
 	id, err := r.id(g.name, line.Key)
 	if err != nil {
-		return r.refuse(result, err)
-	}
-	owner := g.named(line.Data)
-	if id != "" {
-		owner = g.named(existing.data)
-	}
-	if err := r.c.gate(owner); err != nil {
 		return r.refuse(result, err)
 	}
 	if id != "" && r.mode == ModeSkip {
@@ -576,7 +562,6 @@ func (s *service) prune(r *run, in ImportRequest, file File, incoming map[string
 	}
 	for _, target := range targets {
 		g := s.byName[target.Group]
-		r.c.Organization = ""
 		rows, err := g.export(r.c, Query{Filter: target.Filter, Keys: target.Keys})
 		if err != nil {
 			return err
@@ -590,49 +575,14 @@ func (s *service) prune(r *run, in ImportRequest, file File, incoming map[string
 				continue
 			}
 			listed[row.key] = true
-			removals[g.name] = append(removals[g.name], removal{key: row.key, id: row.id, owner: g.named(row.data)})
+			removals[g.name] = append(removals[g.name], removal{key: row.key, id: row.id})
 		}
 	}
 	return nil
 }
 
-func (s *service) owners(r *run, g group, items []removal) ([]removal, error) {
-	if g.owner == "" {
-		return items, nil
-	}
-	var keys []string
-	for _, item := range items {
-		if item.id == "" {
-			keys = append(keys, item.key)
-		}
-	}
-	if len(keys) == 0 {
-		return items, nil
-	}
-	r.c.Organization = ""
-	rows, err := g.export(r.c, Query{Keys: keys})
-	if err != nil {
-		return nil, err
-	}
-	named := make(map[string]string, len(rows))
-	for _, row := range rows {
-		named[row.key] = g.named(row.data)
-	}
-	out := make([]removal, 0, len(items))
-	for _, item := range items {
-		if item.id == "" {
-			item.owner = named[item.key]
-		}
-		out = append(out, item)
-	}
-	return out, nil
-}
-
 func (s *service) deleteRecord(r *run, g group, item removal) Result {
 	result := Result{Key: item.key, Group: g.name, ID: item.id}
-	if err := r.c.gate(item.owner); err != nil {
-		return r.refuse(result, err)
-	}
 	if result.ID == "" {
 		id, err := r.id(g.name, item.key)
 		if err != nil {

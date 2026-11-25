@@ -448,7 +448,6 @@ func (p *placeholders) object(name string) (object, error) {
 		return nil, err
 	}
 	held := p.names[name]
-	p.r.c.Organization = ""
 	rows, err := p.s.byName[held.group].export(p.r.c, Query{Keys: []string{held.key}})
 	if err != nil {
 		return nil, err
