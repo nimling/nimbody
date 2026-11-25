@@ -45,6 +45,9 @@ func contains(list []string, value string) bool {
 }
 
 func (s *service) export(c *Context, in ExportRequest) (File, error) {
+	if err := c.gate(""); err != nil {
+		return File{}, err
+	}
 	targets, err := s.targets(in.Targets)
 	if err != nil {
 		return File{}, err

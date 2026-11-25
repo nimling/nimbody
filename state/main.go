@@ -56,15 +56,17 @@ type Resolver interface {
 
 type Context struct {
 	echo.Context
-	Service     string
-	Version     string
-	Headers     []mcp.Header
-	Transaction func(ctx context.Context, run func(ctx context.Context) error) error
-	Keys        Resolver
-	PostAsset   func(ctx echo.Context, name string, body []byte) (string, error)
-	GetAsset    func(ctx echo.Context, assetID string) ([]byte, error)
-	Progress    func(ctx echo.Context, result Result)
-	Steps       *respond.Steps
+	Service      string
+	Version      string
+	Headers      []mcp.Header
+	Transaction  func(ctx context.Context, run func(ctx context.Context) error) error
+	Keys         Resolver
+	Owner        func(ctx echo.Context, owner string) (string, error)
+	PostAsset    func(ctx echo.Context, name string, body []byte) (string, error)
+	GetAsset     func(ctx echo.Context, assetID string) ([]byte, error)
+	Progress     func(ctx echo.Context, result Result)
+	Steps        *respond.Steps
+	Organization string
 }
 
 type Query struct {
@@ -94,6 +96,7 @@ type Group[T any] struct {
 	Filters       []string
 	Discriminator string
 	Updated       string
+	Owner         string
 	Document      string
 	Sensitive     func() map[string][]string
 	Export        func(ctx *Context, query Query) ([]Record[T], error)
@@ -189,6 +192,7 @@ type group struct {
 	sensitive func() map[string][]string
 	blobs     bool
 	updated   string
+	owner     string
 	document  string
 	export    func(ctx *Context, query Query) ([]exported, error)
 	write     func(ctx *Context, id, origin, key string, data map[string]any) (string, func(ctx *Context, blob Blob) error, error)
@@ -204,6 +208,11 @@ func (g Group[T]) definition() group {
 	if g.Updated != "" {
 		if _, err := ParsePointer(g.Updated); err != nil {
 			panic("state: group " + g.Name + " names updated " + g.Updated + ", which is not a field pointer")
+		}
+	}
+	if g.Owner != "" {
+		if _, err := ParsePointer(g.Owner); err != nil {
+			panic("state: group " + g.Name + " names owner " + g.Owner + ", which is not a field pointer")
 		}
 	}
 	if g.Document != "" && strings.Contains(g.Document, "/") {
@@ -222,6 +231,7 @@ func (g Group[T]) definition() group {
 		sensitive: g.Sensitive,
 		blobs:     g.Blobs.Get != nil,
 		updated:   g.Updated,
+		owner:     g.Owner,
 		document:  g.Document,
 		delete:    g.Delete,
 	}
@@ -362,6 +372,9 @@ func GetDocument(service, version string, definitions ...Definition) Document {
 }
 
 func Register(host Context, middleware []echo.MiddlewareFunc, definitions ...Definition) []mcp.Operation {
+	if host.Owner == nil {
+		panic("state: the host supplies no owner hook, so nothing gates /api" + Path)
+	}
 	s := newService(host, definitions)
 	chain := append([]echo.MiddlewareFunc{}, middleware...)
 	export := append([]echo.MiddlewareFunc{respond.FrameLimitMiddleware(0)}, middleware...)
@@ -439,6 +452,25 @@ func (s *service) context(ctx echo.Context) *Context {
 	c.Context = ctx
 	c.Steps = respond.GetSteps(ctx)
 	return &c
+}
+
+func (c *Context) gate(owner string) error {
+	c.Organization = ""
+	organization, err := c.Owner(c.Context, owner)
+	if err != nil {
+		return err
+	}
+	c.Organization = organization
+	return nil
+}
+
+func (g group) named(data map[string]any) string {
+	if g.owner == "" {
+		return ""
+	}
+	value, _ := lookup(data, g.owner)
+	owner, _ := value.(string)
+	return owner
 }
 
 func (s *service) document() Document {
