@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -1619,8 +1620,9 @@ func TestStateRefusesACallerWhoDoesNotOwn(t *testing.T) {
 	e := ownedService(m, &calls)
 
 	rec := callAs(e, "org-b", "/api/state/export", echo.MIMEApplicationJSON, []byte(`{}`))
-	assert.Equal(t, http.StatusForbidden, rec.Code, rec.Body.String())
-	assert.Equal(t, []string{"gate "}, calls)
+	assert.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+	assert.NotContains(t, rec.Body.String(), "skill-1")
+	assert.Equal(t, []string{"export ", "gate org-a"}, calls)
 
 	calls = nil
 	out := importAs(t, e, "org-b", "delete=skill:skill-1",
@@ -1671,9 +1673,10 @@ func TestStateGatesBeforeTheCallback(t *testing.T) {
 	assert.True(t, gated >= 0 && gated < written, "%v", calls)
 
 	calls = nil
-	rec := callAs(e, "org-app", "/api/state/export", echo.MIMEApplicationJSON, []byte(`{}`))
+	rec := callAs(e, "org-b", "/api/state/export", echo.MIMEApplicationJSON, []byte(`{}`))
 	assert.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
-	assert.Equal(t, []string{"gate ", "export org-app"}, calls)
+	assert.Contains(t, rec.Body.String(), "Postgres")
+	assert.Equal(t, []string{"export ", "gate org-b"}, calls)
 
 	m.rows["skill"][0].data["owner_id"] = "org-a"
 	calls = nil
@@ -1682,6 +1685,98 @@ func TestStateGatesBeforeTheCallback(t *testing.T) {
 	gated, removed := indexOf(calls, "gate org-a"), indexOf(calls, "delete org-a")
 	assert.True(t, gated >= 0 && gated < removed, "%v", calls)
 	assert.Equal(t, 0, m.count("skill"))
+}
+
+func exportedKeys(t *testing.T, rec *httptest.ResponseRecorder) []string {
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+	file, err := state.Read(bytes.NewReader(rec.Body.Bytes()))
+	require.NoError(t, err)
+	keys := []string{}
+	for _, line := range file.Records {
+		keys = append(keys, line.Key)
+	}
+	return keys
+}
+
+func countOf(list []string, value string) int {
+	count := 0
+	for _, item := range list {
+		if item == value {
+			count++
+		}
+	}
+	return count
+}
+
+func TestStateExportGatesEveryRowOnItsOwner(t *testing.T) {
+	m := newMemory("a")
+	m.add("skill", "skill-1", map[string]any{"name": "Go", "owner_id": "org-a"})
+	m.add("skill", "skill-2", map[string]any{"name": "SQL", "owner_id": "org-b"})
+	m.add("skill", "skill-3", map[string]any{"name": "CSS", "owner_id": "org-a"})
+	m.add("skill", "skill-4", map[string]any{"name": "Rust", "owner_id": "org-b"})
+	m.add("skill", "skill-5", map[string]any{"name": "Zig"})
+	var calls []string
+	e := ownedService(m, &calls)
+
+	keys := exportedKeys(t, callAs(e, "org-a", "/api/state/export", echo.MIMEApplicationJSON, []byte(`{}`)))
+	assert.Equal(t, []string{"skill-1", "skill-3"}, keys)
+	assert.Equal(t, []string{"export ", "gate org-a", "gate org-b", "gate "}, calls)
+
+	calls = nil
+	keys = exportedKeys(t, callAs(e, "org-a,org-b,org-app", "/api/state/export", echo.MIMEApplicationJSON, []byte(`{"targets":[{"group":"skill"},{"group":"skill","keys":["skill-2"]}]}`)))
+	assert.Equal(t, []string{"skill-1", "skill-2", "skill-3", "skill-4", "skill-5"}, keys)
+	assert.Equal(t, 1, countOf(calls, "gate org-a"), "%v", calls)
+	assert.Equal(t, 1, countOf(calls, "gate org-b"), "%v", calls)
+	assert.Equal(t, 1, countOf(calls, "gate "), "%v", calls)
+
+	keys = exportedKeys(t, callAs(e, "org-c", "/api/state/export", echo.MIMEApplicationJSON, []byte(`{}`)))
+	assert.Empty(t, keys)
+}
+
+func TestStateExportGatesAGroupWithoutAnOwnerOnTheApplicationOwner(t *testing.T) {
+	m := newMemory("a")
+	m.add("location", "loc-1", map[string]any{"name": "Head office", "owner_id": "org-a"})
+	m.add("location", "loc-2", map[string]any{"name": "Annex"})
+	var calls []string
+	location := memoryGroup[ownedBody](m, "location")
+	exported := location.Export
+	location.Export = func(ctx *state.Context, query state.Query) ([]state.Record[ownedBody], error) {
+		calls = append(calls, "export "+ctx.Organization)
+		return exported(ctx, query)
+	}
+	location.Blobs.Get = func(ctx *state.Context, record state.Record[ownedBody]) ([]state.Blob, error) {
+		calls = append(calls, "blobs "+ctx.Organization)
+		return nil, nil
+	}
+	host := state.Context{Service: "demo", Version: "v1.2.3", Keys: m, Owner: func(ctx echo.Context, owner string) (string, error) {
+		calls = append(calls, "gate "+owner)
+		return owns(ctx, owner)
+	}}
+	e := echo.New()
+	mcp.Route(e.Group("/api"), state.Register(host, nil, location)...)
+
+	keys := exportedKeys(t, callAs(e, "", "/api/state/export", echo.MIMEApplicationJSON, []byte(`{"blobs":true}`)))
+	assert.Equal(t, []string{"loc-1", "loc-2"}, keys)
+	assert.Equal(t, []string{"export ", "gate ", "blobs org-app", "blobs org-app"}, calls)
+}
+
+func TestStateExportStopsOnAHookErrorThatIsNoRefusal(t *testing.T) {
+	m := newMemory("a")
+	m.add("location", "loc-1", map[string]any{"name": "Head office"})
+	for _, failed := range []error{errors.New("the database is gone"), echo.NewHTTPError(http.StatusServiceUnavailable, "the prophet is away")} {
+		calls := 0
+		host := state.Context{Service: "demo", Version: "v1.2.3", Keys: m, Owner: func(ctx echo.Context, owner string) (string, error) {
+			calls++
+			return "", failed
+		}}
+		e := echo.New()
+		mcp.Route(e.Group("/api"), state.Register(host, nil, memoryGroup[locationBody](m, "location"))...)
+
+		rec := callAs(e, "", "/api/state/export", echo.MIMEApplicationJSON, []byte(`{}`))
+		assert.GreaterOrEqual(t, rec.Code, http.StatusInternalServerError, rec.Body.String())
+		assert.NotContains(t, rec.Body.String(), "loc-1")
+		assert.Equal(t, 1, calls)
+	}
 }
 
 const placeholderFile = stateHeader +
