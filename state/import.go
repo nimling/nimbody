@@ -538,9 +538,18 @@ func putBlobs(c *Context, put func(ctx *Context, blob Blob) error, blobs []Blob)
 func (s *service) prune(r *run, in ImportRequest, file File, incoming map[string][]Line, removals map[string][]removal) error {
 	scope := in.Targets
 	if r.mode == ModeReplace {
-		scope = make([]Target, 0, len(s.groups))
+		held := map[string]bool{}
+		for _, line := range file.Records {
+			held[line.Group] = true
+		}
+		scope = make([]Target, 0, len(held))
 		for _, g := range s.groups {
-			scope = append(scope, Target{Group: g.name})
+			if held[g.name] {
+				scope = append(scope, Target{Group: g.name})
+			}
+		}
+		if len(scope) == 0 {
+			return nil
 		}
 	}
 	if len(scope) == 0 {

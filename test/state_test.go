@@ -54,6 +54,8 @@ type memory struct {
 	next   int
 	writes int
 	rows   map[string][]*stored
+	names  map[string]any
+	named  int
 	assets map[string][]byte
 }
 
@@ -260,6 +262,12 @@ func stateService(m *memory, extra ...state.Definition) (*echo.Echo, []mcp.Opera
 		Version: "v1.2.3",
 		Keys:    m,
 		Owner:   owns,
+		Names: func(ctx echo.Context) (map[string]any, error) {
+			m.mu.Lock()
+			defer m.mu.Unlock()
+			m.named++
+			return m.names, nil
+		},
 		Transaction: func(ctx context.Context, run func(ctx context.Context) error) error {
 			return run(ctx)
 		},
@@ -1782,4 +1790,82 @@ func TestStateReadsBracesAsTextWhenNothingIsDefined(t *testing.T) {
 	out := importState(t, e, "", []byte(stateHeader+`{"group":"location","key":"mail","data":{"name":"Hello {{first_name}}"}}`+"\n"))
 	require.Equal(t, map[string]int{state.OutcomeCreated: 1}, out.Counts, "%+v", out.Results)
 	assert.Equal(t, "Hello {{first_name}}", m.rows["location"][0].data["name"])
+}
+
+func TestStateReplaceLeavesAGroupTheInputLacks(t *testing.T) {
+	m := seeded()
+	e, _ := stateService(m)
+	file := []byte(stateHeader + `{"group":"room","key":"room-9","data":{"name":"New","seats":3,"kind":"desk"},"refs":{"location_id":"loc-1"}}` + "\n")
+
+	planned := importState(t, e, "mode=replace&dry_run=true", file)
+	assert.Equal(t, map[string]string{"room:room-1": state.OutcomeDeleted, "room:room-2": state.OutcomeDeleted, "room:room-9": state.OutcomeCreated}, outcomes(planned))
+	assert.Equal(t, 2, m.count("room"), "a dry run writes nothing")
+
+	replaced := importState(t, e, "mode=replace", file)
+	assert.Equal(t, map[string]string{"room:room-1": state.OutcomeDeleted, "room:room-2": state.OutcomeDeleted, "room:room-9": state.OutcomeCreated}, outcomes(replaced), "a replace prunes within the group the input holds and names no other")
+	assert.Equal(t, 1, m.count("room"))
+	assert.Equal(t, 2, m.count("location"), "a group with no line in the input is not touched")
+
+	empty := importState(t, e, "mode=replace", []byte(stateHeader))
+	assert.Empty(t, empty.Results, "a replace of no record deletes nothing")
+	assert.Equal(t, 1, m.count("room"))
+	assert.Equal(t, 2, m.count("location"))
+}
+
+func TestStatePlaceholdersResolveANameTheHostSupplies(t *testing.T) {
+	m := newMemory("p")
+	m.names = map[string]any{"team_base": map[string]any{"id": "org-1", "name": "Consult"}, "tenant": "acme"}
+	e, _ := stateService(m)
+	file := []byte(stateHeader +
+		`{"group":"location","key":"base","data":{"name":"Base of {{team_base.name}}","region":"{{tenant}}"}}` + "\n" +
+		`{"group":"location","key":"mail","data":{"name":"Hello {{first_name}} of {{tenant}}","region":"{{team_base.id}}"}}` + "\n" +
+		`{"group":"location","key":"text","data":{"name":"Dear {{first_name}}","region":"{{ range .rows }}"}}` + "\n")
+
+	out := importState(t, e, "", file)
+	require.Equal(t, map[string]int{state.OutcomeCreated: 3}, out.Counts, "%+v", out.Results)
+	ids := map[string]string{}
+	for _, result := range out.Results {
+		ids[result.Key] = result.ID
+	}
+	assert.Equal(t, "acme", rowOf(m, "location", ids["base"]).data["region"], "{{name}} is the value the host supplies")
+	assert.Equal(t, "Base of Consult", rowOf(m, "location", ids["base"]).data["name"], "{{name.field}} is a field of the value")
+	assert.Equal(t, "org-1", rowOf(m, "location", ids["mail"]).data["region"])
+	assert.Equal(t, "Hello {{first_name}} of acme", rowOf(m, "location", ids["mail"]).data["name"], "a name nobody supplies is kept as text beside one the host supplies")
+	assert.Equal(t, "Dear {{first_name}}", rowOf(m, "location", ids["text"]).data["name"])
+	assert.Equal(t, "{{ range .rows }}", rowOf(m, "location", ids["text"]).data["region"])
+	assert.Equal(t, 1, m.named, "the host is asked once per import")
+
+	again := importState(t, e, "", file)
+	assert.Equal(t, map[string]int{state.OutcomeUnchanged: 3}, again.Counts, "%+v", again.Results)
+
+	m.named = 0
+	plain := importState(t, e, "", []byte(stateHeader+`{"group":"location","key":"plain","data":{"name":"Plain"}}`+"\n"))
+	assert.Equal(t, map[string]int{state.OutcomeCreated: 1}, plain.Counts)
+	assert.Equal(t, 0, m.named, "a file with no placeholder never asks the host")
+
+	defining := importState(t, e, "", []byte(stateHeader+
+		`{"group":"room","key":"desk","data":{"name":"Desk of {{tenant}}","location_id":"{{hq}}","seats":1,"kind":"{{team_base.id}}"}}`+"\n"+
+		`{"group":"location","id":"{{hq}}","data":{"name":"HQ","region":"{{tenant}}"}}`+"\n"))
+	require.Equal(t, map[string]int{state.OutcomeCreated: 2}, defining.Counts, "%+v", defining.Results)
+	for _, result := range defining.Results {
+		ids[result.Key] = result.ID
+	}
+	assert.Equal(t, "acme", rowOf(m, "location", ids["hq"]).data["region"])
+	assert.Equal(t, "Desk of acme", rowOf(m, "room", ids["desk"]).data["name"])
+	assert.Equal(t, "org-1", rowOf(m, "room", ids["desk"]).data["kind"])
+	assert.Equal(t, ids["hq"], rowOf(m, "room", ids["desk"]).data["location_id"])
+}
+
+func TestStatePlaceholdersRefuseANameTheHostAndTheFileDefine(t *testing.T) {
+	for _, query := range []string{"", "dry_run=true", "mode=replace"} {
+		m := seeded()
+		m.names = map[string]any{"hq": "org-1"}
+		e, _ := stateService(m)
+		rec := call(e, http.MethodPost, "/api/state/import?"+query, state.MIMENDJSON, "", []byte(placeholderFile))
+		assert.Equal(t, http.StatusBadRequest, rec.Code, rec.Body.String())
+		assert.Contains(t, rec.Body.String(), "{{hq}}")
+		assert.Equal(t, 0, m.writes, query)
+		assert.Equal(t, 2, m.count("location"), query)
+		assert.Equal(t, 2, m.count("room"), query)
+	}
 }

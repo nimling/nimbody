@@ -265,7 +265,7 @@ func stateImport(send Send, output *Output) *cobra.Command {
 	}
 	flags := cmd.Flags()
 	flags.BoolVar(&dryRun, "dry-run", false, "list every outcome and write nothing")
-	flags.StringVar(&mode, "mode", "", "upsert (default), create, sync, which also deletes what the targets reach and the file lacks, skip, which leaves every record that exists as it is, replace, which deletes every record of every group the file lacks, merge, which writes only the fields the file carries over the existing record, or latest, which keeps whichever of the file and the existing record changed last")
+	flags.StringVar(&mode, "mode", "", "upsert (default), create, sync, which also deletes what the targets reach and the file lacks, skip, which leaves every record that exists as it is, replace, which deletes every record the file lacks in the groups it holds a record of, merge, which writes only the fields the file carries over the existing record, or latest, which keeps whichever of the file and the existing record changed last")
 	flags.StringArrayVar(&deletes, "delete", nil, "delete a record as group:key, repeatable")
 	flags.StringArrayVar(&targets, "target", nil, "import only this group, group:field=value to narrow what a sync deletes, repeatable; a markdown file takes its group as one --target group")
 	flags.StringVar(&asset, "asset", "", "import a stored export by its asset id instead of a file")

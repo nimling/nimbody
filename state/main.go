@@ -62,6 +62,7 @@ type Context struct {
 	Transaction  func(ctx context.Context, run func(ctx context.Context) error) error
 	Keys         Resolver
 	Owner        func(ctx echo.Context, owner string) (string, error)
+	Names        func(ctx echo.Context) (map[string]any, error)
 	PostAsset    func(ctx echo.Context, name string, body []byte) (string, error)
 	GetAsset     func(ctx echo.Context, assetID string) ([]byte, error)
 	Progress     func(ctx echo.Context, result Result)
@@ -153,7 +154,7 @@ type Stored struct {
 
 type ImportRequest struct {
 	AssetID string              `json:"asset_id,omitempty" jsonschema:"the stored export to import"`
-	Mode    string              `json:"mode,omitempty" jsonschema:"upsert (default), create, sync, skip, replace, merge or latest; sync deletes what the targets reach and the input lacks, skip leaves every record that exists as it is, replace deletes every record of every group the input lacks, merge writes only the fields the input carries over the existing record, latest keeps whichever of the input and the existing record changed last"`
+	Mode    string              `json:"mode,omitempty" jsonschema:"upsert (default), create, sync, skip, replace, merge or latest; sync deletes what the targets reach and the input lacks, skip leaves every record that exists as it is, replace deletes every record the input lacks in the groups it holds a record of, merge writes only the fields the input carries over the existing record, latest keeps whichever of the input and the existing record changed last"`
 	DryRun  bool                `json:"dry_run,omitempty" jsonschema:"list every outcome and write nothing"`
 	Delete  map[string][]string `json:"delete,omitempty" jsonschema:"keys to delete, per group"`
 	Targets []Target            `json:"targets,omitempty" jsonschema:"the groups to import, and the scope a sync prunes"`

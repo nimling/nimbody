@@ -2,6 +2,7 @@ package state
 
 import (
 	"bytes"
+	"encoding/json"
 	"net/http"
 	"strconv"
 	"strings"
@@ -11,7 +12,10 @@ import (
 	"github.com/labstack/echo/v4"
 )
 
-const placeholderOpen = "{{"
+const (
+	placeholderOpen  = "{{"
+	placeholderClose = "}}"
+)
 
 type object map[string]any
 
@@ -40,6 +44,8 @@ type placeholders struct {
 	s       *service
 	r       *run
 	names   map[string]definition
+	host    map[string]any
+	lenient bool
 	parsed  map[string]*placeholder
 	set     *template.Template
 	objects map[string]object
@@ -98,7 +104,16 @@ func (p *placeholders) parse(text string) (*placeholder, error) {
 	if held, ok := p.parsed[text]; ok {
 		return held, nil
 	}
-	tree, uses, single, err := parsePlaceholder(text)
+	source := text
+	if p.lenient {
+		literal, active := p.literal(text)
+		if !active {
+			p.parsed[text] = &placeholder{}
+			return p.parsed[text], nil
+		}
+		source = literal
+	}
+	tree, uses, single, err := parsePlaceholder(source)
 	if err != nil {
 		return nil, err
 	}
@@ -113,6 +128,104 @@ func (p *placeholders) parse(text string) (*placeholder, error) {
 	return held, nil
 }
 
+func (p *placeholders) literal(text string) (string, bool) {
+	var out strings.Builder
+	active := false
+	rest := text
+	for {
+		start := strings.Index(rest, placeholderOpen)
+		if start < 0 {
+			out.WriteString(rest)
+			return out.String(), active
+		}
+		out.WriteString(rest[:start])
+		rest = rest[start:]
+		end := strings.Index(rest, placeholderClose)
+		if end < 0 {
+			out.WriteString(placeholderOpen + strconv.Quote(rest) + placeholderClose)
+			return out.String(), active
+		}
+		segment := rest[:end+len(placeholderClose)]
+		rest = rest[len(segment):]
+		_, uses, single, err := parsePlaceholder(segment)
+		if err == nil && single && p.hosted(uses[0].name) {
+			out.WriteString(segment)
+			active = true
+			continue
+		}
+		out.WriteString(placeholderOpen + strconv.Quote(segment) + placeholderClose)
+	}
+}
+
+func (p *placeholders) hosted(name string) bool {
+	_, ok := p.host[name]
+	return ok
+}
+
+func (p *placeholders) supplied(lines map[string][]Line) error {
+	if p.r.c.Names == nil {
+		return nil
+	}
+	if len(p.names) == 0 {
+		used := false
+		for _, held := range lines {
+			for _, line := range held {
+				used = used || braced(line.Data) || braced(line.Refs)
+			}
+		}
+		if !used {
+			return nil
+		}
+	}
+	supplied, err := p.r.c.Names(p.r.c.Context)
+	if err != nil {
+		return err
+	}
+	body, err := json.Marshal(supplied)
+	if err != nil {
+		return err
+	}
+	if err := json.Unmarshal(body, &p.host); err != nil {
+		return err
+	}
+	for name := range p.host {
+		if held, ok := defined(placeholderOpen + name + placeholderClose); !ok || held != name {
+			return echo.NewHTTPError(http.StatusInternalServerError, "the service supplies the name "+name+", which {{name}} cannot write")
+		}
+	}
+	clashes := map[string]bool{}
+	for name := range p.names {
+		if p.hosted(name) {
+			clashes[name] = true
+		}
+	}
+	for _, name := range sorted(clashes) {
+		taken := p.names[name]
+		return echo.NewHTTPError(http.StatusBadRequest, "{{"+name+"}} is defined by "+taken.group+" "+taken.key+" and is a name the service supplies")
+	}
+	return nil
+}
+
+func braced(value any) bool {
+	switch held := value.(type) {
+	case string:
+		return strings.Contains(held, placeholderOpen)
+	case map[string]any:
+		for _, item := range held {
+			if braced(item) {
+				return true
+			}
+		}
+	case []any:
+		for _, item := range held {
+			if braced(item) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func (p *placeholders) key(text string) (string, bool, error) {
 	if !strings.Contains(text, placeholderOpen) {
 		return "", false, nil
@@ -122,6 +235,9 @@ func (p *placeholders) key(text string) (string, bool, error) {
 		return "", false, err
 	}
 	if !held.single || len(held.uses[0].fields) > 1 || (len(held.uses[0].fields) == 1 && held.uses[0].fields[0] != "id") {
+		return "", false, nil
+	}
+	if p.hosted(held.uses[0].name) {
 		return "", false, nil
 	}
 	if _, ok := p.names[held.uses[0].name]; !ok {
@@ -141,7 +257,9 @@ func (p *placeholders) needs(value any, into map[string]bool) error {
 			return err
 		}
 		for _, used := range parsed.uses {
-			into[used.name] = true
+			if !p.hosted(used.name) {
+				into[used.name] = true
+			}
 		}
 	case map[string]any:
 		for _, item := range held {
@@ -180,8 +298,12 @@ func (s *service) placeholders(r *run, incoming map[string][]Line) ([]Line, erro
 			incoming[g.name][index].ID = ""
 		}
 	}
+	if err := p.supplied(incoming); err != nil {
+		return nil, err
+	}
+	p.lenient = len(p.names) == 0
 	var base []Line
-	if len(p.names) == 0 {
+	if len(p.names) == 0 && len(p.host) == 0 {
 		for _, g := range s.groups {
 			base = append(base, orderLines(g, incoming[g.name])...)
 		}
@@ -190,6 +312,9 @@ func (s *service) placeholders(r *run, incoming map[string][]Line) ([]Line, erro
 	funcs := template.FuncMap{}
 	for name := range p.names {
 		funcs[name] = func() (object, error) { return p.object(name) }
+	}
+	for name, value := range p.host {
+		funcs[name] = func() any { return value }
 	}
 	p.set = template.New("state").Option("missingkey=error").Funcs(funcs)
 	for _, g := range s.groups {
@@ -367,7 +492,13 @@ func (p *placeholders) value(value any) (any, error) {
 		if err != nil {
 			return nil, err
 		}
+		if !parsed.single && parsed.text == nil {
+			return held, nil
+		}
 		for _, used := range parsed.uses {
+			if p.hosted(used.name) {
+				continue
+			}
 			id, err := p.id(used.name)
 			if err != nil {
 				return nil, err
@@ -384,14 +515,19 @@ func (p *placeholders) value(value any) (any, error) {
 			return text.String(), nil
 		}
 		used := parsed.uses[0]
-		if len(used.fields) == 0 {
+		var at any
+		switch {
+		case p.hosted(used.name):
+			at = p.host[used.name]
+		case len(used.fields) == 0:
 			return p.id(used.name)
+		default:
+			found, err := p.object(used.name)
+			if err != nil {
+				return nil, err
+			}
+			at = map[string]any(found)
 		}
-		found, err := p.object(used.name)
-		if err != nil {
-			return nil, err
-		}
-		var at any = map[string]any(found)
 		for _, field := range used.fields {
 			node, ok := at.(map[string]any)
 			if !ok {
