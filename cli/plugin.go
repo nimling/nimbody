@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"bufio"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -11,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 
 	"github.com/spf13/cobra"
@@ -23,7 +25,17 @@ type Plugin struct {
 	Skill       string
 	Tree        fs.FS
 	Version     func() string
+	Hosts       []Host
 }
+
+type Host string
+
+const (
+	Claude   Host = "claude"
+	Codex    Host = "codex"
+	Gemini   Host = "gemini"
+	OpenCode Host = "opencode"
+)
 
 type pluginManifest struct {
 	Name        string                     `json:"name"`
@@ -94,10 +106,14 @@ func (p Plugin) Write(dir, executable string) (string, error) {
 			return "", err
 		}
 	}
+	return manifest.Version, p.skills(dir)
+}
+
+func (p Plugin) skills(dir string) error {
 	if p.Tree == nil {
-		return manifest.Version, writeIn(dir, filepath.Join("skills", p.Name, "SKILL.md"), []byte(p.Skill))
+		return writeIn(dir, filepath.Join("skills", p.Name, "SKILL.md"), []byte(p.Skill))
 	}
-	return manifest.Version, fs.WalkDir(p.Tree, ".", func(name string, item fs.DirEntry, err error) error {
+	return fs.WalkDir(p.Tree, ".", func(name string, item fs.DirEntry, err error) error {
 		if err != nil || item.IsDir() {
 			return err
 		}
@@ -130,6 +146,7 @@ func Executable() (string, error) {
 
 func PluginCommand(p Plugin) *cobra.Command {
 	var project bool
+	picked := map[Host]*bool{}
 	plugin := &cobra.Command{
 		Use:   "plugin",
 		Short: "The claude plugin that carries the skill and the " + p.Name + " mcp server",
@@ -139,10 +156,29 @@ func PluginCommand(p Plugin) *cobra.Command {
 		Short: "Write the plugin under ~/." + p.Name + "/plugin and install it into Claude Code for the user, or the project with --project",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return p.install(cmd, project)
+			if len(p.Hosts) == 0 {
+				return p.install(cmd, project)
+			}
+			hosts, err := p.pick(cmd, picked)
+			if err != nil {
+				return err
+			}
+			for _, host := range hosts {
+				if err := p.installOn(cmd, host, project); err != nil {
+					return err
+				}
+			}
+			return nil
 		},
 	}
 	install.Flags().BoolVar(&project, "project", false, "install into the project settings of the current directory instead of the user settings")
+	for _, host := range p.Hosts {
+		picked[host] = install.Flags().Bool(string(host), false, "install for "+string(host))
+	}
+	if len(p.Hosts) > 0 {
+		plugin.Short = "The plugin that carries the skill and the " + p.Name + " mcp server to each host"
+		install.Short = "Install the skill and the " + p.Name + " mcp server for the hosts picked by flag, or for the one found on the path"
+	}
 	desktop := &cobra.Command{
 		Use:   "desktop",
 		Short: "Add the " + p.Name + " mcp server to the Claude Desktop config, keeping every other entry",
@@ -164,6 +200,26 @@ func PluginCommand(p Plugin) *cobra.Command {
 			want, have, err := p.Drift()
 			if err != nil {
 				return err
+			}
+			if len(p.Hosts) > 0 {
+				installed := p.installed()
+				if have != "" {
+					installed[Claude] = have
+				}
+				if len(installed) == 0 {
+					return Refused("the plugin is installed for no host, this binary carries "+want, "Run '"+p.Name+" plugin install'.")
+				}
+				for _, host := range p.Hosts {
+					version, found := installed[host]
+					if !found {
+						continue
+					}
+					if version != want {
+						return Refused("the plugin installed for "+string(host)+" is "+version+", this binary carries "+want, "Run '"+p.Name+" plugin install --"+string(host)+"'.")
+					}
+					fmt.Fprintln(cmd.OutOrStdout(), "installed "+version+" for "+string(host))
+				}
+				return nil
 			}
 			if want != have {
 				return Refused("the installed plugin is "+orNone(have)+", this binary carries "+want, "Run '"+p.Name+" plugin install'.")
@@ -235,7 +291,7 @@ func (p Plugin) install(cmd *cobra.Command, project bool) error {
 			step = []string{"plugin", "marketplace", "update", p.Name}
 		}
 	}
-	if err := p.claude(cmd, step...); err != nil {
+	if err := p.run(cmd, "claude", step...); err != nil {
 		return err
 	}
 	var plugins []struct {
@@ -251,21 +307,200 @@ func (p Plugin) install(cmd *cobra.Command, project bool) error {
 			step = []string{"plugin", "update", p.id(), "--scope", scope}
 		}
 	}
-	if err := p.claude(cmd, step...); err != nil {
+	if err := p.run(cmd, "claude", step...); err != nil {
 		return err
 	}
 	fmt.Fprintln(stderr, "installed "+p.id()+" "+version+", restart claude to load it")
 	return nil
 }
 
-func (p Plugin) claude(cmd *cobra.Command, args ...string) error {
-	run := exec.CommandContext(cmd.Context(), "claude", args...)
+func (p Plugin) run(cmd *cobra.Command, name string, args ...string) error {
+	run := exec.CommandContext(cmd.Context(), name, args...)
 	run.Stdout = cmd.ErrOrStderr()
 	run.Stderr = cmd.ErrOrStderr()
 	if err := run.Run(); err != nil {
-		return errors.New("claude " + strings.Join(args, " ") + " failed: " + err.Error())
+		return errors.New(name + " " + strings.Join(args, " ") + " failed: " + err.Error())
 	}
 	return nil
+}
+
+func (p Plugin) pick(cmd *cobra.Command, picked map[Host]*bool) ([]Host, error) {
+	var asked, found []Host
+	var flags []string
+	for _, host := range p.Hosts {
+		flags = append(flags, "--"+string(host))
+		if *picked[host] {
+			asked = append(asked, host)
+		}
+		if _, err := exec.LookPath(string(host)); err == nil {
+			found = append(found, host)
+		}
+	}
+	if len(asked) > 0 {
+		return asked, nil
+	}
+	hint := "Pass " + strings.Join(flags, ", ") + " to pick."
+	if len(found) == 0 {
+		return nil, Refused("none of the hosts this plugin installs for is on the path", hint)
+	}
+	if len(found) == 1 {
+		return found, nil
+	}
+	var names []string
+	for _, host := range found {
+		names = append(names, string(host))
+	}
+	stderr := cmd.ErrOrStderr()
+	if in, ok := cmd.InOrStdin().(*os.File); !ok || !Terminal(in) || !Terminal(stderr) {
+		return nil, Rejected(strings.Join(names, ", ")+" are installed", hint)
+	}
+	for at, name := range names {
+		fmt.Fprintf(stderr, "%d  %s\n", at+1, name)
+	}
+	fmt.Fprint(stderr, "install for which, numbers separated by spaces, or all: ")
+	line, _ := bufio.NewReader(cmd.InOrStdin()).ReadString('\n')
+	var hosts []Host
+	for _, word := range strings.Fields(strings.ReplaceAll(line, ",", " ")) {
+		if word == "all" {
+			return found, nil
+		}
+		at, err := strconv.Atoi(word)
+		if err != nil || at < 1 || at > len(found) {
+			return nil, Rejected("no host is "+word, hint)
+		}
+		hosts = append(hosts, found[at-1])
+	}
+	if len(hosts) == 0 {
+		return nil, Rejected("no host was picked", hint)
+	}
+	return hosts, nil
+}
+
+func (p Plugin) installOn(cmd *cobra.Command, host Host, project bool) error {
+	if host == Claude {
+		return p.install(cmd, project)
+	}
+	if project {
+		return Rejected("--project installs for claude only", "Run '"+p.Name+" plugin install --"+string(host)+"' without it.")
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return err
+	}
+	executable, err := Executable()
+	if err != nil {
+		return err
+	}
+	version := p.Manifest(executable).Version
+	server := pluginMCPServer{Command: executable, Args: []string{"mcp"}}
+	missing := Refused("the "+string(host)+" cli is not on the path", "Install it, then run '"+p.Name+" plugin install --"+string(host)+"' again.")
+	stderr := cmd.ErrOrStderr()
+	switch host {
+	case Codex:
+		if _, err := exec.LookPath("codex"); err != nil {
+			return missing
+		}
+		dir := filepath.Join(home, ".agents")
+		if err := p.skills(dir); err != nil {
+			return err
+		}
+		fmt.Fprintln(stderr, "wrote the skills under "+filepath.Join(dir, "skills"))
+		_ = exec.CommandContext(cmd.Context(), "codex", "mcp", "remove", p.Name).Run()
+		if err := p.run(cmd, "codex", "mcp", "add", p.Name, "--", executable, "mcp"); err != nil {
+			return err
+		}
+	case Gemini:
+		if _, err := exec.LookPath("gemini"); err != nil {
+			return missing
+		}
+		dir := filepath.Join(home, "."+p.Name, "gemini")
+		body, err := json.MarshalIndent(map[string]any{
+			"name":        p.Name,
+			"version":     strings.TrimPrefix(version, "v"),
+			"description": p.Description,
+			"mcpServers":  map[string]pluginMCPServer{p.Name: server},
+		}, "", "  ")
+		if err != nil {
+			return err
+		}
+		if err := writeIn(dir, "gemini-extension.json", append(body, '\n')); err != nil {
+			return err
+		}
+		if err := p.skills(dir); err != nil {
+			return err
+		}
+		fmt.Fprintln(stderr, "wrote "+dir)
+		_ = exec.CommandContext(cmd.Context(), "gemini", "extensions", "uninstall", p.Name).Run()
+		if err := p.run(cmd, "gemini", "extensions", "install", dir, "--consent"); err != nil {
+			return err
+		}
+	case OpenCode:
+		dir := filepath.Join(home, ".config", "opencode")
+		if err := p.skills(dir); err != nil {
+			return err
+		}
+		fmt.Fprintln(stderr, "wrote the skills under "+filepath.Join(dir, "skills"))
+		path := filepath.Join(dir, "opencode.json")
+		if _, err := os.Stat(path); os.IsNotExist(err) {
+			if _, err := os.Stat(path + "c"); err == nil {
+				path += "c"
+			}
+		}
+		entry := map[string]any{"type": "local", "command": []string{executable, "mcp"}}
+		if err := putServer(path, []string{"mcp", "servers", p.Name}, entry); err != nil {
+			return err
+		}
+		fmt.Fprintln(stderr, "wrote mcp.servers."+p.Name+" in "+path)
+	default:
+		return Rejected("no host is "+string(host), "The hosts are claude, codex, gemini and opencode.")
+	}
+	installed := p.installed()
+	installed[host] = version
+	body, err := json.MarshalIndent(installed, "", "  ")
+	if err != nil {
+		return err
+	}
+	if err := writeIn(filepath.Join(home, "."+p.Name), "hosts.json", append(body, '\n')); err != nil {
+		return err
+	}
+	fmt.Fprintln(stderr, "installed "+p.Name+" "+version+" for "+string(host)+", restart "+string(host)+" to load it")
+	return nil
+}
+
+func (p Plugin) installed() map[Host]string {
+	installed := map[Host]string{}
+	if home, err := os.UserHomeDir(); err == nil {
+		if body, err := os.ReadFile(filepath.Join(home, "."+p.Name, "hosts.json")); err == nil {
+			_ = json.Unmarshal(body, &installed)
+		}
+	}
+	return installed
+}
+
+func putServer(path string, keys []string, entry any) error {
+	root := map[string]any{}
+	if data, err := os.ReadFile(path); err == nil && len(data) > 0 {
+		if err := json.Unmarshal(data, &root); err != nil {
+			return Refused(path+" is not plain json and is left as it is", "Add "+strings.Join(keys, ".")+" there by hand.")
+		}
+	} else if err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	at := root
+	for _, key := range keys[:len(keys)-1] {
+		next, ok := at[key].(map[string]any)
+		if !ok {
+			next = map[string]any{}
+			at[key] = next
+		}
+		at = next
+	}
+	at[keys[len(keys)-1]] = entry
+	body, err := json.MarshalIndent(root, "", "  ")
+	if err != nil {
+		return err
+	}
+	return writeIn(filepath.Dir(path), filepath.Base(path), append(body, '\n'))
 }
 
 func DesktopConfigPath() (string, error) {

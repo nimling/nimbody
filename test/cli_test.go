@@ -593,3 +593,99 @@ func TestCLINotifierChecksOncePerDayAndCanBeTurnedOff(t *testing.T) {
 	assert.False(t, cli.Newer("v1.2.3-tst", "v1.2.3"))
 	assert.False(t, cli.Newer("dev", "v1.0.0"))
 }
+
+func hostPlugin(t *testing.T, found ...string) (*cobra.Command, string, *bytes.Buffer) {
+	home := t.TempDir()
+	bin := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("PATH", bin)
+	for _, name := range found {
+		script := "#!/bin/sh\necho \"" + name + " $*\" >> \"" + filepath.Join(home, "ran") + "\"\n"
+		assert.NoError(t, os.WriteFile(filepath.Join(bin, name), []byte(script), 0o755))
+	}
+	plugin := demoPlugin()
+	plugin.Hosts = []cli.Host{cli.Claude, cli.Codex, cli.Gemini, cli.OpenCode}
+	root := &cobra.Command{Use: "demo", SilenceUsage: true, SilenceErrors: true}
+	root.AddCommand(cli.PluginCommand(plugin))
+	var stdout bytes.Buffer
+	root.SetOut(&stdout)
+	root.SetErr(&bytes.Buffer{})
+	root.SetIn(&bytes.Buffer{})
+	return root, home, &stdout
+}
+
+func TestCLIPluginInstallsForEveryPickedHost(t *testing.T) {
+	root, home, stdout := hostPlugin(t, "codex", "gemini")
+	config := filepath.Join(home, ".config", "opencode", "opencode.json")
+	assert.NoError(t, os.MkdirAll(filepath.Dir(config), 0o755))
+	assert.NoError(t, os.WriteFile(config, []byte(`{"theme":"dark","mcp":{"servers":{"other":{"type":"local","command":["other"]}}}}`), 0o644))
+
+	root.SetArgs([]string{"plugin", "install", "--codex", "--gemini", "--opencode"})
+	assert.NoError(t, root.Execute())
+
+	ran, _ := os.ReadFile(filepath.Join(home, "ran"))
+	assert.Contains(t, string(ran), "codex mcp add demo -- ")
+	assert.Contains(t, string(ran), "gemini extensions install "+filepath.Join(home, ".demo", "gemini")+" --consent")
+	for _, dir := range []string{".agents", filepath.Join(".demo", "gemini"), filepath.Join(".config", "opencode")} {
+		skill, err := os.ReadFile(filepath.Join(home, dir, "skills", "demo", "SKILL.md"))
+		assert.NoError(t, err, dir)
+		assert.Contains(t, string(skill), "name: demo", dir)
+	}
+	extension, _ := os.ReadFile(filepath.Join(home, ".demo", "gemini", "gemini-extension.json"))
+	assert.Contains(t, string(extension), `"version": "1.2.3-`)
+	assert.Contains(t, string(extension), `"mcpServers"`)
+	var written struct {
+		Theme string `json:"theme"`
+		MCP   struct {
+			Servers map[string]struct {
+				Type    string   `json:"type"`
+				Command []string `json:"command"`
+			} `json:"servers"`
+		} `json:"mcp"`
+	}
+	body, _ := os.ReadFile(config)
+	assert.NoError(t, json.Unmarshal(body, &written))
+	assert.Equal(t, "dark", written.Theme)
+	assert.Contains(t, written.MCP.Servers, "other")
+	assert.Equal(t, "local", written.MCP.Servers["demo"].Type)
+	assert.Equal(t, "mcp", written.MCP.Servers["demo"].Command[1])
+
+	root.SetArgs([]string{"plugin", "status"})
+	assert.NoError(t, root.Execute())
+	for _, host := range []string{"codex", "gemini", "opencode"} {
+		assert.Contains(t, stdout.String(), " for "+host)
+	}
+	assert.NotContains(t, stdout.String(), " for claude")
+}
+
+func TestCLIPluginInstallsForTheOneHostFoundAndAsksAmongSeveral(t *testing.T) {
+	root, home, _ := hostPlugin(t, "codex")
+	root.SetArgs([]string{"plugin", "install"})
+	assert.NoError(t, root.Execute())
+	ran, _ := os.ReadFile(filepath.Join(home, "ran"))
+	assert.Contains(t, string(ran), "codex mcp add demo -- ")
+
+	root, home, _ = hostPlugin(t, "codex", "gemini")
+	root.SetArgs([]string{"plugin", "install"})
+	err := root.Execute()
+	assert.Equal(t, cli.ExitRejected, cli.ExitCode(err))
+	assert.Contains(t, err.Error(), "codex, gemini")
+	_, missing := os.Stat(filepath.Join(home, "ran"))
+	assert.True(t, os.IsNotExist(missing), "nothing is installed until a host is picked")
+
+	root, _, _ = hostPlugin(t)
+	root.SetArgs([]string{"plugin", "install"})
+	assert.Equal(t, cli.ExitRefused, cli.ExitCode(root.Execute()))
+
+	root, _, _ = hostPlugin(t)
+	root.SetArgs([]string{"plugin", "install", "--codex", "--project"})
+	assert.Equal(t, cli.ExitRejected, cli.ExitCode(root.Execute()))
+}
+
+func TestCLIPluginWithoutHostsTakesNoHostFlag(t *testing.T) {
+	root := &cobra.Command{Use: "demo", SilenceUsage: true, SilenceErrors: true}
+	root.AddCommand(cli.PluginCommand(demoPlugin()))
+	root.SetErr(&bytes.Buffer{})
+	root.SetArgs([]string{"plugin", "install", "--codex"})
+	assert.ErrorContains(t, root.Execute(), "unknown flag")
+}
