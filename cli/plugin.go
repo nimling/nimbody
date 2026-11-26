@@ -31,10 +31,13 @@ type Plugin struct {
 type Host string
 
 const (
-	Claude   Host = "claude"
-	Codex    Host = "codex"
-	Gemini   Host = "gemini"
-	OpenCode Host = "opencode"
+	Claude      Host = "claude"
+	Codex       Host = "codex"
+	Gemini      Host = "gemini"
+	OpenCode    Host = "opencode"
+	Desktop     Host = "desktop"
+	ChatGPT     Host = "chatgpt"
+	Antigravity Host = "antigravity"
 )
 
 type pluginManifest struct {
@@ -332,7 +335,7 @@ func (p Plugin) pick(cmd *cobra.Command, picked map[Host]*bool) ([]Host, error) 
 		if *picked[host] {
 			asked = append(asked, host)
 		}
-		if _, err := exec.LookPath(string(host)); err == nil {
+		if host.found() {
 			found = append(found, host)
 		}
 	}
@@ -393,25 +396,22 @@ func (p Plugin) installOn(cmd *cobra.Command, host Host, project bool) error {
 	}
 	version := p.Manifest(executable).Version
 	server := pluginMCPServer{Command: executable, Args: []string{"mcp"}}
-	missing := Refused("the "+string(host)+" cli is not on the path", "Install it, then run '"+p.Name+" plugin install --"+string(host)+"' again.")
 	stderr := cmd.ErrOrStderr()
 	switch host {
-	case Codex:
-		if _, err := exec.LookPath("codex"); err != nil {
-			return missing
-		}
+	case Codex, ChatGPT:
 		dir := filepath.Join(home, ".agents")
 		if err := p.skills(dir); err != nil {
 			return err
 		}
 		fmt.Fprintln(stderr, "wrote the skills under "+filepath.Join(dir, "skills"))
-		_ = exec.CommandContext(cmd.Context(), "codex", "mcp", "remove", p.Name).Run()
-		if err := p.run(cmd, "codex", "mcp", "add", p.Name, "--", executable, "mcp"); err != nil {
+		path := filepath.Join(home, ".codex", "config.toml")
+		if err := putTable(path, p.Name, server); err != nil {
 			return err
 		}
+		fmt.Fprintln(stderr, "wrote mcp_servers."+p.Name+" in "+path)
 	case Gemini:
 		if _, err := exec.LookPath("gemini"); err != nil {
-			return missing
+			return Refused("the gemini cli is not on the path", "Install it, then run '"+p.Name+" plugin install --gemini' again.")
 		}
 		dir := filepath.Join(home, "."+p.Name, "gemini")
 		body, err := json.MarshalIndent(map[string]any{
@@ -451,8 +451,25 @@ func (p Plugin) installOn(cmd *cobra.Command, host Host, project bool) error {
 			return err
 		}
 		fmt.Fprintln(stderr, "wrote mcp.servers."+p.Name+" in "+path)
+	case Desktop:
+		path, err := p.InstallDesktop()
+		if err != nil {
+			return err
+		}
+		fmt.Fprintln(stderr, "wrote mcpServers."+p.Name+" in "+path)
+	case Antigravity:
+		dir := filepath.Join(home, ".gemini", "config")
+		if err := p.skills(dir); err != nil {
+			return err
+		}
+		fmt.Fprintln(stderr, "wrote the skills under "+filepath.Join(dir, "skills"))
+		path := filepath.Join(dir, "mcp_config.json")
+		if err := putServer(path, []string{"mcpServers", p.Name}, server); err != nil {
+			return err
+		}
+		fmt.Fprintln(stderr, "wrote mcpServers."+p.Name+" in "+path)
 	default:
-		return Rejected("no host is "+string(host), "The hosts are claude, codex, gemini and opencode.")
+		return Rejected("no host is "+string(host), "The hosts are claude, codex, gemini, opencode, desktop, chatgpt and antigravity.")
 	}
 	installed := p.installed()
 	installed[host] = version
@@ -475,6 +492,54 @@ func (p Plugin) installed() map[Host]string {
 		}
 	}
 	return installed
+}
+
+func (h Host) found() bool {
+	home, _ := os.UserHomeDir()
+	exists := func(path string) bool {
+		_, err := os.Stat(path)
+		return err == nil
+	}
+	switch h {
+	case Desktop:
+		path, err := DesktopConfigPath()
+		return err == nil && exists(filepath.Dir(path))
+	case ChatGPT:
+		return runtime.GOOS == "darwin" && (exists("/Applications/ChatGPT.app") || exists(filepath.Join(home, "Applications", "ChatGPT.app")))
+	case Antigravity:
+		if _, err := exec.LookPath("agy"); err == nil {
+			return true
+		}
+		return exists(filepath.Join(home, ".gemini", "config"))
+	}
+	_, err := exec.LookPath(string(h))
+	return err == nil
+}
+
+func putTable(path, name string, server pluginMCPServer) error {
+	data, err := os.ReadFile(path)
+	if err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	header := "[mcp_servers." + name + "]"
+	var kept []string
+	skip := false
+	for _, line := range strings.Split(strings.TrimRight(string(data), "\n"), "\n") {
+		if trimmed := strings.TrimSpace(line); strings.HasPrefix(trimmed, "[") {
+			skip = trimmed == header || strings.HasPrefix(trimmed, "[mcp_servers."+name+".")
+		}
+		if !skip {
+			kept = append(kept, line)
+		}
+	}
+	command, _ := json.Marshal(server.Command)
+	args, _ := json.Marshal(server.Args)
+	body := strings.TrimRight(strings.Join(kept, "\n"), "\n")
+	if body != "" {
+		body += "\n\n"
+	}
+	body += header + "\ncommand = " + string(command) + "\nargs = " + string(args) + "\n"
+	return writeIn(filepath.Dir(path), filepath.Base(path), []byte(body))
 }
 
 func putServer(path string, keys []string, entry any) error {

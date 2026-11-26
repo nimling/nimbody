@@ -594,7 +594,9 @@ func TestCLINotifierChecksOncePerDayAndCanBeTurnedOff(t *testing.T) {
 	assert.False(t, cli.Newer("dev", "v1.0.0"))
 }
 
-func hostPlugin(t *testing.T, found ...string) (*cobra.Command, string, *bytes.Buffer) {
+var cliHosts = []cli.Host{cli.Claude, cli.Codex, cli.Gemini, cli.OpenCode}
+
+func hostPlugin(t *testing.T, hosts []cli.Host, found ...string) (*cobra.Command, string, *bytes.Buffer) {
 	home := t.TempDir()
 	bin := t.TempDir()
 	t.Setenv("HOME", home)
@@ -604,7 +606,7 @@ func hostPlugin(t *testing.T, found ...string) (*cobra.Command, string, *bytes.B
 		assert.NoError(t, os.WriteFile(filepath.Join(bin, name), []byte(script), 0o755))
 	}
 	plugin := demoPlugin()
-	plugin.Hosts = []cli.Host{cli.Claude, cli.Codex, cli.Gemini, cli.OpenCode}
+	plugin.Hosts = hosts
 	root := &cobra.Command{Use: "demo", SilenceUsage: true, SilenceErrors: true}
 	root.AddCommand(cli.PluginCommand(plugin))
 	var stdout bytes.Buffer
@@ -615,7 +617,7 @@ func hostPlugin(t *testing.T, found ...string) (*cobra.Command, string, *bytes.B
 }
 
 func TestCLIPluginInstallsForEveryPickedHost(t *testing.T) {
-	root, home, stdout := hostPlugin(t, "codex", "gemini")
+	root, home, stdout := hostPlugin(t, cliHosts, "codex", "gemini")
 	config := filepath.Join(home, ".config", "opencode", "opencode.json")
 	assert.NoError(t, os.MkdirAll(filepath.Dir(config), 0o755))
 	assert.NoError(t, os.WriteFile(config, []byte(`{"theme":"dark","mcp":{"servers":{"other":{"type":"local","command":["other"]}}}}`), 0o644))
@@ -624,7 +626,9 @@ func TestCLIPluginInstallsForEveryPickedHost(t *testing.T) {
 	assert.NoError(t, root.Execute())
 
 	ran, _ := os.ReadFile(filepath.Join(home, "ran"))
-	assert.Contains(t, string(ran), "codex mcp add demo -- ")
+	table, _ := os.ReadFile(filepath.Join(home, ".codex", "config.toml"))
+	assert.Contains(t, string(table), "[mcp_servers.demo]\ncommand = ")
+	assert.Contains(t, string(table), `args = ["mcp"]`)
 	assert.Contains(t, string(ran), "gemini extensions install "+filepath.Join(home, ".demo", "gemini")+" --consent")
 	for _, dir := range []string{".agents", filepath.Join(".demo", "gemini"), filepath.Join(".config", "opencode")} {
 		skill, err := os.ReadFile(filepath.Join(home, dir, "skills", "demo", "SKILL.md"))
@@ -659,13 +663,13 @@ func TestCLIPluginInstallsForEveryPickedHost(t *testing.T) {
 }
 
 func TestCLIPluginInstallsForTheOneHostFoundAndAsksAmongSeveral(t *testing.T) {
-	root, home, _ := hostPlugin(t, "codex")
+	root, home, _ := hostPlugin(t, cliHosts, "codex")
 	root.SetArgs([]string{"plugin", "install"})
 	assert.NoError(t, root.Execute())
-	ran, _ := os.ReadFile(filepath.Join(home, "ran"))
-	assert.Contains(t, string(ran), "codex mcp add demo -- ")
+	table, _ := os.ReadFile(filepath.Join(home, ".codex", "config.toml"))
+	assert.Contains(t, string(table), "[mcp_servers.demo]")
 
-	root, home, _ = hostPlugin(t, "codex", "gemini")
+	root, home, _ = hostPlugin(t, cliHosts, "codex", "gemini")
 	root.SetArgs([]string{"plugin", "install"})
 	err := root.Execute()
 	assert.Equal(t, cli.ExitRejected, cli.ExitCode(err))
@@ -673,11 +677,11 @@ func TestCLIPluginInstallsForTheOneHostFoundAndAsksAmongSeveral(t *testing.T) {
 	_, missing := os.Stat(filepath.Join(home, "ran"))
 	assert.True(t, os.IsNotExist(missing), "nothing is installed until a host is picked")
 
-	root, _, _ = hostPlugin(t)
+	root, _, _ = hostPlugin(t, cliHosts)
 	root.SetArgs([]string{"plugin", "install"})
 	assert.Equal(t, cli.ExitRefused, cli.ExitCode(root.Execute()))
 
-	root, _, _ = hostPlugin(t)
+	root, _, _ = hostPlugin(t, cliHosts)
 	root.SetArgs([]string{"plugin", "install", "--codex", "--project"})
 	assert.Equal(t, cli.ExitRejected, cli.ExitCode(root.Execute()))
 }
@@ -688,4 +692,42 @@ func TestCLIPluginWithoutHostsTakesNoHostFlag(t *testing.T) {
 	root.SetErr(&bytes.Buffer{})
 	root.SetArgs([]string{"plugin", "install", "--codex"})
 	assert.ErrorContains(t, root.Execute(), "unknown flag")
+}
+
+func TestCLIPluginInstallsForTheDesktopHosts(t *testing.T) {
+	root, home, stdout := hostPlugin(t, []cli.Host{cli.Desktop, cli.ChatGPT, cli.Antigravity})
+	t.Setenv("APPDATA", home)
+	table := filepath.Join(home, ".codex", "config.toml")
+	assert.NoError(t, os.MkdirAll(filepath.Dir(table), 0o755))
+	assert.NoError(t, os.WriteFile(table, []byte("model = \"o3\"\n\n[mcp_servers.demo]\ncommand = \"/old/demo\"\n\n[mcp_servers.demo.env]\nA = \"b\"\n\n[mcp_servers.other]\ncommand = \"other\"\n"), 0o644))
+	servers := filepath.Join(home, ".gemini", "config", "mcp_config.json")
+	assert.NoError(t, os.MkdirAll(filepath.Dir(servers), 0o755))
+	assert.NoError(t, os.WriteFile(servers, []byte(`{"mcpServers":{"other":{"command":"other"}}}`), 0o644))
+
+	root.SetArgs([]string{"plugin", "install", "--desktop", "--chatgpt", "--antigravity"})
+	assert.NoError(t, root.Execute())
+
+	body, _ := os.ReadFile(table)
+	assert.Contains(t, string(body), "model = \"o3\"")
+	assert.Contains(t, string(body), "[mcp_servers.other]\ncommand = \"other\"")
+	assert.NotContains(t, string(body), "/old/demo")
+	assert.NotContains(t, string(body), "[mcp_servers.demo.env]")
+	assert.Equal(t, 1, strings.Count(string(body), "[mcp_servers.demo]"))
+	body, _ = os.ReadFile(servers)
+	assert.Contains(t, string(body), `"other"`)
+	assert.Contains(t, string(body), `"demo"`)
+	desktop, err := cli.DesktopConfigPath()
+	assert.NoError(t, err)
+	body, _ = os.ReadFile(desktop)
+	assert.Contains(t, string(body), `"demo"`)
+	for _, dir := range []string{".agents", filepath.Join(".gemini", "config")} {
+		_, err := os.Stat(filepath.Join(home, dir, "skills", "demo", "SKILL.md"))
+		assert.NoError(t, err, dir)
+	}
+
+	root.SetArgs([]string{"plugin", "status"})
+	assert.NoError(t, root.Execute())
+	for _, host := range []string{"desktop", "chatgpt", "antigravity"} {
+		assert.Contains(t, stdout.String(), " for "+host)
+	}
 }
