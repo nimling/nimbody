@@ -30,7 +30,7 @@ The shared cli layer the `cli` skill describes.
 
 2.2. `PutOutput[Out]` declares a command's output struct: its tool carries `outputSchema` `{data: …}` and answers `structuredContent` from the json the command prints, unless the call shapes it. A destructive tool carries `_meta["anthropic/requiresUserInteraction"]`. The server answers `GetInstructions(root, name)` in `initialize`, the root's `AnnotationMCPInstructions` or a few lines from its `Short`.
 
-3. `SkillCommand` serves the skill, and `SkillTreeCommand` a cli with references or several skills. `PluginCommand` has `install` for Claude Code, `desktop` for Claude Desktop and `status` for drift.
+3. `SkillCommand` serves the skill, and `SkillTreeCommand` a cli with references or several skills. `PluginCommand` has `install` for Claude Code, `desktop` for Claude Desktop and `status` for drift; a cli that sets `Plugin.Hosts` gets one `install` flag per `Host` (`Claude`, `Codex`, `Gemini`, `OpenCode`, `Desktop`, `ChatGPT`, `Antigravity`), an install for the one host found when no flag is given, a choice among several, and `status` per installed host.
 
 4. `Settings` is the config. `Flags` adds `--config`, `--env`, `--global`, `--yes` and `--plan`. `Load` layers the flag, the environment, `--env` files, the local `.<cli>/config.yaml` found walking up and the named config in `~/.<cli>/config.yaml` into the environment; the local config takes over from the named one. `Guard` asks before a write on a `protected` config. `ConfigCommand` is `config get`, `list`, `set`, `use`, `init`, `local` and `path`; `--plan` prints the write `set`, `use`, `init` or `local` would make and stops. A secret is never a flag: `Root` refuses a `Setting` that is `Secret` and names a `Flag`.
 
